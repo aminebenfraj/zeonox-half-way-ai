@@ -442,6 +442,7 @@ class JustloBot:
             deadline      = t_start + GENERATE_TIMEOUT
             manual_review = False
             server_error  = False
+            server_error_text = ""
 
             while asyncio.get_event_loop().time() < deadline:
                 try:
@@ -455,7 +456,8 @@ class JustloBot:
                         manual_review = True
                         break
 
-                    if await self._safe_evaluate(tab2, _GET_SERVER_ERROR_JS):
+                    server_error_text = await self._safe_evaluate(tab2, _GET_SERVER_ERROR_JS)
+                    if server_error_text:
                         server_error = True
                         break
                 except PlaywrightError as e:
@@ -476,7 +478,7 @@ class JustloBot:
                 self.log(f"[WARN] Chameleon flagged this request for manual review "
                          f"(attempt {attempt}/{max_attempts}) — retrying generation.")
             else:
-                self.log(f"[WARN] Chameleon returned a server error "
+                self.log(f"[WARN] Chameleon returned an error banner ({server_error_text}) "
                          f"(attempt {attempt}/{max_attempts}) — retrying generation.")
             if attempt < max_attempts:
                 await asyncio.sleep(2)

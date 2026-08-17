@@ -241,13 +241,18 @@ _GET_MANUAL_REVIEW_JS = """
 }
 """
 
-# Chameleon's backend can also just fail outright ("Fehler: SERVER_ERROR" /
-# "Interner Fehler. Bitte erneut versuchen."). Treated the same as the manual-
-# review banner: retry generation, refresh the chat if it won't clear.
+# Chameleon's backend can also just fail outright, shown as a red "Fehler: <CODE>"
+# banner under the generate button (SERVER_ERROR, COST_LIMIT, BAD_MODEL_OUTPUT,
+# ... — new codes appear over time, so match the banner generically rather than
+# listing known codes). Treated the same as the manual-review banner: retry
+# generation, refresh the chat if it won't clear. Returns the matched text (for
+# logging) or '' if no error banner is present.
 _GET_SERVER_ERROR_JS = """
 () => {
     const t = document.body.textContent || '';
-    return t.includes('SERVER_ERROR') || t.includes('Interner Fehler');
+    const m = t.match(/Fehler:\\s*\\S+/);
+    if (m) return m[0];
+    return t.includes('Interner Fehler') ? 'Interner Fehler' : '';
 }
 """
 
@@ -693,6 +698,7 @@ class ChatBot:
             quality_failed = False
             manual_review  = False
             server_error   = False
+            server_error_text = ""
 
             while asyncio.get_event_loop().time() < deadline:
                 try:
@@ -710,7 +716,8 @@ class ChatBot:
                         manual_review = True
                         break
 
-                    if await self._safe_evaluate(tab2, _GET_SERVER_ERROR_JS):
+                    server_error_text = await self._safe_evaluate(tab2, _GET_SERVER_ERROR_JS)
+                    if server_error_text:
                         server_error = True
                         break
                 except PlaywrightError as e:
@@ -733,7 +740,7 @@ class ChatBot:
                 self.log(f"[WARN] Chameleon flagged this request for manual review "
                          f"(attempt {attempt}/{max_attempts}) — retrying generation.")
             elif server_error:
-                self.log(f"[WARN] Chameleon returned a server error "
+                self.log(f"[WARN] Chameleon returned an error banner ({server_error_text}) "
                          f"(attempt {attempt}/{max_attempts}) — retrying generation.")
             else:
                 self.log(f"[WARN] Quality check rejected the reply (attempt {attempt}/{max_attempts}): "
