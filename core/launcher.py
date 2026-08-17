@@ -94,9 +94,15 @@ def ensure_approval_server(port: int = APPROVAL_SERVER_PORT):
     """Start the approval dashboard if it isn't already running.
 
     Returns the Popen handle if this call started it (caller is responsible for
-    terminating it on shutdown), or None if it was already running (in which
-    case it's not ours to stop).
+    terminating it on shutdown), or None if it was already running, or if
+    APPROVAL_SERVER_URL points somewhere other than this machine (a cloud
+    dashboard), in which case there's nothing local to launch.
     """
+    remote_url = os.environ.get("APPROVAL_SERVER_URL", "")
+    if remote_url and "127.0.0.1" not in remote_url and "localhost" not in remote_url:
+        print(f"[Launcher] APPROVAL_SERVER_URL={remote_url} -- using that instead of a local dashboard.")
+        return None
+
     if is_approval_server_ready(port):
         print(f"[Launcher] Approval dashboard already running at http://127.0.0.1:{port}")
         return None

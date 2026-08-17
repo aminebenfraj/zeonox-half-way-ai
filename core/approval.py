@@ -25,6 +25,12 @@ import httpx
 APPROVAL_SERVER_URL = os.environ.get("APPROVAL_SERVER_URL", "http://127.0.0.1:8799")
 POLL_INTERVAL = 2  # seconds between "is it decided yet?" checks
 
+# Matches APPROVAL_USER/APPROVAL_PASS on the server (see approval_server.py).
+# None when unset, which disables auth on both sides for local dev.
+_AUTH_USER = os.environ.get("APPROVAL_USER")
+_AUTH_PASS = os.environ.get("APPROVAL_PASS")
+_AUTH = (_AUTH_USER, _AUTH_PASS) if _AUTH_USER and _AUTH_PASS else None
+
 
 class ApprovalRejected(Exception):
     """Raised... actually not used — reject is a normal return, not an error.
@@ -45,7 +51,7 @@ async def request_approval(
       - approved=True,  final_text = the text to actually send (edits applied)
       - approved=False, final_text = None  (human clicked Reject — regenerate)
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, auth=_AUTH) as client:
         resp = await client.post(
             f"{APPROVAL_SERVER_URL}/api/requests",
             json={
@@ -77,7 +83,7 @@ async def mark_sent(request_id: str | None):
     if not request_id:
         return
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, auth=_AUTH) as client:
             await client.post(f"{APPROVAL_SERVER_URL}/api/requests/{request_id}/sent")
     except Exception:
         pass  # dashboard bookkeeping only — never let this break the bot cycle
@@ -88,7 +94,7 @@ async def mark_failed(request_id: str | None, error: str = ""):
     if not request_id:
         return
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, auth=_AUTH) as client:
             await client.post(
                 f"{APPROVAL_SERVER_URL}/api/requests/{request_id}/failed",
                 json={"error": error},

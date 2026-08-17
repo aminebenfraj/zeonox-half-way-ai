@@ -24,6 +24,7 @@ the affected bot's next generate simply creates a fresh one.
 """
 
 import concurrent.futures
+import hmac
 import itertools
 import os
 import threading
@@ -37,7 +38,19 @@ try:
 except ImportError:  # translation is a nice-to-have — dashboard still works without it
     GoogleTranslator = None
 
-PORT = int(os.environ.get("APPROVAL_SERVER_PORT", "8799"))
+# $PORT is what most cloud hosts (Render, Railway, etc.) inject; fall back to
+# the original local-dev var/default when running on a laptop.
+PORT = int(os.environ.get("PORT") or os.environ.get("APPROVAL_SERVER_PORT", "8799"))
+HOST = os.environ.get("HOST", "127.0.0.1")
+
+# If both are set, every route requires HTTP Basic Auth with these creds --
+# this dashboard shows real customer messages and can send real replies, so
+# it must never sit on the public internet without a login. Left unset for
+# local dev on 127.0.0.1, where only processes on the same machine can reach
+# it anyway.
+AUTH_USER = os.environ.get("APPROVAL_USER")
+AUTH_PASS = os.environ.get("APPROVAL_PASS")
+
 MAX_HISTORY = 300  # decided/sent/failed requests kept for the dashboard's history list
 
 # Every platform this project knows about, in the order they should appear in
@@ -68,6 +81,25 @@ PLATFORM_COLORS = {
 _FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"]
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _require_auth():
+    if not AUTH_USER or not AUTH_PASS:
+        return None  # auth disabled (local dev default)
+    auth = request.authorization
+    valid = (
+        auth is not None
+        and hmac.compare_digest(auth.username or "", AUTH_USER)
+        and hmac.compare_digest(auth.password or "", AUTH_PASS)
+    )
+    if not valid:
+        return Response(
+            "Authentication required", 401,
+            {"WWW-Authenticate": 'Basic realm="Chat Approval Dashboard"'},
+        )
+    return None
+
 
 _lock = threading.Lock()
 _requests: dict[str, dict] = {}
@@ -784,9 +816,11 @@ def dashboard():
 
 
 def main():
-    print(f"[ApprovalServer] Dashboard running at http://127.0.0.1:{PORT}")
-    print("[ApprovalServer] Open that URL in a browser to approve/reject replies.")
-    app.run(host="127.0.0.1", port=PORT, threaded=True)
+    print(f"[ApprovalServer] Dashboard running at http://{HOST}:{PORT}")
+    if not (AUTH_USER and AUTH_PASS):
+        print("[ApprovalServer] WARNING: APPROVAL_USER/APPROVAL_PASS not set -- "
+              "no login required. Fine on 127.0.0.1, unsafe on the public internet.")
+    app.run(host=HOST, port=PORT, threaded=True)
 
 
 if __name__ == "__main__":
