@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import configs.justlo as j, configs.linduu as l; print\\('anstupsen:', j.config.sel_anstupsen_btn, '| queue:', l.config.sel_queue_message\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('core/justlo_bot.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('launch_all.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('core/bot.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('start_all.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import start_all; print\\('IMPORT_OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from core.bot import pause_flag_path; print\\(pause_flag_path\\('Gold'\\)\\); print\\(pause_flag_path\\('gold'\\) == pause_flag_path\\('Gold'\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('core/login.py', encoding='utf-8'\\).read\\(\\)\\)\")"
+    ]
+  }
+}

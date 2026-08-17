@@ -1,0 +1,71 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+.pytest_cache/
+
+# Environment variables
+.env
+.env.*
+
+# IDE/editor directories
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Playwright browser binaries and logs
+playwright-report/
+test-results/
+playwright/.cache/
+
+# Browser profiles and user data
+profiles/
+
+# Scraped data and logs
+run.txt
+tab*.txt
+note_logs.log
+
+# checkinall runtime snapshot (used to compute daily earnings delta)
+.checkinall_state.json
+
+# Downloaded or external projects
+ultimate-web-page-scraper-main/
+playwright-report/
+
+# Local Chrome debug profile
+chrome-debug-profile/
