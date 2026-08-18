@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 from core.login import login_mod_site, login_chameleon, chat_not_selected
-from core.approval import request_approval, mark_sent, mark_failed
+from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
 # Cross-process signal: the launcher (start_all.py/launch_all.py) creates/deletes
@@ -536,6 +536,7 @@ class ChatBot:
 
     async def _wait_for_conversation(self, tab1):
         self.log("Waiting for a new conversation...")
+        await report_status(self.cfg.platform, "waiting_for_chat")
         t_start     = asyncio.get_event_loop().time()
         last_report = t_start
         while True:
@@ -550,6 +551,7 @@ class ChatBot:
                 if waiting is None and textarea is not None:
                     waited = asyncio.get_event_loop().time() - t_start
                     self.log(f"Conversation detected! (waited {waited:.0f}s)")
+                    await report_status(self.cfg.platform, "chat_detected")
                     return
             except PlaywrightError as e:
                 if _is_fatal(e):
@@ -632,11 +634,13 @@ class ChatBot:
         or the conversation closes/goes idle (False).
         """
         self.log("Waiting for next user message or conversation end...")
+        await report_status(self.cfg.platform, "idle", "waiting for the customer's next message")
         while True:
             try:
                 waiting = await tab1.query_selector(self.cfg.sel_waiting)
                 if waiting is not None:
                     self.log("Conversation closed — back to idle.")
+                    await report_status(self.cfg.platform, "waiting_for_chat")
                     return False
                 current_html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
                 if current_html != sent_html:
@@ -652,6 +656,19 @@ class ChatBot:
                     self.log(f"[WARN] Error polling for new message: {e}")
             await asyncio.sleep(POLL_INTERVAL)
             await self._wait_while_paused()
+
+    async def _chat_is_open(self, tab1) -> bool:
+        """True while tab1 is still sitting on an open conversation (not back
+        on the 'no chatrooms' idle screen). Passed into request_approval() as
+        the chat_still_active check so a pending reply gets auto-cancelled if
+        the conversation closes while a human hasn't decided yet."""
+        try:
+            waiting = await tab1.query_selector(self.cfg.sel_waiting)
+            return waiting is None
+        except PlaywrightError as e:
+            if _is_fatal(e):
+                raise
+            return True  # unknown/transient — don't cancel on a fluke
 
     async def _generate_reply(self, tab2) -> str:
         old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
@@ -758,7 +775,7 @@ class ChatBot:
             "('Keine sichere Antwort erstellt') — giving up."
         )
 
-    async def _get_approved_reply(self, tab2, customer_message: str) -> tuple[str, str]:
+    async def _get_approved_reply(self, tab1, tab2, customer_message: str) -> tuple[str, str]:
         """Generate a reply, then block on the approval dashboard before it's
         allowed to be sent. A rejection clicks 'Antwort generieren' again for a
         fresh reply and resubmits it — repeats until something is approved.
@@ -766,12 +783,18 @@ class ChatBot:
         ManualReviewLimitExceeded from _generate_reply() is intentionally left
         to propagate — that's a Chameleon-side failure, not a human decision,
         and the caller already knows how to recover from it (refresh the chat).
+        ApprovalCancelled also propagates — either a human clicked Cancel on
+        the dashboard, or the chat closed while this reply was still pending;
+        the caller restarts/redetects rather than looping here.
         """
         while True:
+            await report_status(self.cfg.platform, "generating")
             reply = await self._generate_reply(tab2)
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
+            await report_status(self.cfg.platform, "awaiting_approval")
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply, customer_message=customer_message,
+                chat_still_active=lambda: self._chat_is_open(tab1),
             )
             if approved:
                 if final_text != reply:
@@ -787,6 +810,7 @@ class ChatBot:
         async with async_playwright() as p:
             # ── Connect to Chrome ──────────────────────────────────────────────
             self.log(f"Connecting to Chrome at {self.cfg.cdp_url}...")
+            await report_status(self.cfg.platform, "starting")
             browser = None
             for attempt in range(3):
                 try:
@@ -915,7 +939,7 @@ class ChatBot:
 
                     await self._wait_while_paused()
                     try:
-                        reply, approval_id = await self._get_approved_reply(tab2, last_customer_msg)
+                        reply, approval_id = await self._get_approved_reply(tab1, tab2, last_customer_msg)
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
                                  "review after 3 attempts — refreshing the chat page.")
@@ -924,7 +948,16 @@ class ChatBot:
                         await self._wait_for_conversation(tab1)
                         cycle -= 1
                         continue
+                    except ApprovalCancelled:
+                        self.log("[APPROVAL] Cancelled — chat closed or operator cancelled it. "
+                                 "Reloading the chat page and redetecting...")
+                        await tab1.reload()
+                        await self._wait_for_page_ready(tab1, "domcontentloaded")
+                        await self._wait_for_conversation(tab1)
+                        cycle -= 1
+                        continue
 
+                    await report_status(self.cfg.platform, "sending")
                     await tab1.bring_to_front()
                     textarea = tab1.locator(self.cfg.sel_textarea)
                     await textarea.click()
@@ -980,6 +1013,7 @@ class ChatBot:
 
                 except LoggedOutError:
                     self.log("[RECOVERY] Logged out during idle — re-logging in + fixing Chameleon...")
+                    await report_status(self.cfg.platform, "recovering", "logged out — re-logging in")
                     await self._handle_relogin_and_fix_chameleon(tab1, tab2)
                     if consecutive_errors > 0:
                         self.log(f"Consecutive error counter reset (was {consecutive_errors}).")
@@ -997,6 +1031,7 @@ class ChatBot:
                         f"[WARN] Timeout ({type(e).__name__}): {e} — "
                         f"retrying in 15s (error {consecutive_errors}, {error_elapsed:.0f}s since first error)"
                     )
+                    await report_status(self.cfg.platform, "error", str(e)[:200])
                     await asyncio.sleep(15)
                     if error_elapsed >= ERROR_RELOGIN_AFTER:
                         self.log(f"[RECOVERY] Reply still won't send after {error_elapsed:.0f}s — "
@@ -1020,6 +1055,7 @@ class ChatBot:
                         f"[ERROR] {type(e).__name__}: {e} "
                         f"(error {consecutive_errors}, {error_elapsed:.0f}s since first error) — retrying in 15s..."
                     )
+                    await report_status(self.cfg.platform, "error", str(e)[:200])
                     await asyncio.sleep(15)
                     if error_elapsed >= ERROR_RELOGIN_AFTER:
                         self.log(f"[RECOVERY] Reply still won't send after {error_elapsed:.0f}s — "

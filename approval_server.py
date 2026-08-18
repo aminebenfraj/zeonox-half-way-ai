@@ -14,13 +14,17 @@ Endpoints:
   GET  /api/requests/<id>         -> single request (bots poll this)
   POST /api/requests/<id>/approve -> body {edited_reply?}
   POST /api/requests/<id>/reject
+  POST /api/requests/<id>/cancel  -> abandon it; bot restarts/redetects instead of regenerating
   POST /api/requests/<id>/sent    -> bot confirms the approved reply went out
   POST /api/requests/<id>/failed  -> body {error?}
+  POST /api/status                -> bot reports its current state, body {platform, state, detail?}
+  GET  /api/status                -> live per-platform state (dashboard polls this)
   GET  /                          -> the dashboard page (dark, auto-refreshing)
 
 State lives in memory only (a handful of concurrent platforms, short-lived
-requests) — restarting this process drops any requests that were mid-review;
-the affected bot's next generate simply creates a fresh one.
+requests) — restarting this process drops any requests that were mid-review
+and any live status; the affected bot's next generate/status ping simply
+creates a fresh one.
 """
 
 import concurrent.futures
@@ -104,6 +108,12 @@ def _require_auth():
 _lock = threading.Lock()
 _requests: dict[str, dict] = {}
 _order = itertools.count()  # monotonic insertion counter, used to sort newest-first
+
+# Live per-platform bot state (see core/approval.py's report_status()), keyed
+# by platform name. In-memory like everything else here — a restart just means
+# every platform shows as offline until its next status ping.
+_status: dict[str, dict] = {}
+STATUS_STALE_AFTER = 30  # seconds without a ping before the dashboard treats a platform as offline
 
 # Translation calls hit Google's endpoint over the network; bound each one with
 # a hard timeout on a worker thread so a slow/unreachable network never stalls
@@ -240,6 +250,24 @@ def reject_request(req_id):
     return jsonify({"ok": True})
 
 
+@app.post("/api/requests/<req_id>/cancel")
+def cancel_request(req_id):
+    """Abandon a pending request entirely — unlike reject, the bot does not
+    regenerate and resubmit; it restarts/redetects the chat instead. Used both
+    by the dashboard's Cancel button and by a bot that notices its own chat
+    closed out from under a still-pending request (see request_approval()'s
+    chat_still_active check in core/approval.py)."""
+    with _lock:
+        r = _requests.get(req_id)
+        if not r:
+            return jsonify({"error": "not found"}), 404
+        if r["status"] != "pending":
+            return jsonify({"error": f"already {r['status']}"}), 409
+        r["status"] = "cancelled"
+        r["decided_at"] = _now()
+    return jsonify({"ok": True})
+
+
 @app.post("/api/requests/<req_id>/sent")
 def mark_sent(req_id):
     with _lock:
@@ -260,6 +288,30 @@ def mark_failed(req_id):
             r["error"] = body.get("error") or ""
             r["sent_at"] = _now()
     return jsonify({"ok": True})
+
+
+@app.post("/api/status")
+def update_status():
+    """Bots ping this at each state transition (waiting for a chat, extracting,
+    generating, awaiting approval, sending, idle, error) — see report_status()
+    in core/approval.py. Powers the live 'detector' indicator per platform."""
+    body = request.get_json(force=True, silent=True) or {}
+    platform = (body.get("platform") or "").strip()
+    if not platform:
+        return jsonify({"error": "platform is required"}), 400
+    with _lock:
+        _status[platform] = {
+            "state": body.get("state") or "unknown",
+            "detail": body.get("detail") or "",
+            "updated_at": _now(),
+        }
+    return jsonify({"ok": True})
+
+
+@app.get("/api/status")
+def list_status():
+    with _lock:
+        return jsonify(dict(_status))
 
 
 @app.get("/api/health")
@@ -348,6 +400,22 @@ _PAGE = """<!doctype html>
     padding: 1px 6px;
   }
   .nav-item.has-pending .nav-count { background: var(--pc, var(--primary)); color: #fff; }
+  .nav-detector {
+    font-size: 10.5px; color: var(--muted-foreground); padding: 0 10px 6px 27px;
+    margin-top: -3px; margin-bottom: 2px; display: flex; align-items: center; gap: 5px;
+  }
+  .nav-detector .det-dot { width: 6px; height: 6px; border-radius: 999px; flex: none; background: var(--border); }
+  .nav-detector.live .det-dot { background: var(--det, var(--success)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--det, var(--success)) 30%, transparent); animation: pulse 2s ease-in-out infinite; }
+  .nav-detector.offline { opacity: .55; }
+  .detector-pill {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600;
+    padding: 3px 10px; border-radius: 999px; background: var(--accent); color: var(--muted-foreground);
+    border: 1px solid var(--border);
+  }
+  .detector-pill .det-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--border); flex: none; }
+  .detector-pill.live { color: var(--foreground); background: color-mix(in srgb, var(--det, var(--accent)) 16%, var(--card)); border-color: color-mix(in srgb, var(--det, var(--border)) 45%, transparent); }
+  .detector-pill.live .det-dot { background: var(--det, var(--success)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--det, var(--success)) 30%, transparent); animation: pulse 2s ease-in-out infinite; }
+  .detector-pill.offline { opacity: .6; }
   .sidebar-foot {
     padding: 12px 18px; border-top: 1px solid var(--border);
     color: var(--muted-foreground); font-size: 11.5px;
@@ -415,6 +483,7 @@ _PAGE = """<!doctype html>
   .status-badge { font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 3px 8px; border-radius: 6px; letter-spacing: .03em; }
   .status-badge.approved, .status-badge.sent { background: rgba(34,197,94,.15); color: var(--success); }
   .status-badge.rejected, .status-badge.failed { background: rgba(239,68,68,.15); color: var(--destructive); }
+  .status-badge.cancelled { background: rgba(161,161,170,.18); color: var(--muted-foreground); }
   .status-badge.pending { background: rgba(234,179,8,.15); color: var(--warning); }
 
   .card-divider { height: 1px; background: var(--border); margin: 14px 0; }
@@ -466,6 +535,8 @@ _PAGE = """<!doctype html>
   .btn-approve { background: var(--success); color: var(--success-foreground); }
   .btn-reject { background: transparent; color: var(--destructive); border-color: rgba(239,68,68,.4); }
   .btn-reject:hover { background: rgba(239,68,68,.1); }
+  .btn-cancel { background: transparent; color: var(--muted-foreground); border-color: var(--border); }
+  .btn-cancel:hover { background: var(--accent); color: var(--foreground); }
   .hint { color: var(--muted-foreground); font-size: 11.5px; }
 
   .history-list { display: flex; flex-direction: column; gap: 8px; }
@@ -650,6 +721,40 @@ function approveCard(id) {
   act(id, "approve", { edited_reply: ta ? ta.value : undefined });
 }
 
+function cancelCard(id) {
+  if (!confirm("Cancel this reply? The bot will abandon it and restart the chat instead of regenerating.")) return;
+  act(id, "cancel");
+}
+
+// Human labels + accent per bot state, reported via POST /api/status
+// (see report_status() in core/approval.py). Anything not listed here still
+// renders (falls back to the raw state string) so a new state added on the
+// bot side never breaks the dashboard.
+const STATE_META = {
+  starting:           { label: "Starting…",           color: "var(--muted-foreground)" },
+  waiting_for_chat:   { label: "Waiting for a chat",   color: "var(--muted-foreground)" },
+  chat_detected:      { label: "Chat detected",        color: "var(--info)" },
+  extracting:         { label: "Extracting…",          color: "var(--info)" },
+  generating:         { label: "Generating reply…",    color: "var(--violet)" },
+  awaiting_approval:  { label: "Awaiting approval",    color: "var(--warning)" },
+  sending:            { label: "Sending…",              color: "var(--success)" },
+  idle:               { label: "Idle",                  color: "var(--muted-foreground)" },
+  recovering:         { label: "Recovering…",           color: "var(--warning)" },
+  error:              { label: "Error",                 color: "var(--destructive)" },
+};
+const STATUS_STALE_MS = 30_000; // must match STATUS_STALE_AFTER on the server
+
+let liveStatus = {}; // platform -> {state, detail, updated_at}
+
+function detectorFor(name) {
+  const s = liveStatus[name];
+  if (!s) return { live: false, label: "Offline", color: "var(--border)", detail: "" };
+  const ageMs = Date.now() - new Date(s.updated_at).getTime();
+  if (ageMs > STATUS_STALE_MS) return { live: false, label: "Offline", color: "var(--border)", detail: "" };
+  const meta = STATE_META[s.state] || { label: s.state, color: "var(--info)" };
+  return { live: true, label: meta.label, color: meta.color, detail: s.detail || "" };
+}
+
 const FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"];
 let platformColorMap = new Map();
 
@@ -692,7 +797,8 @@ function pendingCardHtml(r) {
       <div class="actions">
         <button class="btn-approve" onclick="approveCard('${r.id}')">Approve &amp; Send</button>
         <button class="btn-reject" onclick="act('${r.id}', 'reject')">Reject &amp; Regenerate</button>
-        <span class="hint">Edit the German text above before approving to send your own wording.</span>
+        <button class="btn-cancel" onclick="cancelCard('${r.id}')">Cancel</button>
+        <span class="hint">Edit the German text above before approving to send your own wording. Cancel abandons this reply and restarts the chat.</span>
       </div>
     </div>
   `;
@@ -713,6 +819,7 @@ function renderSections(pending) {
     const items = byPlatform.get(name) || [];
     const id = slug(name);
     const pc = colorFor(name);
+    const det = detectorFor(name);
     const body = items.length
       ? `<div class="cards-grid">${items.map(pendingCardHtml).join("")}</div>`
       : `<div class="empty-state">No pending replies for ${escapeHtml(name)}.</div>`;
@@ -722,6 +829,9 @@ function renderSections(pending) {
           <span class="pc-dot"></span>
           <h2>${escapeHtml(name)}</h2>
           <span class="count-pill ${items.length ? "active" : ""}">${items.length} pending</span>
+          <span class="detector-pill ${det.live ? "live" : "offline"}" style="--det:${det.color}" title="${escapeHtml(det.detail)}">
+            <span class="det-dot"></span>${escapeHtml(det.label)}
+          </span>
           <hr />
         </div>
         ${body}
@@ -733,12 +843,16 @@ function renderSections(pending) {
   document.getElementById("navList").innerHTML = order.map(name => {
     const count = (byPlatform.get(name) || []).length;
     const pc = colorFor(name);
+    const det = detectorFor(name);
     return `
       <button class="nav-item ${count ? "has-pending" : ""}" style="--pc:${pc}" onclick="goToSection('${name}')">
         <span class="nav-dot"></span>
         <span>${escapeHtml(name)}</span>
         <span class="nav-count">${count}</span>
       </button>
+      <div class="nav-detector ${det.live ? "live" : "offline"}" style="--det:${det.color}">
+        <span class="det-dot"></span><span>${escapeHtml(det.label)}</span>
+      </div>
     `;
   }).join("");
 
@@ -780,10 +894,12 @@ async function refresh() {
   // Never yank the textarea out from under someone mid-keystroke.
   if (document.activeElement && document.activeElement.classList.contains("reply-input")) return;
   try {
-    const [pendingRes, historyRes] = await Promise.all([
+    const [pendingRes, historyRes, statusRes] = await Promise.all([
       fetch("/api/requests?status=pending"),
-      fetch("/api/requests?status=approved,rejected,sent,failed&limit=200"),
+      fetch("/api/requests?status=approved,rejected,cancelled,sent,failed&limit=200"),
+      fetch("/api/status"),
     ]);
+    liveStatus = await statusRes.json();
     renderSections(await pendingRes.json());
     renderHistory((await historyRes.json()).slice(0, 30));
   } catch (e) {

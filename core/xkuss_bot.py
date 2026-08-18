@@ -47,7 +47,7 @@ from core.bot import (
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
-from core.approval import request_approval, mark_sent, mark_failed
+from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
 from core.xkuss_login import (
     login_xkuss,
     click_home,
@@ -436,13 +436,20 @@ class XkussBot:
             f"({'manual review' if manual_review else 'server error'})."
         )
 
-    async def _get_approved_reply(self, tab2) -> tuple[str, str]:
+    async def _get_approved_reply(self, tab1, tab2) -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
-        sent. A rejection regenerates and resubmits until something is approved."""
+        sent. A rejection regenerates and resubmits until something is approved.
+        ApprovalCancelled propagates to the caller (chat closed, or an operator
+        clicked Cancel) so it can restart this chat's Chameleon job instead."""
         while True:
+            await report_status(self.cfg.platform, "generating")
             reply = await self._generate_reply(tab2)
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
-            approved, final_text, req_id = await request_approval(self.cfg.platform, reply)
+            await report_status(self.cfg.platform, "awaiting_approval")
+            approved, final_text, req_id = await request_approval(
+                self.cfg.platform, reply,
+                chat_still_active=lambda: self._chat_still_active(tab1),
+            )
             if approved:
                 self.log(f"[APPROVAL] Approved{' with edits' if final_text != reply else ''}.")
                 return final_text, req_id
@@ -474,6 +481,7 @@ class XkussBot:
         is expected to sit in the waiting room until a conversation arrives.
         """
         self.log("In the waiting room — waiting for a dialog...")
+        await report_status(self.cfg.platform, "waiting_for_chat")
         t_start      = asyncio.get_event_loop().time()
         last_report  = t_start
         last_rehome  = t_start
@@ -482,6 +490,7 @@ class XkussBot:
             state = await self._detect_phase(tab1)
             if state == PAGE_CHAT:
                 self.log(f"Dialog received! (waited {asyncio.get_event_loop().time() - t_start:.0f}s)")
+                await report_status(self.cfg.platform, "chat_detected")
                 return PAGE_CHAT
             if state == PAGE_LOGIN:
                 return PAGE_LOGIN
@@ -638,6 +647,7 @@ class XkussBot:
         async with async_playwright() as p:
             # ── Connect to Chrome ──────────────────────────────────────────
             self.log(f"Connecting to Chrome at {self.cfg.cdp_url}...")
+            await report_status(self.cfg.platform, "starting")
             browser = None
             for attempt in range(3):
                 try:
@@ -740,7 +750,7 @@ class XkussBot:
                         continue
 
                     try:
-                        reply, approval_id = await self._get_approved_reply(tab2)
+                        reply, approval_id = await self._get_approved_reply(tab1, tab2)
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
                                  "review after 3 attempts — refreshing the chat (re-extracting "
@@ -748,6 +758,13 @@ class XkussBot:
                         await self._restart_chameleon_job(tab1, tab2)
                         cycle -= 1
                         continue
+                    except ApprovalCancelled:
+                        self.log("[APPROVAL] Cancelled — chat closed or operator cancelled it. "
+                                 "Restarting the Chameleon job on this chat...")
+                        await self._restart_chameleon_job(tab1, tab2)
+                        cycle -= 1
+                        continue
+                    await report_status(self.cfg.platform, "sending")
                     await self._send_reply(tab1, reply, approval_id)
 
                     if consecutive_errors > 0:
@@ -776,6 +793,7 @@ class XkussBot:
                         f"[WARN] Timeout ({type(e).__name__}): {e} — "
                         f"retrying in 15s (error {consecutive_errors}/{MAX_ERRORS})"
                     )
+                    await report_status(self.cfg.platform, "error", str(e)[:200])
                     await asyncio.sleep(15)
                     if consecutive_errors >= MAX_ERRORS:
                         self.log(f"[FATAL] {MAX_ERRORS} consecutive errors — triggering restart")
@@ -794,6 +812,7 @@ class XkussBot:
                         f"[ERROR] {type(e).__name__}: {e} "
                         f"(error {consecutive_errors}/{MAX_ERRORS}) — retrying in 15s..."
                     )
+                    await report_status(self.cfg.platform, "error", str(e)[:200])
                     await asyncio.sleep(15)
                     if consecutive_errors >= MAX_ERRORS:
                         self.log(f"[FATAL] {MAX_ERRORS} consecutive errors — triggering restart")
