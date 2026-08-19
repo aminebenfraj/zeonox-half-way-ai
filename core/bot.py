@@ -10,6 +10,7 @@ Exit codes (used by launcher to decide restart):
 
 import asyncio
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -66,6 +67,36 @@ def _is_fatal(e: Exception) -> bool:
 
 def _is_context_destroyed(e: Exception) -> bool:
     return "execution context was destroyed" in str(e).lower()
+
+
+# Reply-side profanity guard: Chameleon occasionally generates a reply
+# containing a genuine insult rather than the flirty-but-blunt tone that's
+# otherwise fine on these platforms — that must never reach a customer. Every
+# _get_approved_reply() (in this file, xkuss_bot.py and justlo_bot.py) checks
+# each freshly generated reply against this list before it's even shown for
+# approval; a hit is treated exactly like a human rejection — discarded, and
+# regenerated — so it can never slip through, including in Auto mode where
+# there's no human in the loop to catch it.
+_BANNED_WORDS = [
+    "arschloch",       # asshole
+    "depp",            # idiot
+    "trottel",         # idiot/moron
+    "arschgeige",      # jerk/dickhead
+    "schlampe",        # bitch/slut
+    "fick dich",       # fuck you
+    "verpiss dich",    # piss off / get lost
+    "halt die fresse", # shut up (very rude)
+    "halt das maul",   # shut your trap (very rude)
+    "hurensohn",       # severe insult referring to one's parentage
+    "fuck",
+]
+_BANNED_WORDS_RE = re.compile("|".join(re.escape(w) for w in _BANNED_WORDS), re.IGNORECASE)
+
+
+def contains_banned_language(text: str) -> str | None:
+    """Returns the matched word/phrase if `text` contains banned language, else None."""
+    m = _BANNED_WORDS_RE.search(text or "")
+    return m.group(0) if m else None
 
 
 class LoggedOutError(Exception):
@@ -281,7 +312,11 @@ _GET_CHAT_DURATION_JS = """
 # The chat thread renders newest-first inside #scrollable-chat-container, and the
 # customer's bubbles carry a 'from-male' class (the operator's own replies carry
 # 'from-female') — see tab1_html_with_conversation.txt. So the first '[class*="from-male"]'
-# match in that container is the customer's most recent message.
+# match in that container is the customer's most recent message. Used only for the
+# stagnant-reply check below (did OUR sent reply actually change the customer's
+# last bubble) — the dashboard's displayed "Last Message" comes from Chameleon
+# instead, see _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS, since this tab1 heuristic has
+# grabbed the wrong bubble on some platforms.
 _GET_LAST_CUSTOMER_MSG_JS = """
 () => {
     const container = document.querySelector('#scrollable-chat-container');
@@ -292,6 +327,24 @@ _GET_LAST_CUSTOMER_MSG_JS = """
     const small = clone.querySelector('small');
     if (small) small.remove();
     return clone.textContent.replace(/\\s+/g, ' ').trim();
+}
+"""
+
+# Chameleon parses the pasted conversation itself and renders the customer's
+# actual last message in a "Letzte Kundennachricht" card (mirrors the
+# "Antwort (Deutsch)" card _GET_DE_REPLY_JS reads from) — reading it from here
+# instead of guessing at tab1's raw chat-widget DOM is what the dashboard's
+# "Last Message" field is meant to show, and doesn't depend on any
+# platform-specific bubble class.
+_GET_LAST_CUSTOMER_MSG_CHAMELEON_JS = """
+() => {
+    const spans = [...document.querySelectorAll('span')];
+    const label = spans.find(s => s.textContent.trim().toUpperCase().includes('KUNDENNACHRICHT'));
+    if (!label) return '';
+    const section = label.closest('div[class*="rounded-2xl"]') || label.parentElement;
+    if (!section) return '';
+    const p = section.querySelector('p');
+    return p ? p.textContent.trim() : '';
 }
 """
 
@@ -790,6 +843,13 @@ class ChatBot:
         while True:
             await report_status(self.cfg.platform, "generating")
             reply = await self._generate_reply(tab2)
+
+            banned = contains_banned_language(reply)
+            if banned:
+                self.log(f"[GUARD] Reply contained banned language ('{banned}') — discarding, never shown, regenerating.")
+                await report_status(self.cfg.platform, "recovering", f"blocked reply containing '{banned}'")
+                continue
+
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
             await report_status(self.cfg.platform, "awaiting_approval")
             approved, final_text, req_id = await request_approval(
@@ -925,6 +985,14 @@ class ChatBot:
                     await tab2.bring_to_front()
                     await self._paste_and_extract(tab2, html)
 
+                    # What the dashboard shows as "Last Message" — read from Chameleon's
+                    # own "Letzte Kundennachricht" card rather than the tab1 heuristic
+                    # above, which has picked the wrong bubble on some platforms. Falls
+                    # back to the tab1 value if Chameleon's card isn't found so the
+                    # dashboard field is never silently left blank.
+                    dashboard_customer_msg = await self._safe_evaluate(tab2, _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS)
+                    dashboard_customer_msg = dashboard_customer_msg or last_customer_msg
+
                     if await self._is_first_contact(tab2):
                         self.log("[FC] First Contact detected — reloading chat and chameleon tabs.")
                         await tab1.reload()
@@ -939,7 +1007,7 @@ class ChatBot:
 
                     await self._wait_while_paused()
                     try:
-                        reply, approval_id = await self._get_approved_reply(tab1, tab2, last_customer_msg)
+                        reply, approval_id = await self._get_approved_reply(tab1, tab2, dashboard_customer_msg)
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
                                  "review after 3 attempts — refreshing the chat page.")

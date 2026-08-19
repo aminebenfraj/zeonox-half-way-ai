@@ -21,6 +21,8 @@ Usage:
 import sys
 import io
 import asyncio
+import contextlib
+import logging
 import subprocess
 import time
 import threading
@@ -32,8 +34,9 @@ if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 from importlib import import_module
 
+from flask import Flask, jsonify, request
 from playwright.async_api import async_playwright
-from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp, ensure_approval_server
+from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp, ensure_approval_server, CONTROL_SERVER_PORT
 from core.login import login_mod_site, login_chameleon, check_chameleon, force_extractor_tab, check_stats
 
 BASE_DIR = Path(__file__).parent
@@ -98,8 +101,45 @@ _HELP = (
     "  help                      — show this list\n"
     "  quit / exit               — stop everything and exit\n"
     f"  Active platforms: {', '.join(PLATFORMS)}  (aliases: plat=platin, g2=gold2, lindu=linduu)\n"
-    f"  Launch specific: python launch_all.py gold justlo linduu"
+    f"  Launch specific: python launch_all.py gold justlo linduu\n"
+    f"  Every command above is also available as a button on the approval dashboard."
 )
+
+
+# ── Command execution / output capture ──────────────────────────────────────────
+# Every command below (typed in this terminal OR clicked as a dashboard button,
+# see the control API in run_bots()) runs through _execute_captured() so both
+# entry points share one code path: it serializes commands with _cmd_lock (a
+# terminal 'restart' and a dashboard button click can never race each other),
+# and mirrors everything printed into a string so the HTTP response can show the
+# dashboard exactly what the terminal would have seen.
+
+_cmd_lock = threading.Lock()
+
+
+class _Tee(io.TextIOBase):
+    """Writes to every given stream — lets a command's prints go to the real
+    console (unchanged terminal UX) and into an in-memory buffer at once."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            st.write(s)
+        return len(s)
+
+    def flush(self):
+        for st in self._streams:
+            st.flush()
+
+
+def _execute_captured(fn, *args, **kwargs) -> str:
+    buf = io.StringIO()
+    with _cmd_lock:
+        with contextlib.redirect_stdout(_Tee(sys.stdout, buf)):
+            fn(*args, **kwargs)
+    return buf.getvalue()
 
 
 # ── Phase 1: Chrome ────────────────────────────────────────────────────────────
@@ -233,6 +273,200 @@ def run_bots():
 
     threading.Thread(target=_listen, daemon=True).start()
 
+    def _resolve(cmd, target):
+        """Validates and resolves `target` ('all' or one platform name) for
+        `cmd`, mirroring each command's own scope: a currently-running bot for
+        stop/restart, any launched platform for chameleon/extractor/fix, or any
+        React platform at all (launched or not — checkins just connects over
+        CDP directly) for checkins. Returns (valid_names, options_list) —
+        options_list is what to show in an 'unknown platform' message."""
+        if cmd in ("stop", "restart"):
+            targets = PLATFORMS if target == "all" else [target]
+            return [n for n in targets if n in procs], PLATFORMS
+        if cmd in ("chameleon", "extractor", "fix"):
+            targets = PLATFORMS if target == "all" else [target]
+            return [n for n in targets if n in PLATFORMS], PLATFORMS
+        if cmd in ("checkins", "checkin", "ins"):
+            targets = ALL_PLATFORMS if target == "all" else [target]
+            return [n for n in targets if n in ALL_PLATFORMS], ALL_PLATFORMS
+        return [], []
+
+    def _cmd_status():
+        print(f"{_BOLD}[Status]{_RESET}")
+        for name in PLATFORMS:
+            if name in stopped:
+                st = "STOPPED (clean exit — needs manual restart)"
+            elif procs[name].poll() is None:
+                uptime = int(time.time() - start_times[name])
+                st = f"RUNNING   uptime={uptime}s   crashes={crash_counts[name]}"
+            else:
+                st = f"DEAD (exit code {procs[name].poll()})"
+            color = _COLORS.get(name, "")
+            print(f"  {color}{name.upper()}{_RESET:<20s}  {st}")
+
+    def _cmd_stop(valid):
+        for name in valid:
+            if procs[name].poll() is None:
+                procs[name].terminate()
+                print(f"[Launcher] {name.upper()} stopped.", flush=True)
+            stopped.add(name)
+        if set(PLATFORMS).issubset(stopped):
+            stop_all.set()
+
+    def _cmd_restart(valid):
+        for name in valid:
+            if procs[name].poll() is None:
+                procs[name].terminate()
+                time.sleep(1)
+            stopped.discard(name)
+            crash_counts[name] = 0
+            procs[name]        = _launch_bot(name)
+            start_times[name]  = time.time()
+            print(f"[Launcher] {name.upper()} restarted.", flush=True)
+
+    def _cmd_chameleon(valid):
+        async def _check_all(names):
+            async with async_playwright() as p:
+                for name in names:
+                    cfg = import_module(f"configs.{name}").config
+                    try:
+                        browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
+                        context = browser.contexts[0]
+                        tab = next(
+                            (pg for pg in context.pages if cfg.tab2_pattern in pg.url),
+                            None,
+                        )
+                        if tab is None:
+                            print(f"[{cfg.platform}]  Chameleon tab not found.", flush=True)
+                        else:
+                            print(f"[{cfg.platform}] Checking Chameleon...", flush=True)
+                            await check_chameleon(tab, cfg.platform)
+                    except Exception as exc:
+                        print(f"[{name.upper()}] Could not connect: {exc}", flush=True)
+        asyncio.run(_check_all(valid))
+
+    def _cmd_extractor(valid):
+        async def _force_extractor(names):
+            async with async_playwright() as p:
+                for name in names:
+                    cfg = import_module(f"configs.{name}").config
+                    try:
+                        browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
+                        context = browser.contexts[0]
+                        tab = next(
+                            (pg for pg in context.pages if cfg.tab2_pattern in pg.url),
+                            None,
+                        )
+                        if tab is None:
+                            print(f"[{cfg.platform}]  Chameleon tab not found.", flush=True)
+                        else:
+                            await force_extractor_tab(tab, cfg.platform)
+                    except Exception as exc:
+                        print(f"[{name.upper()}] Could not connect: {exc}", flush=True)
+        asyncio.run(_force_extractor(valid))
+
+    def _cmd_fix(valid):
+        async def _fix_chameleon(names):
+            async with async_playwright() as p:
+                for name in names:
+                    cfg = import_module(f"configs.{name}").config
+                    try:
+                        browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
+                        context = browser.contexts[0]
+                        tab = next(
+                            (pg for pg in context.pages if cfg.tab2_pattern in pg.url),
+                            None,
+                        )
+                        if tab is None:
+                            print(f"[{cfg.platform}] Chameleon tab not found — opening new tab.", flush=True)
+                            tab = await context.new_page()
+                        else:
+                            print(f"[{cfg.platform}] Chameleon tab found: {tab.url[:80]}", flush=True)
+                        print(f"[{cfg.platform}] Running full Chameleon setup...", flush=True)
+                        await login_chameleon(
+                            tab,
+                            cfg.chameleon_email,
+                            cfg.chameleon_password,
+                            cfg.platform,
+                            cfg.chameleon_chat,
+                        )
+                        print(f"[{cfg.platform}] Fix done. URL: {tab.url}", flush=True)
+                    except Exception as exc:
+                        print(f"[{name.upper()}] Fix failed: {exc}", flush=True)
+        asyncio.run(_fix_chameleon(valid))
+
+    def _cmd_checkins(valid):
+        async def _check_ins(names):
+            from core.checkinall import IN_VALUE, ASA_OUT_VALUE
+            grand_ins = grand_asa_outs = 0
+            grand_money = 0.0
+            rows = []
+            async with async_playwright() as p:
+                for name in names:
+                    cfg   = import_module(f"configs.{name}").config
+                    label = cfg.platform
+                    try:
+                        browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
+                        context = browser.contexts[0]
+                        tab = next(
+                            (pg for pg in context.pages if cfg.tab1_pattern in pg.url),
+                            None,
+                        )
+                        if tab is None:
+                            print(f"[{label}] Mod-site tab not found.", flush=True)
+                            rows.append((label, 0, 0, 0.0, False))
+                            continue
+                        stats = await check_stats(tab, cfg.platform)
+                        if not stats:
+                            rows.append((label, 0, 0, 0.0, False))
+                            continue
+                        ins      = stats.get("Ins", 0)
+                        asa_outs = stats.get("ASA Outs", 0)
+                        money    = ins * IN_VALUE + asa_outs * ASA_OUT_VALUE
+                        grand_ins      += ins
+                        grand_asa_outs += asa_outs
+                        grand_money    += money
+                        rows.append((label, ins, asa_outs, money, True))
+                        detail = "  ".join(f"{k}={v}" for k, v in stats.items())
+                        print(f"[{label}] {detail}", flush=True)
+                        print(
+                            f"[{label}] Ins ({ins}) x {IN_VALUE:.2f} DT + "
+                            f"ASA Outs ({asa_outs}) x {ASA_OUT_VALUE:.2f} DT = {money:,.2f} DT",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(f"[{label}] Could not read stats: {exc}", flush=True)
+                        rows.append((label, 0, 0, 0.0, False))
+            if rows:
+                read = sum(1 for r in rows if r[4])
+                print(f"\n{_BOLD}[checkins] Summary{_RESET}", flush=True)
+                for plat, ins, asa, money, ok in rows:
+                    if ok:
+                        print(f"  {plat:<10s} Ins={ins:<6d} ASA Outs={asa:<6d} = {money:,.2f} DT", flush=True)
+                    else:
+                        print(f"  {plat:<10s} (stats unavailable — bot not running / tab not found)", flush=True)
+                print(
+                    f"  {_BOLD}TOTAL across {read} of {len(rows)} account(s): "
+                    f"Ins={grand_ins} + ASA Outs={grand_asa_outs} "
+                    f"= {grand_money:,.2f} DT{_RESET}",
+                    flush=True,
+                )
+        asyncio.run(_check_ins(valid))
+
+    def _cmd_checkinall():
+        from core.checkinall import gather_and_write
+        text, path = asyncio.run(gather_and_write([p for p in ALL_PLATFORMS if p != "gold3"]))
+        print(text, flush=True)
+        print(f"[checkinall] Note saved to {path}", flush=True)
+
+    # Shared by the terminal parser and the HTTP control API below so a typed
+    # command and a dashboard button click run through the exact same code.
+    _PER_TARGET_CMDS = {
+        "stop": _cmd_stop, "restart": _cmd_restart, "chameleon": _cmd_chameleon,
+        "extractor": _cmd_extractor, "fix": _cmd_fix,
+        "checkins": _cmd_checkins, "checkin": _cmd_checkins, "ins": _cmd_checkins,
+    }
+
     def _handle_commands():
         while not cmd_q.empty():
             raw    = cmd_q.get_nowait()
@@ -247,202 +481,17 @@ def run_bots():
                 print(_HELP)
 
             elif cmd == "status":
-                print(f"{_BOLD}[Status]{_RESET}")
-                for name in PLATFORMS:
-                    if name in stopped:
-                        st = "STOPPED (clean exit — needs manual restart)"
-                    elif procs[name].poll() is None:
-                        uptime = int(time.time() - start_times[name])
-                        st = f"RUNNING   uptime={uptime}s   crashes={crash_counts[name]}"
-                    else:
-                        st = f"DEAD (exit code {procs[name].poll()})"
-                    color = _COLORS.get(name, "")
-                    print(f"  {color}{name.upper()}{_RESET:<20s}  {st}")
+                _execute_captured(_cmd_status)
 
-            elif cmd == "stop":
-                targets = PLATFORMS if target == "all" else [target]
-                valid   = [n for n in targets if n in procs]
+            elif cmd in _PER_TARGET_CMDS:
+                valid, options = _resolve(cmd, target)
                 if not valid:
-                    print(f"[Launcher] Unknown platform '{target}'. Options: {', '.join(PLATFORMS)}")
+                    print(f"[Launcher] Unknown platform '{target}'. Options: {', '.join(options)}")
                     continue
-                for name in valid:
-                    if procs[name].poll() is None:
-                        procs[name].terminate()
-                        print(f"[Launcher] {name.upper()} stopped.", flush=True)
-                    stopped.add(name)
-                if set(PLATFORMS).issubset(stopped):
-                    stop_all.set()
-
-            elif cmd == "restart":
-                targets = PLATFORMS if target == "all" else [target]
-                valid   = [n for n in targets if n in procs]
-                if not valid:
-                    print(f"[Launcher] Unknown platform '{target}'. Options: {', '.join(PLATFORMS)}")
-                    continue
-                for name in valid:
-                    if procs[name].poll() is None:
-                        procs[name].terminate()
-                        time.sleep(1)
-                    stopped.discard(name)
-                    crash_counts[name] = 0
-                    procs[name]        = _launch_bot(name)
-                    start_times[name]  = time.time()
-                    print(f"[Launcher] {name.upper()} restarted.", flush=True)
-
-            elif cmd == "chameleon":
-                targets = PLATFORMS if target == "all" else [target]
-                valid   = [n for n in targets if n in PLATFORMS]
-                if not valid:
-                    print(f"[Launcher] Unknown platform '{target}'. Options: {', '.join(PLATFORMS)}")
-                    continue
-                async def _check_all(names):
-                    async with async_playwright() as p:
-                        for name in names:
-                            cfg = import_module(f"configs.{name}").config
-                            try:
-                                browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
-                                context = browser.contexts[0]
-                                tab = next(
-                                    (pg for pg in context.pages if cfg.tab2_pattern in pg.url),
-                                    None,
-                                )
-                                if tab is None:
-                                    print(f"[{cfg.platform}]  Chameleon tab not found.", flush=True)
-                                else:
-                                    print(f"[{cfg.platform}] Checking Chameleon...", flush=True)
-                                    await check_chameleon(tab, cfg.platform)
-                            except Exception as exc:
-                                print(f"[{name.upper()}] Could not connect: {exc}", flush=True)
-                asyncio.run(_check_all(valid))
-
-            elif cmd == "extractor":
-                targets = PLATFORMS if target == "all" else [target]
-                valid   = [n for n in targets if n in PLATFORMS]
-                if not valid:
-                    print(f"[Launcher] Unknown platform '{target}'. Options: {', '.join(PLATFORMS)}")
-                    continue
-                async def _force_extractor(names):
-                    async with async_playwright() as p:
-                        for name in names:
-                            cfg = import_module(f"configs.{name}").config
-                            try:
-                                browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
-                                context = browser.contexts[0]
-                                tab = next(
-                                    (pg for pg in context.pages if cfg.tab2_pattern in pg.url),
-                                    None,
-                                )
-                                if tab is None:
-                                    print(f"[{cfg.platform}]  Chameleon tab not found.", flush=True)
-                                else:
-                                    await force_extractor_tab(tab, cfg.platform)
-                            except Exception as exc:
-                                print(f"[{name.upper()}] Could not connect: {exc}", flush=True)
-                asyncio.run(_force_extractor(valid))
-
-            elif cmd == "fix":
-                targets = PLATFORMS if target == "all" else [target]
-                valid   = [n for n in targets if n in PLATFORMS]
-                if not valid:
-                    print(f"[Launcher] Unknown platform '{target}'. Options: {', '.join(PLATFORMS)}")
-                    continue
-                async def _fix_chameleon(names):
-                    async with async_playwright() as p:
-                        for name in names:
-                            cfg = import_module(f"configs.{name}").config
-                            try:
-                                browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
-                                context = browser.contexts[0]
-                                tab = next(
-                                    (pg for pg in context.pages if cfg.tab2_pattern in pg.url),
-                                    None,
-                                )
-                                if tab is None:
-                                    print(f"[{cfg.platform}] Chameleon tab not found — opening new tab.", flush=True)
-                                    tab = await context.new_page()
-                                else:
-                                    print(f"[{cfg.platform}] Chameleon tab found: {tab.url[:80]}", flush=True)
-                                print(f"[{cfg.platform}] Running full Chameleon setup...", flush=True)
-                                await login_chameleon(
-                                    tab,
-                                    cfg.chameleon_email,
-                                    cfg.chameleon_password,
-                                    cfg.platform,
-                                    cfg.chameleon_chat,
-                                )
-                                print(f"[{cfg.platform}] Fix done. URL: {tab.url}", flush=True)
-                            except Exception as exc:
-                                print(f"[{name.upper()}] Fix failed: {exc}", flush=True)
-                asyncio.run(_fix_chameleon(valid))
-
-            elif cmd in ("checkins", "checkin", "ins"):
-                targets = ALL_PLATFORMS if target == "all" else [target]
-                valid   = [n for n in targets if n in ALL_PLATFORMS]
-                if not valid:
-                    print(f"[Launcher] Unknown platform '{target}'. Options: {', '.join(ALL_PLATFORMS)}")
-                    continue
-                async def _check_ins(names):
-                    from core.checkinall import IN_VALUE, ASA_OUT_VALUE
-                    grand_ins = grand_asa_outs = 0
-                    grand_money = 0.0
-                    rows = []
-                    async with async_playwright() as p:
-                        for name in names:
-                            cfg   = import_module(f"configs.{name}").config
-                            label = cfg.platform
-                            try:
-                                browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
-                                context = browser.contexts[0]
-                                tab = next(
-                                    (pg for pg in context.pages if cfg.tab1_pattern in pg.url),
-                                    None,
-                                )
-                                if tab is None:
-                                    print(f"[{label}] Mod-site tab not found.", flush=True)
-                                    rows.append((label, 0, 0, 0.0, False))
-                                    continue
-                                stats = await check_stats(tab, cfg.platform)
-                                if not stats:
-                                    rows.append((label, 0, 0, 0.0, False))
-                                    continue
-                                ins      = stats.get("Ins", 0)
-                                asa_outs = stats.get("ASA Outs", 0)
-                                money    = ins * IN_VALUE + asa_outs * ASA_OUT_VALUE
-                                grand_ins      += ins
-                                grand_asa_outs += asa_outs
-                                grand_money    += money
-                                rows.append((label, ins, asa_outs, money, True))
-                                detail = "  ".join(f"{k}={v}" for k, v in stats.items())
-                                print(f"[{label}] {detail}", flush=True)
-                                print(
-                                    f"[{label}] Ins ({ins}) × ${IN_VALUE:.2f} + "
-                                    f"ASA Outs ({asa_outs}) × ${ASA_OUT_VALUE:.2f} = ${money:,.2f}",
-                                    flush=True,
-                                )
-                            except Exception as exc:
-                                print(f"[{label}] Could not read stats: {exc}", flush=True)
-                                rows.append((label, 0, 0, 0.0, False))
-                    if rows:
-                        read = sum(1 for r in rows if r[4])
-                        print(f"\n{_BOLD}[checkins] Summary{_RESET}", flush=True)
-                        for plat, ins, asa, money, ok in rows:
-                            if ok:
-                                print(f"  {plat:<10s} Ins={ins:<6d} ASA Outs={asa:<6d} = ${money:,.2f}", flush=True)
-                            else:
-                                print(f"  {plat:<10s} (stats unavailable — bot not running / tab not found)", flush=True)
-                        print(
-                            f"  {_BOLD}TOTAL across {read} of {len(rows)} account(s): "
-                            f"Ins={grand_ins} + ASA Outs={grand_asa_outs} "
-                            f"= ${grand_money:,.2f}{_RESET}",
-                            flush=True,
-                        )
-                asyncio.run(_check_ins(valid))
+                _execute_captured(_PER_TARGET_CMDS[cmd], valid)
 
             elif cmd in ("checkinall", "checkinsall", "ca"):
-                from core.checkinall import gather_and_write
-                text, path = asyncio.run(gather_and_write([p for p in ALL_PLATFORMS if p != "gold3"]))
-                print(text, flush=True)
-                print(f"[checkinall] Note saved to {path}", flush=True)
+                _execute_captured(_cmd_checkinall)
 
             elif cmd in ("quit", "exit"):
                 print(f"[Launcher] Quit received — stopping all bots...")
@@ -450,6 +499,59 @@ def run_bots():
 
             else:
                 print(f"[Launcher] Unknown command '{cmd}'. Type 'help' for options.")
+
+    # ── Control API — lets the approval dashboard drive these same commands as
+    # buttons instead of typing them here. Local-only (127.0.0.1); every
+    # command runs through _execute_captured so it's serialized with anything
+    # typed in this terminal and the response carries exactly what would have
+    # printed here.
+    control_app = Flask(__name__)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)  # keep Flask's request logging out of this console
+
+    @control_app.get("/control/health")
+    def _control_health():
+        return jsonify({"ok": True})
+
+    @control_app.get("/control/status")
+    def _control_status():
+        with _cmd_lock:
+            platforms = {}
+            for name in PLATFORMS:
+                if name in stopped:
+                    platforms[name] = {"state": "stopped"}
+                elif procs[name].poll() is None:
+                    platforms[name] = {
+                        "state": "running",
+                        "uptime": int(time.time() - start_times[name]),
+                        "crashes": crash_counts[name],
+                    }
+                else:
+                    platforms[name] = {"state": "dead", "exit_code": procs[name].poll()}
+        return jsonify({"ok": True, "platforms": platforms, "all_platforms": ALL_PLATFORMS})
+
+    @control_app.post("/control/command")
+    def _control_command():
+        body   = request.get_json(force=True, silent=True) or {}
+        cmd    = (body.get("cmd") or "").strip().lower()
+        target = (body.get("target") or "all").strip().lower()
+        target = _ALIASES.get(target, target)
+
+        if cmd == "status":
+            return jsonify({"ok": True, "output": _execute_captured(_cmd_status)})
+        if cmd in ("checkinall", "checkinsall", "ca"):
+            return jsonify({"ok": True, "output": _execute_captured(_cmd_checkinall)})
+        if cmd in _PER_TARGET_CMDS:
+            valid, options = _resolve(cmd, target)
+            if not valid:
+                return jsonify({"ok": False, "error": f"Unknown platform '{target}'. Options: {', '.join(options)}"}), 400
+            return jsonify({"ok": True, "output": _execute_captured(_PER_TARGET_CMDS[cmd], valid)})
+        return jsonify({"ok": False, "error": f"Unknown command '{cmd}'."}), 400
+
+    threading.Thread(
+        target=lambda: control_app.run(host="127.0.0.1", port=CONTROL_SERVER_PORT, threaded=True, use_reloader=False),
+        daemon=True,
+    ).start()
+    print(f"[Launcher] Control API for the dashboard's buttons: http://127.0.0.1:{CONTROL_SERVER_PORT}\n")
 
     def _interruptible_sleep(seconds: float):
         deadline = time.time() + seconds

@@ -44,6 +44,7 @@ from core.bot import (
     _is_context_destroyed,
     ManualReviewLimitExceeded,
     log_sent_message,
+    contains_banned_language,
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
@@ -444,6 +445,13 @@ class XkussBot:
         while True:
             await report_status(self.cfg.platform, "generating")
             reply = await self._generate_reply(tab2)
+
+            banned = contains_banned_language(reply)
+            if banned:
+                self.log(f"[GUARD] Reply contained banned language ('{banned}') — discarding, never shown, regenerating.")
+                await report_status(self.cfg.platform, "recovering", f"blocked reply containing '{banned}'")
+                continue
+
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
             await report_status(self.cfg.platform, "awaiting_approval")
             approved, final_text, req_id = await request_approval(

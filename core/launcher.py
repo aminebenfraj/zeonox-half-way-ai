@@ -8,6 +8,13 @@ from pathlib import Path
 
 APPROVAL_SERVER_PORT = int(os.environ.get("APPROVAL_SERVER_PORT", "8799"))
 
+# launch_all.py's in-process control API (restart/stop/fix/checkinall/... as
+# HTTP instead of typed terminal commands) — see run_bots() in launch_all.py.
+# Local-only by design: it drives real Chrome/CDP connections on this machine,
+# so it's only reachable (and only useful) from whatever is running alongside
+# the bots, e.g. the dashboard's control panel when both run on the same host.
+CONTROL_SERVER_PORT = int(os.environ.get("CONTROL_SERVER_PORT", "8800"))
+
 _CHROME_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -115,3 +122,13 @@ def ensure_approval_server(port: int = APPROVAL_SERVER_PORT):
     else:
         print("[ERROR] Approval dashboard did not come up in time. Bots will stall waiting for it.")
     return proc
+
+
+# ── Control API (launch_all.py's restart/stop/fix/checkinall buttons) ──────────
+
+def is_control_server_ready(port: int = CONTROL_SERVER_PORT) -> bool:
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/control/health", timeout=1)
+        return True
+    except Exception:
+        return False

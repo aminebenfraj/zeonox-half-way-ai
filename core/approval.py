@@ -64,6 +64,7 @@ async def request_approval(
     *,
     customer_message: str = "",
     context: str = "",
+    reply_type: str = "",
     timeout: float = 20.0,
     chat_still_active: Callable[[], Awaitable[bool]] | None = None,
     chat_check_interval: float = 6.0,
@@ -89,6 +90,7 @@ async def request_approval(
                 "reply": reply,
                 "customer_message": customer_message,
                 "context": context,
+                "reply_type": reply_type,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             },
         )

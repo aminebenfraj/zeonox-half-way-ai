@@ -56,6 +56,7 @@ from core.bot import (
     _is_context_destroyed,
     ManualReviewLimitExceeded,
     log_sent_message,
+    contains_banned_language,
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
@@ -77,6 +78,12 @@ from core.justlo_login import (
 # write a reply — we just nudge the client ('Anstupsen'). The \b before ASA keeps
 # this from matching 'FASA' (a first-contact task, which has no number anyway).
 _ASA_NUDGE_RE = re.compile(r"\bASA\s*[23]\b", re.IGNORECASE)
+
+# Broader than _ASA_NUDGE_RE above: matches ANY ASA follow-up tag (including
+# 'ASA 1', which — unlike ASA 2/3 — does get a written reply). Same \b guard
+# against matching inside 'FASA'. Used only to label a reply on the approval
+# dashboard as a follow-up vs. a regular dialog; it never changes bot behavior.
+_ASA_ANY_RE = re.compile(r"\bASA\b", re.IGNORECASE)
 
 POLL_INTERVAL    = 3    # seconds between idle checks
 WAITING_REPLAY_INTERVAL = 90  # seconds with no dialog before re-pressing Play / reloading the console
@@ -488,7 +495,7 @@ class JustloBot:
             f"({'manual review' if manual_review else 'server error'})."
         )
 
-    async def _get_approved_reply(self, tab1, tab2) -> tuple[str, str]:
+    async def _get_approved_reply(self, tab1, tab2, reply_type: str = "") -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
@@ -496,10 +503,18 @@ class JustloBot:
         while True:
             await report_status(self.cfg.platform, "generating")
             reply = await self._generate_reply(tab2)
+
+            banned = contains_banned_language(reply)
+            if banned:
+                self.log(f"[GUARD] Reply contained banned language ('{banned}') — discarding, never shown, regenerating.")
+                await report_status(self.cfg.platform, "recovering", f"blocked reply containing '{banned}'")
+                continue
+
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
             await report_status(self.cfg.platform, "awaiting_approval")
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply,
+                reply_type=reply_type,
                 chat_still_active=lambda: self._chat_still_active(tab1),
             )
             if approved:
@@ -675,6 +690,24 @@ class JustloBot:
                 raise
             return False
         return bool(_ASA_NUDGE_RE.search(txt or ""))
+
+    async def _queue_task_type(self, tab1) -> str:
+        """Classifies the current queue task as 'DIA' (a regular dialog) or
+        'ASA Follow-up' for display on the approval dashboard. ASA 2/3 never
+        reach this (they're nudged, see _is_asa_nudge) and FASA never does
+        either (handed over before a reply is generated), so only ASA 1 and
+        plain dialogs are actually seen here."""
+        try:
+            txt = await tab1.evaluate(
+                "(s) => { const el = document.querySelector(s);"
+                " return el ? (el.textContent || '').trim() : ''; }",
+                self.cfg.sel_queue_message,
+            )
+        except PlaywrightError as e:
+            if _is_fatal(e):
+                raise
+            txt = ""
+        return "ASA Follow-up" if _ASA_ANY_RE.search(txt or "") else "DIA"
 
     async def _click_anstupsen(self, tab1):
         """Press 'Anstupsen' to nudge the client (used for ASA 2 / ASA 3)."""
@@ -943,7 +976,8 @@ class JustloBot:
                         continue
 
                     try:
-                        reply, approval_id = await self._get_approved_reply(tab1, tab2)
+                        reply_type = await self._queue_task_type(tab1)
+                        reply, approval_id = await self._get_approved_reply(tab1, tab2, reply_type)
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
                                  "review after 3 attempts — refreshing the chat (re-extracting "
