@@ -1,3 +1,5 @@
+import os
+
 from core.bot import BotConfig
 
 config = BotConfig(
@@ -6,9 +8,9 @@ config = BotConfig(
     tab1_pattern="mods.platin-chat.com",
     tab2_pattern="chamaleon-ai",
     tab1_url="https://mods.platin-chat.com/login",
-    username="TT_DAN_024",
-    password="V5#qM8@tL2!xR9",
-    chameleon_email="amed13515@gmail.com",
-    chameleon_password="Amine963@",
+    username=os.environ.get("PLATIN_USERNAME", ""),
+    password=os.environ.get("PLATIN_PASSWORD", ""),
+    chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
+    chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
     reload_on_zero_duration=True,
 )

@@ -1,3 +1,5 @@
+import os
+
 from core.bot import BotConfig
 
 config = BotConfig(
@@ -6,9 +8,9 @@ config = BotConfig(
     tab1_pattern="mods.chatsx.net",
     tab2_pattern="chamaleon-ai",
     tab1_url="https://mods.chatsx.net/login",
-    username="S69_DA_006",
-    password="X4@pN8$rK5#zL7",
-    chameleon_email="amed13515@gmail.com",
-    chameleon_password="Amine963@",
+    username=os.environ.get("S69_USERNAME", ""),
+    password=os.environ.get("S69_PASSWORD", ""),
+    chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
+    chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
     reload_on_zero_duration=True,
 )

@@ -61,6 +61,7 @@ from core.bot import (
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
 from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
+from core import chameleon_local
 from core.justlo_login import (
     login_justlo,
     go_console,
@@ -204,6 +205,7 @@ class JustloBot:
         self.cfg = config
         self._last_phase = None   # last logged phase, so we only log on change
         self._last_sig   = None   # signature of the last conversation we handled
+        self._local_mode = False  # set once at the top of run() — see core/chameleon_local.py
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -251,11 +253,12 @@ class JustloBot:
 
     async def _resolve_tabs(self, context, retries: int = TAB_MAX_RETRIES):
         """Re-query both tabs from the live context, matched by URL substring."""
+        tab2_pattern = chameleon_local.LOCAL_TAB_PATTERN if self._local_mode else self.cfg.tab2_pattern
         for attempt in range(retries):
             pages = context.pages
             self.log(f"Tab search (attempt {attempt + 1}/{retries}) — {len(pages)} page(s) open.")
             tab1 = next((p for p in pages if self.cfg.tab1_pattern in p.url), None)
-            tab2 = next((p for p in pages if self.cfg.tab2_pattern in p.url), None)
+            tab2 = next((p for p in pages if tab2_pattern in p.url), None)
             if tab1 and tab2:
                 self.log(f"  Tab1 OK -> {tab1.url[:80]}")
                 self.log(f"  Tab2 OK -> {tab2.url[:80]}")
@@ -265,7 +268,7 @@ class JustloBot:
             if not tab1:
                 missing.append(f"tab1 (pattern: '{self.cfg.tab1_pattern}')")
             if not tab2:
-                missing.append(f"tab2 (pattern: '{self.cfg.tab2_pattern}')")
+                missing.append(f"tab2 (pattern: '{tab2_pattern}')")
             self.log(f"[WARN] Not found: {', '.join(missing)}")
             for p in pages:
                 self.log(f"  open tab -> {p.url[:100]}")
@@ -412,6 +415,9 @@ class JustloBot:
             return False
 
     async def _generate_reply(self, tab2) -> str:
+        if self._local_mode:
+            return await chameleon_local.generate_reply(tab2, self.cfg.additional_instructions, GENERATE_TIMEOUT)
+
         old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
         gen_btn   = tab2.locator(_SEL_GEN_BTN)
         self.log(f"Waiting up to {EXTRACT_TIMEOUT}s for 'Generate Reply' button...")
@@ -495,7 +501,7 @@ class JustloBot:
             f"({'manual review' if manual_review else 'server error'})."
         )
 
-    async def _get_approved_reply(self, tab1, tab2, reply_type: str = "") -> tuple[str, str]:
+    async def _get_approved_reply(self, tab1, tab2, reply_type: str = "", customer_message: str = "") -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
@@ -515,6 +521,7 @@ class JustloBot:
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply,
                 reply_type=reply_type,
+                customer_message=customer_message,
                 chat_still_active=lambda: self._chat_still_active(tab1),
             )
             if approved:
@@ -771,7 +778,11 @@ class JustloBot:
         await tab1.bring_to_front()
         textarea = tab1.locator(self.cfg.sel_textarea)
         await textarea.click()
-        await textarea.fill(reply)
+        # Local mode: paste from the OS clipboard, same as a human copying out
+        # of our /chameleon page (see chameleon_local.paste_via_clipboard()).
+        # Falls back to setting the value directly on any clipboard hiccup.
+        if not (self._local_mode and await chameleon_local.paste_via_clipboard(tab1, textarea, reply)):
+            await textarea.fill(reply)
         await self._nudge_message_box(tab1)
         wait = random.randint(15, 20)
         self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
@@ -817,6 +828,10 @@ class JustloBot:
 
     async def _restart_chameleon_job(self, tab1, tab2):
         """Re-establish a clean chameleon state after a mid-cycle failure."""
+        if self._local_mode:
+            self.log("[RECOVERY] Local mode — nothing to fix; next cycle re-pastes fresh.")
+            return
+
         self.log("[RECOVERY] Failure but chat still active — restarting Chameleon job "
                  "(re-copy HTML → paste → generate).")
         try:
@@ -857,17 +872,26 @@ class JustloBot:
             context = browser.contexts[0]
             self.log(f"Browser context has {len(context.pages)} open page(s).")
 
+            self._local_mode = await chameleon_local.is_local_mode(self.cfg.platform.lower())
+            if self._local_mode:
+                self.log("[LOCAL] Automatic Mode is ON — replies will come from this project's "
+                         "own /chameleon page (Groq), not the real Chameleon-AI.")
+
             # ── Set up both tabs: login to justlo + chameleon ──────────────
             tab1 = await self._find_or_open_tab(context, self.cfg.tab1_pattern)
             self.log("Logging in to justlo and opening the console (Play)...")
             await login_justlo(tab1, self.cfg, self.cfg.platform)
 
-            tab2 = await self._find_or_open_tab(context, self.cfg.tab2_pattern)
-            self.log("Setting up chameleon tab...")
-            await login_chameleon(
-                tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
-                self.cfg.platform, self.cfg.chameleon_chat,
-            )
+            if self._local_mode:
+                tab2 = await self._find_or_open_tab(context, chameleon_local.LOCAL_TAB_PATTERN)
+                await chameleon_local.setup_local_tab(tab2, "justlo_lindu")
+            else:
+                tab2 = await self._find_or_open_tab(context, self.cfg.tab2_pattern)
+                self.log("Setting up chameleon tab...")
+                await login_chameleon(
+                    tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
+                    self.cfg.platform, self.cfg.chameleon_chat,
+                )
 
             self.log("Both tabs ready. Bot running.\n")
 
@@ -935,9 +959,10 @@ class JustloBot:
                     # chameleon's verdict (checked below, after extraction) decides
                     # between handover and a normal reply.
                     await tab1.bring_to_front()
-                    if await self._is_chameleon_broken(tab2):
-                        await self._fix_chameleon_only(tab2)
-                    await self._ensure_chat_selected(tab2)
+                    if not self._local_mode:
+                        if await self._is_chameleon_broken(tab2):
+                            await self._fix_chameleon_only(tab2)
+                        await self._ensure_chat_selected(tab2)
 
                     await tab1.bring_to_front()
                     await self._wait_for_page_ready(tab1)
@@ -948,28 +973,38 @@ class JustloBot:
                         continue
 
                     await tab2.bring_to_front()
-                    await self._paste_and_extract(tab2, html)
+                    if self._local_mode:
+                        self.log(f"[LOCAL] Pasting {len(html):,} chars into our own /chameleon page...")
+                        if not await chameleon_local.paste_and_extract(tab2, html, "justlo_lindu"):
+                            raise RuntimeError("Local Chameleon page: extraction did not produce a Generate button.")
+                        is_fc = await chameleon_local.is_first_contact(tab2)
+                        last_customer_msg = await chameleon_local.get_last_message(tab2)
+                    else:
+                        await self._paste_and_extract(tab2, html)
+                        is_fc = await self._is_first_contact(tab2)
+                        last_customer_msg = await chameleon_local.extract_last_message(context, html, "justlo_lindu")
 
-                    if await self._is_first_contact(tab2):
+                    if is_fc:
                         # Chameleon is the sole authority on First Contact — hand over
                         # only when it says so, never based on the local DOM grid.
                         self.log("[FC] Chameleon flagged First Contact — "
                                  "handing over via 'Übergeben'.")
                         await self._handover_first_contact(tab1)
-                        await tab2.reload()
-                        await self._wait_for_page_ready(tab2, "domcontentloaded")
-                        # Reload is a React SPA remount — domcontentloaded fires long
-                        # before the combobox exists, so give it a moment to hydrate
-                        # before checking/selecting the chat, or we race the fallback
-                        # into picking whatever chat happens to be first in the list.
-                        try:
-                            await tab2.locator(_SEL_COMBOBOX).first.wait_for(
-                                state="visible", timeout=15_000
-                            )
-                        except Exception:
-                            pass
-                        await self._ensure_chat_selected(tab2)
-                        await self._ensure_extractor_tab_active(tab2)
+                        if not self._local_mode:
+                            await tab2.reload()
+                            await self._wait_for_page_ready(tab2, "domcontentloaded")
+                            # Reload is a React SPA remount — domcontentloaded fires long
+                            # before the combobox exists, so give it a moment to hydrate
+                            # before checking/selecting the chat, or we race the fallback
+                            # into picking whatever chat happens to be first in the list.
+                            try:
+                                await tab2.locator(_SEL_COMBOBOX).first.wait_for(
+                                    state="visible", timeout=15_000
+                                )
+                            except Exception:
+                                pass
+                            await self._ensure_chat_selected(tab2)
+                            await self._ensure_extractor_tab_active(tab2)
                         # Mark this one handled so the wait loop holds for a new one.
                         self._last_sig = sig
                         cycle -= 1
@@ -977,7 +1012,7 @@ class JustloBot:
 
                     try:
                         reply_type = await self._queue_task_type(tab1)
-                        reply, approval_id = await self._get_approved_reply(tab1, tab2, reply_type)
+                        reply, approval_id = await self._get_approved_reply(tab1, tab2, reply_type, last_customer_msg)
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
                                  "review after 3 attempts — refreshing the chat (re-extracting "

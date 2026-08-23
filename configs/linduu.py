@@ -1,3 +1,5 @@
+import os
+
 from core.justlo_bot import JustloBot, JustloConfig
 
 # Linduu shares the SAME ExtJS moderation console as justlo (same Play/Pause,
@@ -19,12 +21,12 @@ config = JustloConfig(
     login_url="https://www.linduu.com/auth/index/login",  # dedicated login page
     mod_url="https://www.linduu.com/community-mod/",       # the ExtJS console
     console_via_goto=True,
-    username="CB-Alex",                                   # #username
-    password="654321",                                   # #password
+    username=os.environ.get("LINDUU_USERNAME", ""),      # #username
+    password=os.environ.get("LINDUU_PASSWORD", ""),      # #password
 
     # ── chameleon AI (shared with justlo — same 'Justlo/Linduu DE' chat) ───────
-    chameleon_email="amed13515@gmail.com",
-    chameleon_password="Amine963@",
+    chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
+    chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
     chameleon_chat="Justlo/Linduu DE",
     additional_instructions="",
 

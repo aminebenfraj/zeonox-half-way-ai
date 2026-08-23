@@ -1,3 +1,5 @@
+import os
+
 from core.justlo_bot import JustloBot, JustloConfig
 
 config = JustloConfig(
@@ -11,12 +13,12 @@ config = JustloConfig(
     # there the flow is: Login -> Einloggen -> click 'Mod' -> Play.
     tab1_url="https://mod.justlo.de",                     # entry / landing URL
     mod_url="https://mod.justlo.de/community-mod/",        # the ExtJS console
-    username="RK-Alex",                                   # #login input[name='username']
-    password="123456",                                    # #login input[name='password']
+    username=os.environ.get("JUSTLO_USERNAME", ""),      # #login input[name='username']
+    password=os.environ.get("JUSTLO_PASSWORD", ""),      # #login input[name='password']
 
     # ── chameleon AI (shared with every other platform) ──────────────────────
-    chameleon_email="amed13515@gmail.com",
-    chameleon_password="Amine963@",
+    chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
+    chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
     chameleon_chat="Justlo/Linduu DE",  # justlo + linduu share this chameleon chat
     additional_instructions="",
 )
