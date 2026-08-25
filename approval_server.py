@@ -33,6 +33,7 @@ bot's next generate/status ping simply creates a fresh one.
 
 import concurrent.futures
 import hmac
+import html
 import itertools
 import json
 import os
@@ -50,10 +51,6 @@ from flask import Flask, jsonify, request, Response
 
 from core.launcher import is_cdp_ready
 
-try:
-    from deep_translator import GoogleTranslator
-except ImportError:  # translation is a nice-to-have — dashboard still works without it
-    GoogleTranslator = None
 
 try:
     from flask_sock import Sock
@@ -204,6 +201,43 @@ _mode_overrides: dict[str, str] = {}
 SELF_MANAGED_PLATFORMS = ("xkuss", "justlo", "linduu")
 _chameleon_source: dict[str, str] = {p: "real" for p in SELF_MANAGED_PLATFORMS}
 
+# ── Custom instructions for the built-in Groq generator ─────────────────────
+# Operator-editable text (see /bots' "Custom AI instructions" box) that's
+# appended to every _generate_chameleon_reply() call, on top of the fixed
+# _CHAMELEON_SYSTEM_PROMPT and any one-off "Zusatzanweisung" typed into a
+# single request. Keyed the same way the Groq pipeline itself already is
+# everywhere else (chameleon_local._SEL_PLATFORM_TAB, the /chameleon page's
+# currentPlatform) -- "xkuss" and "justlo_lindu" -- NOT by the three
+# SELF_MANAGED_PLATFORMS above: Justlo and Linduu bots already share the same
+# local /chameleon page/tab and the same Groq prompt, so their custom
+# instructions are shared too (the /bots page labels this explicitly so it's
+# never a silent surprise). Persisted to disk (unlike _chameleon_source) since
+# this is operator-authored content worth surviving a server restart.
+_CUSTOM_INSTRUCTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_instructions.json")
+_CUSTOM_INSTRUCTIONS_KEYS = ("xkuss", "justlo_lindu")
+
+
+def _load_custom_instructions() -> dict:
+    try:
+        with open(_CUSTOM_INSTRUCTIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {k: (data.get(k) or "").strip() for k in _CUSTOM_INSTRUCTIONS_KEYS}
+    except (OSError, ValueError):
+        return {k: "" for k in _CUSTOM_INSTRUCTIONS_KEYS}
+
+
+def _save_custom_instructions_locked():
+    """Caller must hold _lock. Best-effort: a failed write just means the
+    edit won't survive a restart, not a request-breaking error."""
+    try:
+        with open(_CUSTOM_INSTRUCTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_custom_instructions, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+_custom_instructions: dict[str, str] = _load_custom_instructions()
+
 # ── Bot process management (see /bots) ──────────────────────────────────────
 # Only the three self-managed platforms: each does its own Chrome launch +
 # login inside run_bot.py, so starting one is just spawning that one process
@@ -294,12 +328,33 @@ def chameleon_prompt():
 _translate_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="translate")
 
 
+_TRANSLATE_RESULT_RE = re.compile(r'class="result-container">(.*?)</div>', re.DOTALL)
+
+
+def _translate_de_en_sync(text: str) -> str | None:
+    # deep_translator's GoogleTranslator scrapes the desktop translate.google.com
+    # page for a <div class="t0"> that Google has since removed, so it always
+    # raised TranslationNotFound. The lightweight /m (mobile) endpoint still
+    # returns a plain <div class="result-container"> with the translation.
+    resp = httpx.get(
+        "https://translate.google.com/m",
+        params={"sl": "de", "tl": "en", "q": text},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=6.0,
+    )
+    resp.raise_for_status()
+    match = _TRANSLATE_RESULT_RE.search(resp.text)
+    if not match:
+        return None
+    return html.unescape(match.group(1)).strip() or None
+
+
 def _translate_de_en(text: str, timeout: float = 6.0) -> str | None:
     text = (text or "").strip()
-    if not text or GoogleTranslator is None:
+    if not text:
         return None
     try:
-        future = _translate_pool.submit(lambda: GoogleTranslator(source="de", target="en").translate(text))
+        future = _translate_pool.submit(_translate_de_en_sync, text)
         return future.result(timeout=timeout)
     except Exception:
         return None
@@ -369,6 +424,7 @@ def _classify_message_with_groq(message: str) -> dict:
             temperature=0,
             max_completion_tokens=512,
             top_p=1,
+            reasoning_effort="low",
             response_format={"type": "json_object"},
         )
     except Exception as e:
@@ -479,8 +535,9 @@ def _validate_chameleon_reply(mode_line: str, transcript: str, reply: str) -> di
                 {"role": "user", "content": user_content},
             ],
             temperature=0,
-            max_completion_tokens=300,
+            max_completion_tokens=400,
             top_p=1,
+            reasoning_effort="low",
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content or "{}")
@@ -533,12 +590,18 @@ def _format_transcript(conversation: list) -> str:
     return "\n".join(lines) if lines else "(noch keine Nachrichten)"
 
 
-def _generate_chameleon_reply(message_type: str, conversation: list, client_profile: dict,
+def _generate_chameleon_reply(platform: str, message_type: str, conversation: list, client_profile: dict,
                                fake_profile: dict, additional_instructions: str) -> dict:
     client = _get_groq_test_client()
     if client is None:
         reason = "groq package not installed" if Groq is None else "GROQ_API_KEY is not set"
         return {"ok": False, "error": reason, "status": 400}
+
+    with _lock:
+        custom = _custom_instructions.get(platform, "")
+    # The saved custom instructions always apply; a one-off "Zusatzanweisung"
+    # typed for just this request stacks on top of them, not instead of them.
+    combined_instructions = "\n".join(x for x in (custom, additional_instructions) if x)
 
     mode_line = _MODE_LABELS.get(message_type, _MODE_LABELS["DIA"])
     user_content = (
@@ -547,8 +610,8 @@ def _generate_chameleon_reply(message_type: str, conversation: list, client_prof
         f"Ich-Profil (mein Account): {_format_profile(fake_profile)}\n\n"
         f"Bisherige Unterhaltung:\n{_format_transcript(conversation)}"
     )
-    if additional_instructions:
-        user_content += f"\n\nZusatzanweisung: {additional_instructions}"
+    if combined_instructions:
+        user_content += f"\n\nZusatzanweisung: {combined_instructions}"
 
     # Groq's own structured-output validation ("json_validate_failed" / "Failed
     # to validate JSON") and an occasionally-malformed completion are transient
@@ -560,6 +623,14 @@ def _generate_chameleon_reply(message_type: str, conversation: list, client_prof
     last_error = "unknown error"
     for attempt in range(1, max_attempts + 1):
         try:
+            # CHAMELEON_MODEL is a reasoning model: its hidden chain-of-thought
+            # is billed against max_completion_tokens too, and a big enough
+            # custom instruction (see _custom_instructions) can make it burn
+            # the entire budget "thinking" and return nothing at all -- empty
+            # failed_generation with response_format=json_object, empty
+            # content with finish_reason="length" without it. reasoning_effort
+            # "low" keeps that overhead small enough to reliably leave room
+            # for the actual reply even with a long custom instruction.
             resp = client.chat.completions.create(
                 model=CHAMELEON_MODEL,
                 messages=[
@@ -567,8 +638,9 @@ def _generate_chameleon_reply(message_type: str, conversation: list, client_prof
                     {"role": "user", "content": user_content},
                 ],
                 temperature=0.8,
-                max_completion_tokens=600,
+                max_completion_tokens=900,
                 top_p=1,
+                reasoning_effort="low",
                 response_format={"type": "json_object"},
             )
         except Exception as e:
@@ -680,6 +752,28 @@ def set_chameleon_source():
     return jsonify({"ok": True, "source": source})
 
 
+@app.get("/api/chameleon/custom-instructions")
+def get_custom_instructions():
+    platform = (request.args.get("platform") or "").strip()
+    if platform not in _CUSTOM_INSTRUCTIONS_KEYS:
+        return jsonify({"error": f"platform must be one of {_CUSTOM_INSTRUCTIONS_KEYS}"}), 400
+    with _lock:
+        return jsonify({"platform": platform, "instructions": _custom_instructions[platform]})
+
+
+@app.post("/api/chameleon/custom-instructions")
+def set_custom_instructions():
+    body = request.get_json(force=True, silent=True) or {}
+    platform = (body.get("platform") or "").strip()
+    if platform not in _CUSTOM_INSTRUCTIONS_KEYS:
+        return jsonify({"error": f"platform must be one of {_CUSTOM_INSTRUCTIONS_KEYS}"}), 400
+    text = (body.get("instructions") or "").strip()
+    with _lock:
+        _custom_instructions[platform] = text
+        _save_custom_instructions_locked()
+    return jsonify({"ok": True, "platform": platform, "instructions": text})
+
+
 @app.post("/api/chameleon/reply")
 def chameleon_reply():
     body = request.get_json(force=True, silent=True) or {}
@@ -694,7 +788,7 @@ def chameleon_reply():
         return jsonify({"ok": False, "error": "conversation is empty"}), 400
 
     result = _generate_chameleon_reply(
-        message_type, conversation,
+        platform, message_type, conversation,
         body.get("client_profile") or {}, body.get("fake_profile") or {},
         (body.get("additional_instructions") or "").strip(),
     )
@@ -725,6 +819,15 @@ def create_request():
     reply = body.get("reply") or ""
     customer_message = body.get("customer_message") or ""
     reply_type = (body.get("reply_type") or "").strip() or None  # e.g. "DIA" / "ASA Follow-up" (Justlo only) — None means the bot doesn't report one
+    # The client-vs-fake-account profile comparison table extracted from the
+    # chat HTML (see XkussExtractor/JustloExtractor and chameleon_local.py's
+    # extract_conversation_data()/get_conversation_data()) — shown on the
+    # dashboard card as "Client data" / "Fake account data" so a reviewer can
+    # sanity-check what the AI actually saw before approving. Optional: only
+    # the three self-managed platforms (Xkuss/Justlo/Linduu) currently send
+    # this, so it defaults to empty for everyone else.
+    client_profile = body.get("client_profile") or {}
+    fake_profile = body.get("fake_profile") or {}
     if not reply.strip():
         return jsonify({"error": "reply is required"}), 400
 
@@ -771,6 +874,8 @@ def create_request():
             "platform": platform,
             "customer_message": customer_message,
             "customer_message_en": customer_message_en,
+            "client_profile": client_profile,
+            "fake_profile": fake_profile,
             "context": body.get("context") or "",
             "reply_type": reply_type,
             "reply": reply,
@@ -1392,6 +1497,23 @@ _PAGE = """<!doctype html>
     color: var(--info); opacity: .85; font-style: italic; font-size: 12.5px;
     white-space: pre-wrap; flex: 1;
   }
+
+  .extracted-data { margin-top: 12px; }
+  .extracted-data summary {
+    cursor: pointer; font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--warning); list-style: none;
+  }
+  .extracted-data summary::-webkit-details-marker { display: none; }
+  .extracted-data summary::before { content: "▸ "; }
+  .extracted-data[open] summary::before { content: "▾ "; }
+  .extracted-data summary .hint-inline { color: var(--muted-foreground); text-transform: none; font-weight: 400; letter-spacing: 0; }
+  .profile-cols { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
+  .profile-col { flex: 1 1 220px; min-width: 220px; }
+  .profile-col .field-label { margin: 0 0 4px; color: var(--muted-foreground); }
+  .profile-row { display: flex; gap: 8px; padding: 5px 0; font-size: 12.5px; border-bottom: 1px solid var(--border); }
+  .profile-row .k { color: var(--muted-foreground); min-width: 110px; flex: none; }
+  .profile-empty { font-size: 12px; color: var(--muted-foreground); font-style: italic; padding: 4px 0; }
+
   textarea.reply-input {
     width: 100%; min-height: 92px; resize: vertical;
     background: var(--muted); color: var(--foreground); border: 1px solid var(--input);
@@ -2213,6 +2335,35 @@ async function runCheckinAll() {
   }
 }
 
+function profileRowsHtml(profile) {
+  const keys = Object.keys(profile || {});
+  if (!keys.length) return '<div class="profile-empty">No data extracted.</div>';
+  return keys.map(k => `
+    <div class="profile-row"><span class="k">${escapeHtml(k)}</span><span>${escapeHtml(String(profile[k]))}</span></div>
+  `).join("");
+}
+
+function extractedDataHtml(r) {
+  const hasClient = r.client_profile && Object.keys(r.client_profile).length;
+  const hasFake = r.fake_profile && Object.keys(r.fake_profile).length;
+  if (!hasClient && !hasFake) return "";
+  return `
+    <details class="extracted-data">
+      <summary>Extracted data <span class="hint-inline">— review before approving</span></summary>
+      <div class="profile-cols">
+        <div class="profile-col">
+          <div class="field-label">Client data</div>
+          ${profileRowsHtml(r.client_profile)}
+        </div>
+        <div class="profile-col">
+          <div class="field-label">Fake account data</div>
+          ${profileRowsHtml(r.fake_profile)}
+        </div>
+      </div>
+    </details>
+  `;
+}
+
 function pendingCardHtml(r) {
   const val = editedReplies.has(r.id) ? editedReplies.get(r.id) : r.reply;
   const pc = colorFor(r.platform);
@@ -2240,6 +2391,7 @@ function pendingCardHtml(r) {
         <span class="lang-tag tag-en">EN</span>
         <span class="en-box">${r.reply_en ? escapeHtml(r.reply_en) : "(translation unavailable)"}</span>
       </div>
+      ${extractedDataHtml(r)}
       <div class="actions">
         <button class="btn-approve" onclick="approveCard('${r.id}', this)">Approve &amp; Send</button>
         <button class="btn-reject" onclick="act('${r.id}', 'reject', null, this)">Reject &amp; Regenerate</button>
@@ -2728,7 +2880,7 @@ _CHAMELEON_PAGE = r"""<!doctype html>
          message in the conversation (either side), read back by
          chameleon_local.py via Playwright — in local mode straight off this
          same tab, in real Chameleon-AI mode via a throwaway visit to this
-         page just for the extraction (see extract_last_message()) — so the
+         page just for the extraction (see extract_conversation_data()) — so the
          approval dashboard's "Last Message" card can show it next to the
          generated reply regardless of which mode produced that reply. -->
     <div id="lastMsgDe" style="display:none"></div>
@@ -3742,6 +3894,28 @@ _BOTS_PAGE = r"""<!doctype html>
   }
   .error-note { color: var(--destructive); font-size: 12px; margin-top: 8px; }
 
+  /* ── Custom AI instructions (static section, deliberately outside the
+     status-polled botsGrid/render() cycle so a 2.5s refresh never wipes
+     in-progress typing) ── */
+  .custom-instr-section { margin-bottom: 22px; }
+  .custom-instr-section > h2 { font-size: 16px; margin: 0; letter-spacing: -.01em; }
+  .custom-instr-section > p { margin: 3px 0 14px; color: var(--muted-foreground); font-size: 13px; }
+  .custom-instr-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; }
+  .custom-instr-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .custom-instr-card h3 { margin: 0 0 8px; font-size: 13.5px; font-weight: 650; }
+  .custom-instr-card textarea {
+    width: 100%; min-height: 74px; resize: vertical; font: 12.5px/1.45 inherit;
+    background: var(--muted); border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 11px; color: var(--foreground);
+  }
+  .custom-instr-card textarea:focus { outline: none; border-color: var(--ring); }
+  .custom-instr-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 8px; }
+  .custom-instr-status { font-size: 11.5px; color: var(--success); }
+  .btn-save-instr { background: var(--primary); color: #fff; padding: 6px 13px; font-size: 12.5px; }
+
   /* ── Toasts + confirm modal (same component as the approval dashboard) ── */
   #toastRoot {
     position: fixed; z-index: 200; right: 16px; bottom: 16px;
@@ -3788,6 +3962,12 @@ _BOTS_PAGE = r"""<!doctype html>
     <p>Start, stop, and configure Xkuss, Justlo and Linduu — each one fully independent, no shared switches.
     Want to test extraction/Groq by hand without touching a live bot? <a href="/chameleon" style="text-decoration:underline;">Chameleon — Standalone</a>.</p>
   </div>
+</div>
+
+<div class="custom-instr-section">
+  <h2>Custom AI Instructions</h2>
+  <p>Always appended to the base prompt for every Built-in Groq reply — takes effect on the very next generated reply, no restart needed. Only used while a platform's Source is set to Built-in Groq.</p>
+  <div class="custom-instr-grid" id="customInstrGrid"></div>
 </div>
 
 <div class="bots-grid" id="botsGrid"></div>
@@ -3938,6 +4118,72 @@ function render() {
   document.getElementById("botsGrid").innerHTML = PLATFORMS.map(p => renderCard(p.slug, p.label)).join("");
 }
 
+// Two Groq-prompt buckets, matching the pipeline's actual granularity
+// (chameleon_local._SEL_PLATFORM_TAB / the /chameleon page's currentPlatform)
+// -- Justlo and Linduu bots already share the same local /chameleon tab and
+// prompt, so their custom instructions are shared too, unlike Source/Approval
+// which stay genuinely per-platform.
+const CUSTOM_INSTR_TARGETS = [
+  { key: "xkuss", label: "Xkuss" },
+  { key: "justlo_lindu", label: "Justlo & Linduu" },
+];
+
+function renderCustomInstrPanel() {
+  document.getElementById("customInstrGrid").innerHTML = CUSTOM_INSTR_TARGETS.map(t => `
+    <div class="custom-instr-card">
+      <h3>${escapeHtml(t.label)}</h3>
+      <textarea id="custBox-${t.key}"
+        placeholder="e.g. &quot;always ask a follow-up question&quot; or &quot;keep replies under two sentences&quot;..."></textarea>
+      <div class="custom-instr-actions">
+        <span class="custom-instr-status" id="custStatus-${t.key}"></span>
+        <button class="btn-save-instr" onclick="saveCustomInstructions('${t.key}', this)">Save</button>
+      </div>
+    </div>
+  `).join("");
+}
+
+async function loadCustomInstructions() {
+  for (const t of CUSTOM_INSTR_TARGETS) {
+    const box = document.getElementById(`custBox-${t.key}`);
+    if (!box) continue;
+    try {
+      const res = await fetch(`/api/chameleon/custom-instructions?platform=${t.key}`);
+      const data = await res.json();
+      box.value = data.instructions || "";
+    } catch (e) {
+      box.placeholder = "(could not load saved instructions)";
+    }
+  }
+}
+
+async function saveCustomInstructions(key, btn) {
+  const box = document.getElementById(`custBox-${key}`);
+  const statusEl = document.getElementById(`custStatus-${key}`);
+  const label = (CUSTOM_INSTR_TARGETS.find(t => t.key === key) || {}).label || key;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const res = await fetch("/api/chameleon/custom-instructions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ platform: key, instructions: box.value.trim() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (statusEl) {
+      statusEl.textContent = "Saved";
+      setTimeout(() => { if (statusEl.textContent === "Saved") statusEl.textContent = ""; }, 2500);
+    }
+    toast("Custom instructions saved", { type: "success", detail: `Applies to every new ${label} reply from now on.` });
+  } catch (e) {
+    toast("Save failed", { type: "error", detail: String((e && e.message) || e) });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
 function showError(slug, msg) {
   const el = document.getElementById(`err-${slug}`);
   if (el) el.textContent = msg;
@@ -4076,6 +4322,8 @@ async function loadInitial() {
 }
 
 render();
+renderCustomInstrPanel();
+loadCustomInstructions();
 loadInitial();
 </script>
 </body>

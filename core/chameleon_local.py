@@ -51,6 +51,23 @@ _GET_ERROR_JS = """
 """
 _GET_TYPE_JS = "() => { const el = document.querySelector('#typeBadge'); return el ? el.textContent.trim() : ''; }"
 _GET_LAST_MSG_JS = "() => { const el = document.querySelector('#lastMsgDe'); return el ? el.textContent.trim() : ''; }"
+# `extracted` is the /chameleon page's own top-level `let extracted = ...`
+# (set by its doExtract()) — script-scope `let`/`const` bindings are visible
+# to page.evaluate() the same way they're visible to the DevTools console, so
+# this reads the client/fake profile dicts straight from it instead of
+# re-parsing the rendered #clientProfile/#fakeProfile DOM.
+_GET_PROFILES_JS = """
+() => {
+    try {
+        return {
+            client: (extracted && extracted.clientProfile) || {},
+            fake: (extracted && extracted.fakeProfile) || {},
+        };
+    } catch (e) {
+        return { client: {}, fake: {} };
+    }
+}
+"""
 
 
 async def is_local_mode(platform_key: str) -> bool:
@@ -96,26 +113,36 @@ async def is_first_contact(tab2) -> bool:
     return (await tab2.evaluate(_GET_TYPE_JS)) == "FC"
 
 
-async def get_last_message(tab2) -> str:
+async def get_conversation_data(tab2) -> dict:
     """The literal last message in the just-extracted conversation (either
-    side), for the approval dashboard's "Last Message" card. Local-mode-only
-    fast path: tab2 already has the conversation extracted (it's mid-way
-    through generating a reply from it), so this just reads the result back
-    with no extra navigation. See extract_last_message() for the real-mode
-    equivalent."""
-    return await tab2.evaluate(_GET_LAST_MSG_JS)
+    side) plus the client-vs-fake-account profile comparison table, for the
+    approval dashboard's "Last Message" / "Client data" / "Fake account data"
+    fields. Local-mode-only fast path: tab2 already has the conversation
+    extracted (it's mid-way through generating a reply from it), so this just
+    reads the result back with no extra navigation. See
+    extract_conversation_data() for the real-mode equivalent. Returns
+    {"last_message": str, "client_profile": dict, "fake_profile": dict}."""
+    last_message = await tab2.evaluate(_GET_LAST_MSG_JS)
+    profiles = await tab2.evaluate(_GET_PROFILES_JS)
+    return {
+        "last_message": last_message,
+        "client_profile": profiles.get("client") or {},
+        "fake_profile": profiles.get("fake") or {},
+    }
 
 
-async def extract_last_message(context, html: str, platform_key: str, timeout_s: int = 10) -> str:
-    """Real-Chameleon-mode equivalent of get_last_message(): tab2 there is
-    busy with the actual Chameleon-AI site, so this pastes `html` into a
+async def extract_conversation_data(context, html: str, platform_key: str, timeout_s: int = 10) -> dict:
+    """Real-Chameleon-mode equivalent of get_conversation_data(): tab2 there
+    is busy with the actual Chameleon-AI site, so this pastes `html` into a
     throwaway visit to our own /chameleon page purely to reuse its
     already-precise, sender-aware conversation parsing (see
     XkussExtractor/JustloExtractor in approval_server.py) for the dashboard's
-    "Last Message" card — real mode never otherwise touches this page. Costs
-    one extra lightweight page load per reply (this project's own page, no
-    login, sub-second), and is best-effort: any failure just leaves the
-    dashboard field blank rather than affecting the actual reply."""
+    "Last Message" / "Client data" / "Fake account data" fields — real mode
+    never otherwise touches this page. Costs one extra lightweight page load
+    per reply (this project's own page, no login, sub-second), and is
+    best-effort: any failure just leaves those dashboard fields blank rather
+    than affecting the actual reply. Returns the same shape as
+    get_conversation_data()."""
     page = await context.new_page()
     try:
         await page.goto(LOCAL_CHAMELEON_URL, wait_until="domcontentloaded")
@@ -123,9 +150,15 @@ async def extract_last_message(context, html: str, platform_key: str, timeout_s:
         await page.locator("#htmlInput").fill(html)
         await page.locator("button:has-text('Daten extrahieren')").click()
         await page.locator("#extractedCard").wait_for(state="visible", timeout=timeout_s * 1_000)
-        return await page.evaluate(_GET_LAST_MSG_JS)
+        last_message = await page.evaluate(_GET_LAST_MSG_JS)
+        profiles = await page.evaluate(_GET_PROFILES_JS)
+        return {
+            "last_message": last_message,
+            "client_profile": profiles.get("client") or {},
+            "fake_profile": profiles.get("fake") or {},
+        }
     except PlaywrightError:
-        return ""
+        return {"last_message": "", "client_profile": {}, "fake_profile": {}}
     finally:
         await page.close()
 

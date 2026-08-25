@@ -501,7 +501,8 @@ class JustloBot:
             f"({'manual review' if manual_review else 'server error'})."
         )
 
-    async def _get_approved_reply(self, tab1, tab2, reply_type: str = "", customer_message: str = "") -> tuple[str, str]:
+    async def _get_approved_reply(self, tab1, tab2, reply_type: str = "", customer_message: str = "",
+                                   client_profile: dict | None = None, fake_profile: dict | None = None) -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
@@ -522,6 +523,7 @@ class JustloBot:
                 self.cfg.platform, reply,
                 reply_type=reply_type,
                 customer_message=customer_message,
+                client_profile=client_profile, fake_profile=fake_profile,
                 chat_still_active=lambda: self._chat_still_active(tab1),
             )
             if approved:
@@ -978,11 +980,12 @@ class JustloBot:
                         if not await chameleon_local.paste_and_extract(tab2, html, "justlo_lindu"):
                             raise RuntimeError("Local Chameleon page: extraction did not produce a Generate button.")
                         is_fc = await chameleon_local.is_first_contact(tab2)
-                        last_customer_msg = await chameleon_local.get_last_message(tab2)
+                        conv_data = await chameleon_local.get_conversation_data(tab2)
                     else:
                         await self._paste_and_extract(tab2, html)
                         is_fc = await self._is_first_contact(tab2)
-                        last_customer_msg = await chameleon_local.extract_last_message(context, html, "justlo_lindu")
+                        conv_data = await chameleon_local.extract_conversation_data(context, html, "justlo_lindu")
+                    last_customer_msg = conv_data["last_message"]
 
                     if is_fc:
                         # Chameleon is the sole authority on First Contact — hand over
@@ -1012,7 +1015,10 @@ class JustloBot:
 
                     try:
                         reply_type = await self._queue_task_type(tab1)
-                        reply, approval_id = await self._get_approved_reply(tab1, tab2, reply_type, last_customer_msg)
+                        reply, approval_id = await self._get_approved_reply(
+                            tab1, tab2, reply_type, last_customer_msg,
+                            conv_data["client_profile"], conv_data["fake_profile"],
+                        )
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
                                  "review after 3 attempts — refreshing the chat (re-extracting "

@@ -17,7 +17,7 @@ config = XkussConfig(
     # ── chameleon AI (shared with every other platform) ──────────────────────
     chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
     chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
-    chameleon_chat="Global",          # xkuss uses the 'Global' chameleon chat
+    chameleon_chat="Xkuss",          # xkuss uses the 'Global' chameleon chat
     additional_instructions="",
 )
 
