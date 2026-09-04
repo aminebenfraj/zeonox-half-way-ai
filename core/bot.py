@@ -155,9 +155,10 @@ _HTML_SERIALIZER_JS = """(rootSel) => {
     'display':'inline','position':'static',
     'overflow':'visible','overflow-x':'visible','overflow-y':'visible',
     'flex-direction':'row','flex-wrap':'nowrap','flex-grow':'0','flex-shrink':'1',
+    'top':'0px','right':'0px','bottom':'0px','left':'0px','z-index':'auto',
     'opacity':'1','border-collapse':'separate','vertical-align':'baseline',
-    'text-align':'start','text-transform':'none','white-space':'normal',
-    'word-break':'normal','overflow-wrap':'normal','cursor':'auto','resize':'none',
+    'text-align':'start','text-decoration':'none solid rgb(0, 0, 0)','text-transform':'none',
+    'white-space':'normal','word-break':'normal','overflow-wrap':'normal','cursor':'auto','resize':'none',
     'box-shadow':'none','backdrop-filter':'none','transform':'none',
     'letter-spacing':'normal','aspect-ratio':'auto','list-style':'outside none disc',
     'background-image':'none','background-size':'auto','background-position':'0% 0%',
@@ -193,10 +194,66 @@ _HTML_SERIALIZER_JS = """(rootSel) => {
 
   function escText(str) { return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+  // Chat annotator — runs BEFORE serialization. Reads DOM class names/gradients
+  // and injects clear semantic data-* attributes onto every message bubble
+  // (data-sender, data-gender, data-persona, data-client, data-is-last,
+  // data-moderator, data-timestamp) so Chameleon's extractor never has to
+  // guess sender/persona from CSS classes — mirrors the browser extension's
+  // annotateChatMessages().
+  function annotateChatMessages() {
+    const fakeSidebar = document.getElementById('fake-sidebar')
+      || Array.from(document.querySelectorAll('aside')).find(a => a.className && (a.className.includes('right-0') || a.className.includes('translate-x-[336px]')));
+    const clientSidebar = document.getElementById('regular-sidebar')
+      || Array.from(document.querySelectorAll('aside')).find(a => a.className && (a.className.includes('left-0') || a.className.includes('translate-x-[-336px]')));
+
+    let personaName = '', clientName = '';
+
+    if (fakeSidebar) {
+      const nameEl = fakeSidebar.querySelector('p.text-lg, [class*="text-lg"]');
+      if (nameEl) personaName = nameEl.textContent.replace(/[,\\s]+$/, '').trim();
+    }
+    if (clientSidebar) {
+      const nameEl = clientSidebar.querySelector('p.text-lg, [class*="text-lg"]');
+      if (nameEl) clientName = nameEl.textContent.replace(/[,\\s]+$/, '').trim();
+    }
+
+    const bubbles = Array.from(document.querySelectorAll('[class*="from-female"],[class*="from-male"]'))
+      .filter(el => {
+        const c = el.className || '';
+        return (c.includes('from-female') || c.includes('from-male'))
+            && (c.includes('ml-auto') || c.includes('mr-auto') || c.includes('rounded-tl') || c.includes('rounded-tr'));
+      });
+
+    bubbles.forEach(b => {
+      const c = b.className || '';
+      const isFake = c.includes('ml-auto') || c.includes('rounded-tl');
+      const isClient = c.includes('mr-auto') || c.includes('rounded-tr');
+      const gender = c.includes('from-female') ? 'female' : c.includes('from-male') ? 'male' : '';
+
+      b.setAttribute('data-sender', isFake ? 'fake' : isClient ? 'client' : 'unknown');
+      b.setAttribute('data-gender', gender);
+      if (isFake && personaName) b.setAttribute('data-persona', personaName);
+      if (isClient && clientName) b.setAttribute('data-client', clientName);
+
+      const small = b.querySelector('small');
+      if (small) b.setAttribute('data-timestamp', small.textContent.trim());
+
+      const next = b.nextElementSibling;
+      if (next && next.className && next.className.includes('ml-auto') && next.className.includes('text-right')) {
+        b.setAttribute('data-moderator', next.textContent.trim());
+      }
+    });
+
+    if (bubbles.length) bubbles[0].setAttribute('data-is-last', 'true');
+  }
+
   const HTML_ATTRS = [
-    'src','srcset','alt','href','placeholder','rows','cols','type','value','name',
-    'width','height','loading','decoding','data-nimg','id','class','role',
-    'aria-label','aria-hidden','target','rel','for',
+    'src','srcset','alt','href',
+    'placeholder','rows','cols','type','name',
+    'width','height','loading','decoding','data-nimg',
+    'data-sender','data-gender','data-persona','data-client',
+    'data-is-last','data-moderator','data-timestamp',
+    'id','role','aria-label',
   ];
 
   function serialize(node, depth) {
@@ -216,9 +273,29 @@ _HTML_SERIALIZER_JS = """(rootSel) => {
       const v = node.getAttribute(a);
       if (v !== null && v.trim() !== '') attrParts.push(`${a}="${v.trim().replace(/"/g,'&quot;')}"`);
     });
+
+    // Live form values — JS-set .value on inputs/textareas/selects doesn't
+    // always touch the DOM attribute or child text, so read it directly.
+    if (tag === 'input') {
+      const type = (node.getAttribute('type') || 'text').toLowerCase();
+      if ((type === 'checkbox' || type === 'radio') && node.checked) attrParts.push('checked="checked"');
+      if (node.value !== '') attrParts.push(`value="${node.value.replace(/"/g,'&quot;')}"`);
+    } else if (tag === 'select') {
+      const opt = node.options[node.selectedIndex];
+      if (opt) {
+        const sel = (opt.value || opt.textContent).trim();
+        if (sel) attrParts.push(`data-selected-value="${sel.replace(/"/g,'&quot;')}"`);
+      }
+    } else if (tag === 'option') {
+      if (node.selected) attrParts.push('selected="selected"');
+      if (node.value !== '') attrParts.push(`value="${node.value.replace(/"/g,'&quot;')}"`);
+    }
+
     const attrsStr = attrParts.length ? ' ' + attrParts.join(' ') : '';
 
     if (VOID_TAGS.has(tag)) return `${indent}<${tag}${attrsStr} />\\n`;
+
+    if (tag === 'textarea') return `${indent}<${tag}${attrsStr}>${escText(node.value || '')}</${tag}>\\n`;
 
     const childNodes = Array.from(node.childNodes);
     const visibleChildren = childNodes.filter(c => !(c.nodeType===1 && SKIP_TAGS.has(c.tagName.toLowerCase())));
@@ -232,6 +309,8 @@ _HTML_SERIALIZER_JS = """(rootSel) => {
     out += `${indent}</${tag}>\\n`;
     return out;
   }
+
+  try { annotateChatMessages(); } catch (_) {}
 
   // Serialize only the requested subtree when a root selector is given
   // (xkuss passes '#showpm' so only the OPEN chat is captured, not the inbox /
