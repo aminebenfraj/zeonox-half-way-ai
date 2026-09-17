@@ -45,14 +45,14 @@ BASE_DIR = Path(__file__).parent
 # (Phases 1–2 below). The self-managed ones bring up their own Chrome and log
 # themselves in inside their run() (xkuss_bot / justlo_bot), so they skip Phase 2.
 REACT_PLATFORMS   = ["gold", "gold2", "gold3", "diamond", "platin", "s69", "ml"]
-SELF_MANAGED      = ["xkuss", "justlo", "linduu"]
+SELF_MANAGED      = ["xkuss", "justlo", "linduu", "gnoxx"]
 KNOWN_PLATFORMS   = REACT_PLATFORMS + SELF_MANAGED
-# `python launch_all.py` with no args starts exactly these eight.
-DEFAULT_PLATFORMS = ["gold", "ml", "platin", "s69", "diamond", "xkuss", "justlo", "linduu"]
+# `python launch_all.py` with no args starts exactly these platforms.
+DEFAULT_PLATFORMS = ["gold", "ml", "platin", "s69", "diamond", "xkuss", "justlo", "linduu", "gnoxx"]
 # Stats-capable platforms ('checkins'/'checkinall' read the React mod-site dialog).
 ALL_PLATFORMS     = REACT_PLATFORMS
 
-_CLI_ALIASES = {"plat": "platin", "g2": "gold2", "g3": "gold3", "lindu": "linduu", "just": "justlo"}
+_CLI_ALIASES = {"plat": "platin", "g2": "gold2", "g3": "gold3", "lindu": "linduu", "just": "justlo", "gnox": "gnoxx"}
 
 def _resolve_platforms(args: list[str]) -> list[str]:
     resolved = []
@@ -82,6 +82,7 @@ _COLORS = {
     "xkuss":   "\033[31m",
     "justlo":  "\033[34m",
     "linduu":  "\033[92m",
+    "gnoxx":   "\033[96m",
 }
 
 _ALIASES = _CLI_ALIASES
@@ -100,8 +101,8 @@ _HELP = (
     "  checkinall                — save/update a Desktop note (checkinall.txt) with money made across all accounts\n"
     "  help                      — show this list\n"
     "  quit / exit               — stop everything and exit\n"
-    f"  Active platforms: {', '.join(PLATFORMS)}  (aliases: plat=platin, g2=gold2, lindu=linduu)\n"
-    f"  Launch specific: python launch_all.py gold justlo linduu\n"
+    f"  Active platforms: {', '.join(PLATFORMS)}  (aliases: plat=platin, g2=gold2, lindu=linduu, gnox=gnoxx)\n"
+    f"  Launch specific: python launch_all.py gold justlo linduu gnoxx\n"
     f"  Every command above is also available as a button on the approval dashboard."
 )
 
@@ -200,7 +201,7 @@ async def _setup_platform(playwright, name: str, cfg):
 
 
 async def setup_all_browsers():
-    # Only React platforms are logged in here. xkuss/justlo/linduu sign themselves
+    # Only React platforms are logged in here. xkuss/justlo/linduu/gnoxx sign themselves
     # in inside their own run() (different sites + login flows), so we skip them.
     react = [n for n in PLATFORMS if n in REACT_PLATFORMS]
     skipped = [n for n in PLATFORMS if n in SELF_MANAGED]

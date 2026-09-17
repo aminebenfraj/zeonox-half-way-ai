@@ -39,6 +39,7 @@ LOCAL_CHAMELEON_URL = f"{APPROVAL_SERVER_URL}/chameleon"
 _SEL_PLATFORM_TAB = {
     "xkuss": "#tab-xkuss",
     "justlo_lindu": "#tab-justlo",
+    "gnoxx": "#tab-gnoxx",
 }
 
 _GET_REPLY_JS = "() => { const el = document.querySelector('#replyDe'); return el ? el.textContent.trim() : ''; }"
@@ -136,7 +137,7 @@ async def extract_conversation_data(context, html: str, platform_key: str, timeo
     is busy with the actual Chameleon-AI site, so this pastes `html` into a
     throwaway visit to our own /chameleon page purely to reuse its
     already-precise, sender-aware conversation parsing (see
-    XkussExtractor/JustloExtractor in approval_server.py) for the dashboard's
+    XkussExtractor/JustloExtractor/GnoxxExtractor in approval_server.py) for the dashboard's
     "Last Message" / "Client data" / "Fake account data" fields — real mode
     never otherwise touches this page. Costs one extra lightweight page load
     per reply (this project's own page, no login, sub-second), and is

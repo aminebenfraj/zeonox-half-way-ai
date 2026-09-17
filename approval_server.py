@@ -92,7 +92,7 @@ MAX_HISTORY = 300  # decided/sent/failed requests kept for the dashboard's histo
 # just appended after the known ones instead of being dropped.
 KNOWN_PLATFORMS = [
     "Gold", "Gold2", "Gold3", "Diamond", "Platin", "S69", "ML",
-    "Xkuss", "Justlo", "Linduu",
+    "Xkuss", "Justlo", "Linduu", "Gnoxx",
 ]
 
 # One accent color per platform (mirrors the ANSI colors launch_all.py/start_all.py
@@ -109,6 +109,7 @@ PLATFORM_COLORS = {
     "Xkuss":   "#ef4444",  # red
     "Justlo":  "#3b82f6",  # blue
     "Linduu":  "#10b981",  # emerald
+    "Gnoxx":   "#0ea5e9",  # sky
 }
 _FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"]
 
@@ -177,13 +178,13 @@ STATUS_STALE_AFTER = 30  # seconds without a ping before the dashboard treats a 
 # a card out from under someone who's mid-edit.
 #
 # This is the DEFAULT for every platform. _mode_overrides (below) lets the
-# three self-managed platforms opt out of it independently without touching
+# self-managed platforms opt out of it independently without touching
 # this global — so flipping Xkuss to auto never affects Gold/Diamond/etc, and
 # never affects Justlo/Linduu either.
 _mode = "manual"
 
 # Per-platform override of the review mode above, keyed by lowercase platform
-# slug ("xkuss"/"justlo"/"linduu" — see /bots). Populated only when a platform
+# slug ("xkuss"/"justlo"/"linduu"/"gnoxx" — see /bots). Populated only when a platform
 # has explicitly chosen something other than "use the global default"; a
 # platform with no entry here just falls back to _mode. Read live on every
 # request (see create_request()'s `_mode_overrides.get(...)` lookup) — no
@@ -195,10 +196,10 @@ _mode_overrides: dict[str, str] = {}
 # Chameleon-AI site, unchanged. "local" tells it to paste HTML into and read
 # the reply from OUR OWN /chameleon page instead (see core/chameleon_local.py)
 # — read once at bot startup, so flipping this takes effect on that platform's
-# next restart, not mid-run. Only the three self-managed platforms ever read
+# next restart, not mid-run. Only the self-managed platforms ever read
 # this (core/xkuss_bot.py, core/justlo_bot.py) — React platforms never call
 # chameleon_local at all, so they're structurally unaffected regardless.
-SELF_MANAGED_PLATFORMS = ("xkuss", "justlo", "linduu")
+SELF_MANAGED_PLATFORMS = ("xkuss", "justlo", "linduu", "gnoxx")
 _chameleon_source: dict[str, str] = {p: "real" for p in SELF_MANAGED_PLATFORMS}
 
 # ── Custom instructions for the built-in Groq generator ─────────────────────
@@ -207,14 +208,14 @@ _chameleon_source: dict[str, str] = {p: "real" for p in SELF_MANAGED_PLATFORMS}
 # _CHAMELEON_SYSTEM_PROMPT and any one-off "Zusatzanweisung" typed into a
 # single request. Keyed the same way the Groq pipeline itself already is
 # everywhere else (chameleon_local._SEL_PLATFORM_TAB, the /chameleon page's
-# currentPlatform) -- "xkuss" and "justlo_lindu" -- NOT by the three
-# SELF_MANAGED_PLATFORMS above: Justlo and Linduu bots already share the same
-# local /chameleon page/tab and the same Groq prompt, so their custom
-# instructions are shared too (the /bots page labels this explicitly so it's
-# never a silent surprise). Persisted to disk (unlike _chameleon_source) since
+# currentPlatform) -- "xkuss", "justlo_lindu", and "gnoxx" -- NOT directly by
+# every SELF_MANAGED_PLATFORMS entry: Justlo and Linduu bots already share the
+# same local /chameleon page/tab and the same Groq prompt, so their custom
+# instructions are shared too, while Gnoxx has its own supplied extractor.
+# Persisted to disk (unlike _chameleon_source) since
 # this is operator-authored content worth surviving a server restart.
 _CUSTOM_INSTRUCTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "custom_instructions.json")
-_CUSTOM_INSTRUCTIONS_KEYS = ("xkuss", "justlo_lindu")
+_CUSTOM_INSTRUCTIONS_KEYS = ("xkuss", "justlo_lindu", "gnoxx")
 
 
 def _load_custom_instructions() -> dict:
@@ -239,14 +240,14 @@ def _save_custom_instructions_locked():
 _custom_instructions: dict[str, str] = _load_custom_instructions()
 
 # ── Bot process management (see /bots) ──────────────────────────────────────
-# Only the three self-managed platforms: each does its own Chrome launch +
+# Only the self-managed platforms: each does its own Chrome launch +
 # login inside run_bot.py, so starting one is just spawning that one process
 # -- no Playwright-based Chrome/login bring-up needed here (that stays in
 # launch_all.py, kept deliberately out of this process; see KNOWN_PLATFORMS
 # above for the same reasoning). React platforms (Gold/Diamond/...) still
 # only start via launch_all.py / Bot Controls, unchanged.
 _BASE_DIR = Path(__file__).resolve().parent
-_SELF_MANAGED_CDP_PORTS = {"xkuss": 9227, "justlo": 9229, "linduu": 9230}
+_SELF_MANAGED_CDP_PORTS = {"xkuss": 9227, "justlo": 9229, "linduu": 9230, "gnoxx": 9231}
 _bot_procs: dict[str, subprocess.Popen] = {}
 
 
@@ -458,7 +459,7 @@ def test_groq():
 
 # ── Chameleon standalone reply generator (Groq) ─────────────────────────────
 # Powers the "/chameleon" page: paste raw chat HTML copied from the Xkuss or
-# Justlo/Linduu mod site, extract it client-side (ported from those platforms'
+# Justlo/Linduu/Gnoxx mod site, extract it client-side (ported from those platforms'
 # own Chameleon-AI extractor JS — see _CHAMELEON_PAGE below), and get back a
 # single contextual reply from Groq. No browser automation and no real
 # Chameleon-AI tab required, so this works even when no bot is running —
@@ -703,7 +704,7 @@ def _restart_bot(platform: str):
     rather than launch_all.py) — restart is a convenience on top of the
     toggle, not a requirement for it to take effect eventually. Deliberately
     scoped to ONE platform: flipping Xkuss's settings must never restart, or
-    otherwise touch, Justlo/Linduu or any React platform."""
+    otherwise touch, Justlo/Linduu/Gnoxx or any React platform."""
     try:
         httpx.post(
             f"{LAUNCHER_CONTROL_URL}/control/command",
@@ -778,8 +779,8 @@ def set_custom_instructions():
 def chameleon_reply():
     body = request.get_json(force=True, silent=True) or {}
     platform = (body.get("platform") or "").strip()
-    if platform not in ("xkuss", "justlo_lindu"):
-        return jsonify({"ok": False, "error": "platform must be 'xkuss' or 'justlo_lindu'"}), 400
+    if platform not in ("xkuss", "justlo_lindu", "gnoxx"):
+        return jsonify({"ok": False, "error": "platform must be 'xkuss', 'justlo_lindu', or 'gnoxx'"}), 400
     message_type = (body.get("message_type") or "DIA").strip().upper()
     if message_type not in _MODE_LABELS:
         message_type = "DIA"
@@ -824,7 +825,7 @@ def create_request():
     # extract_conversation_data()/get_conversation_data()) — shown on the
     # dashboard card as "Client data" / "Fake account data" so a reviewer can
     # sanity-check what the AI actually saw before approving. Optional: only
-    # the three self-managed platforms (Xkuss/Justlo/Linduu) currently send
+    # the self-managed platforms (Xkuss/Justlo/Linduu/Gnoxx) currently send
     # this, so it defaults to empty for everyone else.
     client_profile = body.get("client_profile") or {}
     fake_profile = body.get("fake_profile") or {}
@@ -2715,7 +2716,7 @@ init();
 
 
 # ── Chameleon standalone page ───────────────────────────────────────────────
-# Paste raw chat HTML from Xkuss or Justlo/Linduu, extract it in-browser (ported
+# Paste raw chat HTML from Xkuss, Justlo/Linduu, or Gnoxx, extract it in-browser (ported
 # from those platforms' own Chameleon-AI extractor React components — pure DOM
 # code, no framework needed), then get one contextual reply from Groq via
 # POST /api/chameleon/reply. Entirely separate from the approval queue above:
@@ -2848,7 +2849,7 @@ _CHAMELEON_PAGE = r"""<!doctype html>
 <div class="auto-mode-box">
   <p class="auto-mode-hint" style="margin:0;">
     This page is just a testing tool — pasting HTML and generating a reply here never affects any live bot.
-    To turn a live bot's Automatic Mode on or off (per-platform: Xkuss, Justlo and Linduu are each independent),
+    To turn a live bot's Automatic Mode on or off (per-platform: Xkuss, Justlo, Linduu and Gnoxx are each independent),
     use <a href="/bots" style="color:var(--foreground);text-decoration:underline;">the Bots page</a>.
   </p>
 </div>
@@ -2856,6 +2857,7 @@ _CHAMELEON_PAGE = r"""<!doctype html>
 <div class="platform-tabs">
   <button class="platform-tab active" id="tab-justlo" onclick="setPlatform('justlo_lindu')">Justlo / Linduu</button>
   <button class="platform-tab" id="tab-xkuss" onclick="setPlatform('xkuss')">Xkuss</button>
+  <button class="platform-tab" id="tab-gnoxx" onclick="setPlatform('gnoxx')">Gnoxx</button>
 </div>
 
 <div class="grid">
@@ -3589,14 +3591,171 @@ const XkussExtractor = (function () {
   return { extract };
 })();
 
+// ── Gnoxx extractor ────────────────────────────────────────────────────────
+// Ported from the supplied gnox_extractor.html. Gnoxx shares the same ExtJS
+// moderation workflow as Justlo/Linduu, but its current/history grids and
+// profile cards have a distinct, stable DOM shape.
+const GnoxxExtractor = (function () {
+  const TS_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+  const EMPTY_BIO_RE = /Im Moment hat unser Gnoxx Mitglied noch nichts über sich geschrieben/i;
+
+  function clean(value) {
+    return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  function text(el) { return clean(el?.textContent || el?.innerText || ''); }
+  function controlValue(el) {
+    if (!el) return '';
+    const control = el.matches?.('input, textarea, select') ? el : el.querySelector('input, textarea, select');
+    return control ? clean(control.value || control.getAttribute('value') || control.textContent) : text(el);
+  }
+  function multilineValue(el) {
+    if (!el) return '';
+    return String(el.value || el.getAttribute?.('value') || el.textContent || '')
+      .replace(/\r\n?/g, '\n').split('\n').map(line => line.trimEnd()).join('\n')
+      .replace(/\n{3,}/g, '\n\n').trim();
+  }
+  function normaliseGender(value) {
+    const v = clean(value).toLowerCase();
+    if (v === 'm') return 'male';
+    if (v === 'w' || v === 'f') return 'female';
+    if (v === 'd') return 'diverse';
+    return clean(value);
+  }
+  function parseTimestamp(value) {
+    return TS_RE.test(value || '') ? new Date(value.replace(' ', 'T')).getTime() : null;
+  }
+  function sortChronologically(messages) {
+    return [...messages].sort((a, b) => {
+      const at = parseTimestamp(a.timestamp), bt = parseTimestamp(b.timestamp);
+      if (at == null && bt == null) return a._order - b._order;
+      if (at == null) return 1;
+      if (bt == null) return -1;
+      return at - bt || a._order - b._order;
+    });
+  }
+  function readLabelledFields(panel) {
+    const details = {};
+    if (!panel) return details;
+    for (const row of panel.querySelectorAll('tr')) {
+      const label = clean(row.querySelector('label')?.textContent).replace(/:$/, '');
+      if (!label) continue;
+      const cells = row.querySelectorAll(':scope > td');
+      const value = controlValue(cells.length > 1 ? cells[cells.length - 1] : row);
+      if (value) details[label] = value;
+    }
+    return details;
+  }
+  function extractProfile(doc, role) {
+    const isClient = role === 'client';
+    const panel = doc.querySelector(isClient ? '#user-panel' : '#moderator-user-panel');
+    const comments = doc.querySelector(isClient ? '#user-comment-panel' : '#moderator-comment-panel');
+    const empty = {
+      role, username: '', gender: '', looking_for_gender: '', age: '', birthdate: '',
+      location: '', postal_code: '', region: '', relationship_status: '', looking_for: '',
+      bio: '', notes: '', additional_details: {},
+    };
+    if (!panel) return empty;
+    const info = panel.querySelector('[id^="thia-profileinfopanel-"]');
+    const summary = info?.querySelector('p');
+    const usernameLink = summary?.querySelector('a[href*="/profile/show/username/"]');
+    const username = text(usernameLink) || text(panel.querySelector('[id$="_header_hd-textEl"]')).split(' ')[0];
+    const identity = text(summary?.querySelector(':scope > span:first-child'));
+    const age = identity.match(/\((\d{1,3})\)/)?.[1] || '';
+    const birthdate = identity.match(/,\s*(\d{2}\.\s*[A-Za-zÄÖÜäöü]{3,}\s+\d{4})/)?.[1] || '';
+    const spans = summary ? [...summary.querySelectorAll(':scope > span')] : [];
+    const genderParts = spans[1] ? [...spans[1].querySelectorAll('span')].map(text).filter(Boolean) : [];
+    const locationRaw = text(spans[2]);
+    const locationMatch = locationRaw.match(/^(\d{4,5})\s*-\s*(.+)$/);
+    const paragraphs = info ? [...info.querySelectorAll(':scope > div > p, :scope > p')] : [];
+    const bioCandidate = paragraphs.length > 1 ? text(paragraphs[1]) : '';
+    const labelled = readLabelledFields(comments);
+    return {
+      ...empty,
+      username,
+      gender: normaliseGender(genderParts[0]),
+      looking_for_gender: normaliseGender(genderParts[1]),
+      age,
+      birthdate: labelled.Geburtstag || birthdate,
+      location: labelled.Ort || (locationMatch ? locationMatch[2] : locationRaw),
+      postal_code: locationMatch?.[1] || '',
+      region: locationMatch?.[2] || '',
+      relationship_status: text(spans.at(-2)),
+      looking_for: text(spans.at(-1)),
+      bio: EMPTY_BIO_RE.test(bioCandidate) ? '' : bioCandidate,
+      notes: multilineValue(comments?.querySelector('textarea[name="comment"], textarea')),
+      additional_details: {
+        name: labelled.Name || '',
+        profile_visit: labelled.Profilbesuch || '',
+        last_online: labelled['Zuletzt online'] || '',
+      },
+    };
+  }
+  function messageFromRecordRow(recordRow, order, clientUsername, fakeUsername, panelKind) {
+    const cells = [...recordRow.querySelectorAll(':scope > td[role="gridcell"]')];
+    if (cells.length < 4) return null;
+    const from = text(cells[0]), to = text(cells[1]), timestamp = text(cells[2]), moderator = text(cells[3]);
+    let messageRow = recordRow.nextElementSibling;
+    while (messageRow && messageRow.getAttribute('role') === 'row') messageRow = messageRow.nextElementSibling;
+    const message = text(messageRow?.querySelector('td'));
+    if (!from || !to || !TS_RE.test(timestamp) || !message) return null;
+    const fromFake = Boolean(fakeUsername) && from.toLowerCase() === fakeUsername.toLowerCase();
+    const fromClient = Boolean(clientUsername) && from.toLowerCase() === clientUsername.toLowerCase();
+    const hasModerator = Boolean(moderator) || fromFake;
+    const sender = fromFake ? 'fake_account' : fromClient ? 'client' : hasModerator ? 'fake_account' : 'client';
+    return { from, to, timestamp, message, moderator, has_moderator: hasModerator, sender, source_panel: panelKind, _order: order };
+  }
+  function extractGridMessages(grid, clientUsername, fakeUsername, panelKind, startOrder) {
+    if (!grid) return [];
+    const messages = [];
+    let order = startOrder;
+    for (const row of grid.querySelectorAll('tbody tr[role="row"]')) {
+      const parsed = messageFromRecordRow(row, order++, clientUsername, fakeUsername, panelKind);
+      if (parsed) messages.push(parsed);
+    }
+    return messages;
+  }
+  function extract(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const client = extractProfile(doc, 'client');
+    const fakeAccount = extractProfile(doc, 'fake_account');
+    const history = extractGridMessages(doc.querySelector('#history-grid'), client.username, fakeAccount.username, 'history', 0);
+    const current = extractGridMessages(doc.querySelector('#conversation-grid'), client.username, fakeAccount.username, 'conversation', history.length);
+    const seen = new Set(), merged = [];
+    for (const message of sortChronologically([...history, ...current])) {
+      const key = [message.from, message.to, message.timestamp, message.message].join('|');
+      if (!seen.has(key)) { seen.add(key); merged.push(message); }
+    }
+    const latest = merged.at(-1) || null;
+    const clientSentLast = latest?.sender === 'client';
+    const cleanMessage = ({_order, ...message}) => message;
+    return {
+      message_type: latest ? (clientSentLast ? 'DIA' : 'ASA') : 'FC',
+      client_information: client,
+      fake_account: fakeAccount,
+      conversation: merged.slice(-10).map(cleanMessage),
+      last_message: latest ? cleanMessage(latest) : null,
+      last_client_message: clientSentLast ? latest.message : '',
+    };
+  }
+
+  return { extract };
+})();
+
 // ── Shared UI wiring ─────────────────────────────────────────────────────────
 function flattenProfile(raw) {
   const out = {};
   if (!raw) return out;
-  if (raw.username) out['Username'] = raw.username;
-  if (raw.age) out['Alter'] = raw.age;
-  if (raw.birthdate) out['Geburtsdatum'] = raw.birthdate;
-  if (raw.bio) out['Bio'] = raw.bio;
+  const standard = [
+    ['username', 'Username'], ['gender', 'Geschlecht'],
+    ['looking_for_gender', 'Sucht Geschlecht'], ['age', 'Alter'],
+    ['birthdate', 'Geburtsdatum'], ['location', 'Ort'],
+    ['postal_code', 'PLZ'], ['region', 'Region'],
+    ['relationship_status', 'Beziehungsstatus'], ['looking_for', 'Sucht'],
+    ['bio', 'Bio'], ['notes', 'Notizen'],
+  ];
+  for (const [key, label] of standard) {
+    if (raw[key]) out[label] = raw[key];
+  }
   const extra = raw.additional_details || raw.details || {};
   for (const k of Object.keys(extra)) {
     const v = extra[k];
@@ -3630,12 +3789,17 @@ function normalizeExtracted(platform, raw) {
 let currentPlatform = 'justlo_lindu';
 let extracted = null;
 
-const PASTE_LABELS = { justlo_lindu: 'Justlo / Linduu — HTML einfügen', xkuss: 'Xkuss — HTML einfügen' };
+const PASTE_LABELS = {
+  justlo_lindu: 'Justlo / Linduu — HTML einfügen',
+  xkuss: 'Xkuss — HTML einfügen',
+  gnoxx: 'Gnoxx — HTML einfügen',
+};
 
 function setPlatform(p) {
   currentPlatform = p;
   document.getElementById('tab-justlo').classList.toggle('active', p === 'justlo_lindu');
   document.getElementById('tab-xkuss').classList.toggle('active', p === 'xkuss');
+  document.getElementById('tab-gnoxx').classList.toggle('active', p === 'gnoxx');
   document.getElementById('pasteLabel').textContent = PASTE_LABELS[p];
   extracted = null;
   document.getElementById('extractedCard').style.display = 'none';
@@ -3662,7 +3826,11 @@ function doExtract() {
   if (!html) { errEl.textContent = 'Bitte HTML einfügen.'; return; }
 
   try {
-    const raw = currentPlatform === 'xkuss' ? XkussExtractor.extract(html) : JustloExtractor.extract(html);
+    const raw = currentPlatform === 'xkuss'
+      ? XkussExtractor.extract(html)
+      : currentPlatform === 'gnoxx'
+        ? GnoxxExtractor.extract(html)
+        : JustloExtractor.extract(html);
     extracted = normalizeExtracted(currentPlatform, raw);
   } catch (e) {
     errBox.textContent = 'Der eingefügte Chat konnte nicht gelesen werden. Bitte Format und Inhalt prüfen.';
@@ -3795,7 +3963,7 @@ async function copyReply() {
 
 
 # ── Bots launcher page ───────────────────────────────────────────────────────
-# The single place to start/stop Xkuss, Justlo and Linduu and configure each
+# The single place to start/stop Xkuss, Justlo, Linduu and Gnoxx and configure each
 # one's Source (real Chameleon-AI vs this project's own Groq extractor) and
 # Approval (human review vs fully automatic) independently — no terminal
 # commands needed. Each of the three cards is fully self-contained: changing
@@ -3959,7 +4127,7 @@ _BOTS_PAGE = r"""<!doctype html>
   <a class="back-link" href="/">&larr; Approval Dashboard</a>
   <div>
     <h1>Bots</h1>
-    <p>Start, stop, and configure Xkuss, Justlo and Linduu — each one fully independent, no shared switches.
+    <p>Start, stop, and configure Xkuss, Justlo, Linduu and Gnoxx — each one fully independent, no shared switches.
     Want to test extraction/Groq by hand without touching a live bot? <a href="/chameleon" style="text-decoration:underline;">Chameleon — Standalone</a>.</p>
   </div>
 </div>
@@ -4034,6 +4202,7 @@ const PLATFORMS = [
   { slug: "xkuss",  label: "Xkuss" },
   { slug: "justlo", label: "Justlo" },
   { slug: "linduu", label: "Linduu" },
+  { slug: "gnoxx",  label: "Gnoxx" },
 ];
 
 // Per-platform client-side state, kept separate per card by construction --
@@ -4118,7 +4287,7 @@ function render() {
   document.getElementById("botsGrid").innerHTML = PLATFORMS.map(p => renderCard(p.slug, p.label)).join("");
 }
 
-// Two Groq-prompt buckets, matching the pipeline's actual granularity
+// Groq-prompt buckets, matching the pipeline's actual granularity
 // (chameleon_local._SEL_PLATFORM_TAB / the /chameleon page's currentPlatform)
 // -- Justlo and Linduu bots already share the same local /chameleon tab and
 // prompt, so their custom instructions are shared too, unlike Source/Approval
@@ -4126,6 +4295,7 @@ function render() {
 const CUSTOM_INSTR_TARGETS = [
   { key: "xkuss", label: "Xkuss" },
   { key: "justlo_lindu", label: "Justlo & Linduu" },
+  { key: "gnoxx", label: "Gnoxx" },
 ];
 
 function renderCustomInstrPanel() {

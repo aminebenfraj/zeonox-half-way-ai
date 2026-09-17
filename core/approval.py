@@ -161,7 +161,7 @@ async def get_chameleon_source(platform: str) -> str:
     """Best-effort: read this platform's own Automatic Mode toggle on
     /chameleon or /bots ('real' or 'local' — see approval_server.py's
     _chameleon_source dict and GET/POST /api/chameleon/source). Per-platform:
-    Xkuss, Justlo and Linduu each have their own independent setting, so
+    Xkuss, Justlo, Linduu and Gnoxx each have their own independent setting, so
     flipping one never affects another. Defaults to 'real' on any failure
     (unreachable dashboard, bad response) so a bot never silently switches to
     a mode nobody actively chose. Meant to be read once at bot startup (see

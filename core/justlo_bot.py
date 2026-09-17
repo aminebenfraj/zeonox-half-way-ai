@@ -160,6 +160,9 @@ class JustloConfig:
     chameleon_email:    str = ""
     chameleon_password: str = ""
     chameleon_chat:     str = "Justlo/Linduu DE"
+    # Local extractor / Groq pipeline key. Justlo and Linduu share one parser;
+    # Gnoxx uses the same bot workflow but its own supplied HTML extractor.
+    chameleon_platform_key: str = "justlo_lindu"
     additional_instructions: str = ""
 
     # ── justlo-specific selectors ────────────────────────────────────────────
@@ -886,7 +889,7 @@ class JustloBot:
 
             if self._local_mode:
                 tab2 = await self._find_or_open_tab(context, chameleon_local.LOCAL_TAB_PATTERN)
-                await chameleon_local.setup_local_tab(tab2, "justlo_lindu")
+                await chameleon_local.setup_local_tab(tab2, self.cfg.chameleon_platform_key)
             else:
                 tab2 = await self._find_or_open_tab(context, self.cfg.tab2_pattern)
                 self.log("Setting up chameleon tab...")
@@ -977,14 +980,18 @@ class JustloBot:
                     await tab2.bring_to_front()
                     if self._local_mode:
                         self.log(f"[LOCAL] Pasting {len(html):,} chars into our own /chameleon page...")
-                        if not await chameleon_local.paste_and_extract(tab2, html, "justlo_lindu"):
+                        if not await chameleon_local.paste_and_extract(
+                            tab2, html, self.cfg.chameleon_platform_key
+                        ):
                             raise RuntimeError("Local Chameleon page: extraction did not produce a Generate button.")
                         is_fc = await chameleon_local.is_first_contact(tab2)
                         conv_data = await chameleon_local.get_conversation_data(tab2)
                     else:
                         await self._paste_and_extract(tab2, html)
                         is_fc = await self._is_first_contact(tab2)
-                        conv_data = await chameleon_local.extract_conversation_data(context, html, "justlo_lindu")
+                        conv_data = await chameleon_local.extract_conversation_data(
+                            context, html, self.cfg.chameleon_platform_key
+                        )
                     last_customer_msg = conv_data["last_message"]
 
                     if is_fc:
