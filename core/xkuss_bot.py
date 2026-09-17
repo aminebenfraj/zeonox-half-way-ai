@@ -45,6 +45,7 @@ from core.bot import (
     ManualReviewLimitExceeded,
     log_sent_message,
     contains_banned_language,
+    _wait_for_scrape_layout,
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
@@ -76,10 +77,6 @@ _SEL_EXTRACT_BTN   = "button:has-text('Daten extrahieren')"
 _SEL_GEN_BTN       = "button:has-text('Antwort generieren')"
 _SEL_INSTRUCTIONS  = "textarea[placeholder*='Etwas flirtender']"
 _SEL_COMBOBOX      = "button[role='combobox']"
-
-# xkuss puts the open dialog inside #showpm; capture only that so the serialized
-# HTML never includes the inbox / other chat threads on the page.
-_XKUSS_CHAT_ROOT = "#showpm"
 
 # Inject the HTML straight into the React-controlled textarea in ONE shot:
 # use the native value setter + a single 'input' event so React picks it up
@@ -476,10 +473,11 @@ class XkussBot:
     async def _get_tab1_html(self, tab1) -> str:
         self.log("Capturing chat HTML...")
         t0   = asyncio.get_event_loop().time()
-        # Only serialize the open conversation (#showpm) — never the inbox or
-        # other threads on the page. Keeps the payload small so the chameleon
-        # tab doesn't choke on it.
-        html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS, _XKUSS_CHAT_ROOT)
+        # Match the supplied extension's Full Page mode exactly. A selector
+        # returns only a bare subtree; omitting it serializes document.body and
+        # adds the same <html> wrapper produced by the extension.
+        await _wait_for_scrape_layout(tab1)
+        html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
         elapsed = asyncio.get_event_loop().time() - t0
         if html:
             self.log(f"HTML captured: {len(html):,} chars in {elapsed:.1f}s.")

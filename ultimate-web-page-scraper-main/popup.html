@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>HTML Grabber Pro</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+
+    *{box-sizing:border-box;margin:0;padding:0;}
+
+    :root{
+      --bg:#0d0d0d;--bg2:#1a1a1a;--bg3:#222;
+      --border:#2a2a2a;--border2:#333;
+      --green:#00ff88;--green-dim:#003322;
+      --red:#ff4444;--red-dim:#330000;
+      --yellow:#ffaa00;--yellow-dim:#1a0a00;
+      --text:#f0f0f0;--muted:#555;--faint:#333;
+      --mono:'Space Mono',monospace;
+      --sans:'IBM Plex Sans',sans-serif;
+    }
+
+    body{width:340px;background:var(--bg);color:var(--text);font-family:var(--sans);overflow:hidden;}
+
+    /* ── top bar ── */
+    .topbar{
+      display:flex;align-items:center;justify-content:space-between;
+      padding:14px 16px 10px;border-bottom:1px solid var(--border);
+    }
+    .brand{display:flex;align-items:center;gap:8px;}
+    .dot{width:9px;height:9px;background:var(--green);border-radius:50%;
+         box-shadow:0 0 8px var(--green);animation:pulse 2s infinite;flex-shrink:0;}
+    @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 8px var(--green);}50%{opacity:.4;box-shadow:0 0 2px var(--green);}}
+    .brand-name{font-family:var(--mono);font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;}
+    .brand-ver{font-family:var(--mono);font-size:9px;color:var(--muted);margin-left:4px;}
+    .shortcuts-hint{font-family:var(--mono);font-size:9px;color:var(--faint);text-align:right;line-height:1.5;}
+
+    /* ── tabs ── */
+    .tabs{display:flex;border-bottom:1px solid var(--border);}
+    .tab{
+      flex:1;padding:8px 4px;text-align:center;font-family:var(--mono);font-size:10px;
+      color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
+      transition:all .15s;text-transform:uppercase;letter-spacing:.5px;
+    }
+    .tab:hover{color:#aaa;}
+    .tab.active{color:var(--green);border-bottom-color:var(--green);}
+
+    /* ── panels ── */
+    .panel{display:none;padding:14px 16px;}
+    .panel.active{display:block;}
+
+    /* ── page url ── */
+    .page-info{
+      background:var(--bg2);border:1px solid var(--border);border-radius:6px;
+      padding:7px 10px;margin-bottom:12px;font-size:10px;color:var(--muted);
+      font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    }
+
+    /* ── mode pills ── */
+    .mode-label{font-size:10px;font-family:var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;}
+    .mode-pills{display:flex;gap:5px;margin-bottom:12px;}
+    .pill{
+      flex:1;padding:6px 3px;background:var(--bg2);border:1px solid var(--border);
+      border-radius:5px;font-family:var(--mono);font-size:9px;color:var(--muted);
+      cursor:pointer;text-align:center;transition:all .15s;user-select:none;
+    }
+    .pill:hover{border-color:#444;color:#aaa;}
+    .pill.active{background:var(--green-dim);border-color:var(--green);color:var(--green);}
+    .pill .icon{display:block;font-size:15px;margin-bottom:2px;}
+    .pill .lbl{display:block;line-height:1;}
+
+    /* ── selector input ── */
+    .input-row{margin-bottom:12px;display:none;}
+    .input-row input{
+      width:100%;padding:8px 10px;background:var(--bg2);border:1px solid var(--border);
+      border-radius:6px;color:var(--text);font-family:var(--mono);font-size:11px;outline:none;
+      transition:border-color .15s;
+    }
+    .input-row input:focus{border-color:var(--green);}
+    .input-row input::placeholder{color:var(--faint);}
+
+    /* ── smart detect banner ── */
+    .detect-banner{
+      display:none;background:var(--green-dim);border:1px solid var(--green);
+      border-radius:6px;padding:8px 10px;margin-bottom:12px;
+      font-family:var(--mono);font-size:10px;color:var(--green);line-height:1.5;
+    }
+    .detect-banner .detect-title{font-weight:700;margin-bottom:3px;}
+    .detect-sections{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px;}
+    .detect-tag{
+      background:#001a0e;border:1px solid var(--green);border-radius:3px;
+      padding:2px 6px;font-size:9px;cursor:pointer;transition:all .1s;
+    }
+    .detect-tag:hover{background:var(--green);color:#0d0d0d;}
+
+    /* ── main button ── */
+    .grab-btn{
+      width:100%;padding:12px;background:var(--green);color:#0d0d0d;border:none;
+      border-radius:6px;font-family:var(--mono);font-size:12px;font-weight:700;
+      letter-spacing:1px;cursor:pointer;transition:all .15s;text-transform:uppercase;
+    }
+    .grab-btn:hover{background:#00ffaa;transform:translateY(-1px);box-shadow:0 4px 20px rgba(0,255,136,.25);}
+    .grab-btn:active{transform:translateY(0);}
+    .grab-btn.loading{background:var(--bg2);color:var(--green);border:1px solid var(--green);cursor:not-allowed;}
+    .grab-btn.success{background:var(--green-dim);color:var(--green);border:1px solid var(--green);}
+    .grab-btn.error{background:var(--red-dim);color:var(--red);border:1px solid var(--red);}
+    .grab-btn.waiting{background:var(--yellow-dim);color:var(--yellow);border:1px solid var(--yellow);cursor:not-allowed;}
+    .grab-btn:disabled{background:var(--bg2);color:var(--faint);border:1px solid var(--border);cursor:not-allowed;box-shadow:none;transform:none;}
+
+    /* ── also-copy row ── */
+    .also-row{display:flex;gap:6px;margin-top:7px;}
+    .also-btn{
+      flex:1;padding:6px;background:var(--bg2);border:1px solid var(--border);border-radius:5px;
+      font-family:var(--mono);font-size:9px;color:var(--muted);cursor:pointer;
+      text-align:center;transition:all .15s;text-transform:uppercase;
+    }
+    .also-btn:hover{border-color:var(--green);color:var(--green);}
+    .also-btn.success{border-color:var(--green);color:var(--green);}
+
+    /* ── status ── */
+    .status{margin-top:9px;font-size:10px;font-family:var(--mono);color:var(--muted);min-height:14px;text-align:center;}
+    .status.ok{color:var(--green);}
+    .status.err{color:var(--red);}
+    .status.warn{color:var(--yellow);}
+
+    hr{border:none;border-top:1px solid var(--border);margin:11px 0;}
+
+    /* ── stats grid ── */
+    .stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px;}
+    .stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:9px 10px;}
+    .stat-card.hi{border-color:var(--green);background:var(--green-dim);}
+    .stat-label{font-family:var(--mono);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px;}
+    .stat-card.hi .stat-label{color:var(--green);}
+    .stat-value{font-family:var(--mono);font-size:18px;font-weight:700;color:var(--text);}
+    .stat-card.hi .stat-value{color:var(--green);}
+    .stats{display:flex;justify-content:space-between;font-size:9px;font-family:var(--mono);color:var(--faint);}
+    .stats span{color:var(--muted);}
+
+    /* ── history panel ── */
+    .history-empty{text-align:center;font-family:var(--mono);font-size:11px;color:var(--faint);padding:20px 0;}
+    .history-list{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto;}
+    .history-list::-webkit-scrollbar{width:3px;}
+    .history-list::-webkit-scrollbar-track{background:var(--bg);}
+    .history-list::-webkit-scrollbar-thumb{background:var(--border2);}
+
+    .h-item{
+      background:var(--bg2);border:1px solid var(--border);border-radius:6px;
+      padding:9px 10px;cursor:pointer;transition:all .15s;
+    }
+    .h-item:hover{border-color:var(--border2);}
+    .h-item-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;}
+    .h-item-mode{font-family:var(--mono);font-size:9px;color:var(--green);text-transform:uppercase;}
+    .h-item-size{font-family:var(--mono);font-size:9px;color:var(--muted);}
+    .h-item-url{font-family:var(--mono);font-size:9px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px;}
+    .h-item-time{font-family:var(--mono);font-size:9px;color:var(--faint);}
+    .h-item-actions{display:flex;gap:4px;margin-top:6px;}
+    .h-action{
+      padding:3px 7px;background:var(--bg3);border:1px solid var(--border);border-radius:3px;
+      font-family:var(--mono);font-size:9px;color:var(--muted);cursor:pointer;transition:all .1s;
+    }
+    .h-action:hover{border-color:var(--green);color:var(--green);}
+    .h-action.red:hover{border-color:var(--red);color:var(--red);}
+    .history-clear{
+      width:100%;margin-top:8px;padding:6px;background:transparent;border:1px solid var(--border);
+      border-radius:5px;font-family:var(--mono);font-size:9px;color:var(--muted);
+      cursor:pointer;transition:all .15s;text-transform:uppercase;
+    }
+    .history-clear:hover{border-color:var(--red);color:var(--red);}
+
+    /* ── diff panel ── */
+    .diff-selects{display:flex;gap:6px;margin-bottom:10px;}
+    .diff-select{
+      flex:1;padding:6px 8px;background:var(--bg2);border:1px solid var(--border);
+      border-radius:5px;font-family:var(--mono);font-size:9px;color:var(--text);
+      outline:none;cursor:pointer;
+    }
+    .diff-select option{background:var(--bg2);}
+    .diff-btn{
+      width:100%;padding:10px;background:var(--bg2);border:1px solid var(--border);
+      border-radius:6px;font-family:var(--mono);font-size:11px;color:var(--muted);
+      cursor:pointer;transition:all .15s;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;
+    }
+    .diff-btn:hover{border-color:var(--green);color:var(--green);}
+    .diff-result{
+      background:var(--bg2);border:1px solid var(--border);border-radius:6px;
+      padding:10px;font-family:var(--mono);font-size:10px;max-height:200px;overflow-y:auto;
+      line-height:1.6;
+    }
+    .diff-result::-webkit-scrollbar{width:3px;}
+    .diff-result::-webkit-scrollbar-thumb{background:var(--border2);}
+    .diff-added{color:#00ff88;}
+    .diff-removed{color:#ff4444;}
+    .diff-same{color:var(--faint);}
+    .diff-empty{color:var(--faint);text-align:center;padding:10px 0;}
+
+    /* ── settings panel ── */
+    .setting-row{
+      display:flex;justify-content:space-between;align-items:center;
+      padding:9px 0;border-bottom:1px solid var(--border);
+    }
+    .setting-row:last-child{border-bottom:none;}
+    .setting-label{font-size:12px;color:var(--text);}
+    .setting-desc{font-size:10px;font-family:var(--mono);color:var(--muted);margin-top:2px;}
+    .toggle{position:relative;width:36px;height:20px;flex-shrink:0;}
+    .toggle input{opacity:0;width:0;height:0;}
+    .toggle-slider{
+      position:absolute;inset:0;background:var(--bg3);border-radius:20px;
+      border:1px solid var(--border);cursor:pointer;transition:.2s;
+    }
+    .toggle-slider:before{
+      content:'';position:absolute;width:14px;height:14px;left:2px;bottom:2px;
+      background:var(--muted);border-radius:50%;transition:.2s;
+    }
+    .toggle input:checked + .toggle-slider{background:var(--green-dim);border-color:var(--green);}
+    .toggle input:checked + .toggle-slider:before{transform:translateX(16px);background:var(--green);}
+    .shortcut-info{
+      background:var(--bg2);border:1px solid var(--border);border-radius:6px;
+      padding:9px 10px;margin-top:10px;
+    }
+    .shortcut-row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;}
+    .shortcut-key{
+      font-family:var(--mono);font-size:10px;background:var(--bg3);border:1px solid var(--border);
+      border-radius:3px;padding:2px 6px;color:var(--text);
+    }
+    .shortcut-desc{font-family:var(--mono);font-size:10px;color:var(--muted);}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">
+      <div class="dot"></div>
+      <span class="brand-name">HTML Grabber</span>
+      <span class="brand-ver">v3.2</span>
+    </div>
+    <div class="shortcuts-hint">
+      Ctrl+Shift+G — full page<br>
+      Ctrl+Shift+P — picker
+    </div>
+  </div>
+
+  <!-- Tab bar -->
+  <div class="tabs">
+    <div class="tab active" data-tab="grab">⚡ Grab</div>
+    <div class="tab" data-tab="stats">📊 Stats</div>
+    <div class="tab" data-tab="history">🕘 History</div>
+    <div class="tab" data-tab="diff">⚖️ Diff</div>
+    <div class="tab" data-tab="settings">⚙️ Settings</div>
+  </div>
+
+  <!-- ── GRAB TAB ── -->
+  <div class="panel active" id="tab-grab">
+    <div class="page-info" id="pageUrl">—</div>
+
+    <div class="mode-label">Scrape mode</div>
+    <div class="mode-pills">
+      <div class="pill active" data-mode="full"><span class="icon">📄</span><span class="lbl">Full page</span></div>
+      <div class="pill" data-mode="pick"><span class="icon">🎯</span><span class="lbl">Pick element</span></div>
+      <div class="pill" data-mode="selector"><span class="icon">⌨️</span><span class="lbl">CSS selector</span></div>
+    </div>
+
+    <div class="input-row" id="selectorRow">
+      <input id="selectorInput" type="text" placeholder=".chat-box  /  #messages  /  table"/>
+    </div>
+
+    <!-- Smart detect banner -->
+    <div class="detect-banner" id="detectBanner">
+      <div class="detect-title">🤖 Chat layout detected</div>
+      <div id="detectDesc">Found familiar chat structure on this page.</div>
+      <div class="detect-sections" id="detectSections"></div>
+    </div>
+
+    <button class="grab-btn" id="grabBtn">⚡ Copy HTML</button>
+
+    <!-- Also copy as XPath / save file / reset -->
+    <div class="also-row">
+      <div class="also-btn" id="xpathBtn">📍 Copy XPath</div>
+      <div class="also-btn" id="saveBtn">💾 Save file</div>
+      <div class="also-btn" id="resetBtn" style="color:#ff4444;border-color:#330000;">↺ Reset</div>
+    </div>
+
+    <div class="status" id="status"></div>
+    <hr/>
+    <div class="stats">
+      <div>Last grab</div>
+      <span id="lastSize">—</span>
+    </div>
+  </div>
+
+  <!-- ── STATS TAB ── -->
+  <div class="panel" id="tab-stats">
+    <div class="page-info" id="statsSiteInfo">—</div>
+    <button class="grab-btn" id="statsBtn">📊 Fetch Live Stats</button>
+    <div class="status" id="statsStatus"></div>
+    <div id="statsEmpty" class="history-empty">Click "Fetch Live Stats" while<br>logged in and inside the chat.</div>
+    <div id="statsGrid" class="stats-grid" style="display:none;"></div>
+    <div class="stats" style="margin-top:10px;">
+      <div>Last fetched</div>
+      <span id="statsTime">—</span>
+    </div>
+  </div>
+
+  <!-- ── HISTORY TAB ── -->
+  <div class="panel" id="tab-history">
+    <div class="history-empty" id="historyEmpty">No grabs yet.<br>Start grabbing to build history.</div>
+    <div class="history-list" id="historyList"></div>
+    <button class="history-clear" id="historyClear" style="display:none">🗑 Clear all history</button>
+  </div>
+
+  <!-- ── DIFF TAB ── -->
+  <div class="panel" id="tab-diff">
+    <div class="mode-label" style="margin-bottom:8px;">Compare two grabs</div>
+    <div class="diff-selects">
+      <select class="diff-select" id="diffA"><option value="">— Select grab A —</option></select>
+      <select class="diff-select" id="diffB"><option value="">— Select grab B —</option></select>
+    </div>
+    <button class="diff-btn" id="diffBtn">⚖️ Run Diff</button>
+    <div class="diff-result" id="diffResult">
+      <div class="diff-empty">Select two grabs above to compare them.</div>
+    </div>
+  </div>
+
+  <!-- ── SETTINGS TAB ── -->
+  <div class="panel" id="tab-settings">
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto-detect chat layout</div>
+        <div class="setting-desc">Highlight customer / persona panels</div>
+      </div>
+      <label class="toggle"><input type="checkbox" id="settingAutoDetect" checked/><span class="toggle-slider"></span></label>
+    </div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Save to history</div>
+        <div class="setting-desc">Keep last 10 grabs locally</div>
+      </div>
+      <label class="toggle"><input type="checkbox" id="settingHistory" checked/><span class="toggle-slider"></span></label>
+    </div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto-copy XPath</div>
+        <div class="setting-desc">Also copy XPath when picking element</div>
+      </div>
+      <label class="toggle"><input type="checkbox" id="settingXpath"/><span class="toggle-slider"></span></label>
+    </div>
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Timestamp filenames</div>
+        <div class="setting-desc">Add date+time when saving files</div>
+      </div>
+      <label class="toggle"><input type="checkbox" id="settingTimestamp" checked/><span class="toggle-slider"></span></label>
+    </div>
+
+    <div class="shortcut-info">
+      <div class="mode-label" style="margin-bottom:6px;">Keyboard shortcuts</div>
+      <div class="shortcut-row">
+        <span class="shortcut-desc">Grab full page</span>
+        <span class="shortcut-key">Ctrl+Shift+G</span>
+      </div>
+      <div class="shortcut-row">
+        <span class="shortcut-desc">Start picker</span>
+        <span class="shortcut-key">Ctrl+Shift+P</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

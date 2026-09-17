@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "HTML Grabber Pro",
+  "version": "3.2",
+  "description": "Grab HTML, pick elements, auto-detect chat layout, save history, diff grabs, keyboard shortcuts, live operator stats.",
+  "permissions": ["activeTab", "scripting", "clipboardWrite", "storage", "commands"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "commands": {
+    "grab-full-page": {
+      "suggested_key": { "default": "Ctrl+Shift+G", "mac": "Command+Shift+G" },
+      "description": "Grab full page HTML to clipboard"
+    },
+    "start-picker": {
+      "suggested_key": { "default": "Ctrl+Shift+P", "mac": "Command+Shift+P" },
+      "description": "Start element picker"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

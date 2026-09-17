@@ -67,7 +67,6 @@ note_logs.log
 custom_instructions.json
 
 # Downloaded or external projects
-ultimate-web-page-scraper-main/
 playwright-report/
 
 # Local Chrome debug profile

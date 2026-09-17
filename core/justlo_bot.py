@@ -57,6 +57,7 @@ from core.bot import (
     ManualReviewLimitExceeded,
     log_sent_message,
     contains_banned_language,
+    _wait_for_scrape_layout,
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
@@ -539,10 +540,12 @@ class JustloBot:
     async def _get_tab1_html(self, tab1) -> str:
         self.log("Capturing conversation HTML...")
         t0 = asyncio.get_event_loop().time()
-        # Serialize the moderation workspace body — client profile + fake-account
-        # profile + the conversation/message grid — so chameleon has full context
-        # (a FASA first-contact has no messages, only the two profiles).
-        html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS, self.cfg.sel_conv_root)
+        # Use the supplied extension's Full Page mode exactly: no selector means
+        # serialize document.body and wrap it in <html>...</html>. Passing the
+        # workspace selector here produced a bare subtree, so the bot's capture
+        # could never match HTML copied by the extension's Full Page button.
+        await _wait_for_scrape_layout(tab1)
+        html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
         elapsed = asyncio.get_event_loop().time() - t0
         if html:
             self.log(f"HTML captured: {len(html):,} chars in {elapsed:.1f}s.")

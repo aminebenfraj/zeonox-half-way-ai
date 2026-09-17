@@ -48,6 +48,11 @@ def start_chrome(profile_dir: str, port: int) -> subprocess.Popen:
             chrome,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={profile_dir}",
+            # Keep computed CSS geometry identical to a normal 100%-scale
+            # extension capture. Without an explicit factor, this Windows
+            # setup launches bot Chrome at 0.8: getComputedStyle reports a
+            # 1px border as 1.25px and viewport dimensions are inflated.
+            "--force-device-scale-factor=1",
             "--no-first-run",
             "--no-default-browser-check",
         ],

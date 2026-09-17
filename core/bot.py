@@ -115,7 +115,7 @@ class ManualReviewLimitExceeded(Exception):
 
 # ── JavaScript ─────────────────────────────────────────────────────────────────
 
-_HTML_SERIALIZER_JS = """(rootSel) => {
+_FALLBACK_HTML_SERIALIZER_JS = """(rootSel) => {
   const SKIP_TAGS = new Set([
     'script','style','noscript','meta','link','head','template','slot',
     'svg','path','circle','rect','line','polyline','polygon','ellipse',
@@ -202,18 +202,25 @@ _HTML_SERIALIZER_JS = """(rootSel) => {
   // annotateChatMessages().
   function annotateChatMessages() {
     const fakeSidebar = document.getElementById('fake-sidebar')
-      || Array.from(document.querySelectorAll('aside')).find(a => a.className && (a.className.includes('right-0') || a.className.includes('translate-x-[336px]')));
+      || document.querySelector('[class*="fake-sidebar"]')
+      || Array.from(document.querySelectorAll('aside')).find(a => a.className && (
+        a.className.includes('from-female') || a.className.includes('from-male')
+        || a.className.includes('right-0') || a.className.includes('translate-x-[336px]')
+      ));
     const clientSidebar = document.getElementById('regular-sidebar')
-      || Array.from(document.querySelectorAll('aside')).find(a => a.className && (a.className.includes('left-0') || a.className.includes('translate-x-[-336px]')));
+      || document.querySelector('[class*="regular-sidebar"]')
+      || Array.from(document.querySelectorAll('aside')).find(a => a.className && (
+        a.className.includes('left-0') || a.className.includes('translate-x-[-336px]')
+      ));
 
     let personaName = '', clientName = '';
 
     if (fakeSidebar) {
-      const nameEl = fakeSidebar.querySelector('p.text-lg, [class*="text-lg"]');
+      const nameEl = fakeSidebar.querySelector('p.text-lg, p[class*="text-lg"], [class*="text-lg"] p');
       if (nameEl) personaName = nameEl.textContent.replace(/[,\\s]+$/, '').trim();
     }
     if (clientSidebar) {
-      const nameEl = clientSidebar.querySelector('p.text-lg, [class*="text-lg"]');
+      const nameEl = clientSidebar.querySelector('p.text-lg, p[class*="text-lg"], [class*="text-lg"] p');
       if (nameEl) clientName = nameEl.textContent.replace(/[,\\s]+$/, '').trim();
     }
 
@@ -319,6 +326,58 @@ _HTML_SERIALIZER_JS = """(rootSel) => {
   const root = (rootSel && document.querySelector(rootSel)) || document.body;
   return '<html>\\n\\n<head></head>\\n\\n' + serialize(root, 0) + '\\n</html>';
 }"""
+
+
+def _reference_function(source: str, name: str, end_marker: str) -> str:
+    """Extract one top-level function from the supplied extension source.
+
+    The reference file uses stable section banners after both functions. Using
+    those explicit boundaries avoids maintaining a second, gradually-diverging
+    Python copy of the extension's scraper.
+    """
+    start = source.find(f"function {name}(")
+    if start < 0:
+        raise ValueError(f"{name} not found")
+    end = source.find(end_marker, start)
+    if end < 0:
+        raise ValueError(f"end marker for {name} not found")
+    return source[start:end].strip()
+
+
+def _load_reference_html_serializer() -> tuple[str, str]:
+    reference_path = _STATE_DIR / "ultimate-web-page-scraper-main" / "popup.js"
+    try:
+        source = reference_path.read_text(encoding="utf-8")
+        annotator = _reference_function(
+            source,
+            "annotateChatMessages",
+            "// ═══════════════════════════════════════════════════════════════════\n//  HTML SERIALIZER",
+        )
+        serializer = _reference_function(
+            source,
+            "serializeAccessibilityTree",
+            "// ═══════════════════════════════════════════════════════════════════\n//  GRAB MODES",
+        )
+        wrapped = (
+            "(rootSelector) => {\n"
+            f"{annotator}\n\n"
+            f"{serializer}\n\n"
+            "return serializeAccessibilityTree(rootSelector);\n"
+            "}"
+        )
+        return wrapped, str(reference_path)
+    except (OSError, UnicodeError, ValueError):
+        return _FALLBACK_HTML_SERIALIZER_JS, "embedded fallback"
+
+
+_HTML_SERIALIZER_JS, HTML_SCRAPER_SOURCE = _load_reference_html_serializer()
+
+
+async def _wait_for_scrape_layout(page):
+    """Wait two animation frames so computed layout is stable before capture."""
+    await page.evaluate(
+        "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
 
 _GET_DE_REPLY_JS = """
 () => {
@@ -703,6 +762,7 @@ class ChatBot:
     async def _get_tab1_html(self, tab1) -> str:
         self.log("Capturing page HTML...")
         t0   = asyncio.get_event_loop().time()
+        await _wait_for_scrape_layout(tab1)
         html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
         elapsed = asyncio.get_event_loop().time() - t0
         if html:
