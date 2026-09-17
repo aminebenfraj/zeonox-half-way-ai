@@ -2,9 +2,9 @@ import os
 
 from core.justlo_bot import JustloBot, JustloConfig
 
-# Gnoxx uses the same ExtJS moderation console and workflow as Justlo/Linduu.
-# Only the login host, browser profile, local extractor key, and credentials
-# differ, so it intentionally reuses the proven JustloBot implementation.
+# Gnoxx uses exactly the same bot state machine and ExtJS moderation workflow
+# as Linduu. Only connection/login identity and the HTML parser differ; all
+# live-console selectors deliberately inherit the same JustloConfig defaults.
 config = JustloConfig(
     platform="Gnoxx",
     cdp_url="http://127.0.0.1:9231",
@@ -32,7 +32,6 @@ config = JustloConfig(
     sel_login_pass="#password",
     sel_login_btn="#login_btn",
     sel_mod_link="a[href*='community-mod']",
-    sel_conv_grid="#conversation-grid",
 )
 
 bot_class = JustloBot

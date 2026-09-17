@@ -33,7 +33,6 @@ bot's next generate/status ping simply creates a fresh one.
 
 import concurrent.futures
 import hmac
-import html
 import itertools
 import json
 import os
@@ -323,34 +322,85 @@ def chameleon_prompt():
     return jsonify({"prompt": _CHAMELEON_SYSTEM_PROMPT})
 
 
-# Translation calls hit Google's endpoint over the network; bound each one with
-# a hard timeout on a worker thread so a slow/unreachable network never stalls
-# the request-creation endpoint (and therefore never stalls a bot's cycle).
+# Translation calls use the configured Groq account first and OpenRouter as a
+# provider-level fallback. Keep them on a bounded worker thread so an upstream
+# outage never stalls a bot cycle indefinitely.
 _translate_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="translate")
 
+GROQ_TRANSLATION_MODEL = os.environ.get("GROQ_TRANSLATION_MODEL", "openai/gpt-oss-120b")
+OPENROUTER_TRANSLATION_MODEL = os.environ.get("OPENROUTER_TRANSLATION_MODEL", "openai/gpt-4o")
+_TRANSLATION_SYSTEM_PROMPT = (
+    "Translate the user's German text into natural English. Preserve meaning, "
+    "tone, names, emojis, paragraph breaks, and punctuation. Return only the "
+    "English translation, with no notes, labels, or quotation marks."
+)
 
-_TRANSLATE_RESULT_RE = re.compile(r'class="result-container">(.*?)</div>', re.DOTALL)
+
+def _translation_messages(text: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": _TRANSLATION_SYSTEM_PROMPT},
+        {"role": "user", "content": text},
+    ]
+
+
+def _translate_with_groq(text: str) -> str | None:
+    client = _get_groq_test_client()
+    if client is None:
+        return None
+    response = client.chat.completions.create(
+        model=GROQ_TRANSLATION_MODEL,
+        messages=_translation_messages(text),
+        temperature=0,
+        max_completion_tokens=1200,
+        top_p=1,
+        reasoning_effort="low",
+        timeout=8.0,
+    )
+    return (response.choices[0].message.content or "").strip() or None
+
+
+def _translate_with_openrouter(text: str) -> str | None:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
+        "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
+    }
+    response = httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json={
+            "model": OPENROUTER_TRANSLATION_MODEL,
+            "messages": _translation_messages(text),
+            "temperature": 0,
+            "max_tokens": 1200,
+        },
+        timeout=12.0,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return (data["choices"][0]["message"]["content"] or "").strip() or None
 
 
 def _translate_de_en_sync(text: str) -> str | None:
-    # deep_translator's GoogleTranslator scrapes the desktop translate.google.com
-    # page for a <div class="t0"> that Google has since removed, so it always
-    # raised TranslationNotFound. The lightweight /m (mobile) endpoint still
-    # returns a plain <div class="result-container"> with the translation.
-    resp = httpx.get(
-        "https://translate.google.com/m",
-        params={"sl": "de", "tl": "en", "q": text},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=6.0,
-    )
-    resp.raise_for_status()
-    match = _TRANSLATE_RESULT_RE.search(resp.text)
-    if not match:
+    try:
+        translated = _translate_with_groq(text)
+        if translated:
+            return translated
+    except Exception:
+        pass
+
+    try:
+        return _translate_with_openrouter(text)
+    except Exception:
         return None
-    return html.unescape(match.group(1)).strip() or None
 
 
-def _translate_de_en(text: str, timeout: float = 6.0) -> str | None:
+def _translate_de_en(text: str, timeout: float = 22.0) -> str | None:
     text = (text or "").strip()
     if not text:
         return None
