@@ -168,29 +168,6 @@ async def mark_failed(request_id: str | None, error: str = ""):
         pass
 
 
-async def get_chameleon_source(platform: str) -> str:
-    """Best-effort: read this platform's own Automatic Mode toggle on
-    /chameleon or /bots ('real' or 'local' — see approval_server.py's
-    _chameleon_source dict and GET/POST /api/chameleon/source). Per-platform:
-    Xkuss, Justlo, Linduu and Gnoxx each have their own independent setting, so
-    flipping one never affects another. Defaults to 'real' on any failure
-    (unreachable dashboard, bad response) so a bot never silently switches to
-    a mode nobody actively chose. Meant to be read once at bot startup (see
-    core/chameleon_local.py) — flipping the toggle live takes effect on that
-    bot's next restart, not the current run."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0, auth=_AUTH) as client:
-            r = await client.get(
-                f"{APPROVAL_SERVER_URL}/api/chameleon/source",
-                params={"platform": platform},
-            )
-            r.raise_for_status()
-            source = r.json().get("source")
-            return source if source in ("real", "local") else "real"
-    except Exception:
-        return "real"
-
-
 async def report_status(
     platform: str,
     state: str,

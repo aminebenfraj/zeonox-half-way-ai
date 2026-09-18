@@ -515,19 +515,24 @@ def run_bots():
 
     @control_app.get("/control/status")
     def _control_status():
-        with _cmd_lock:
-            platforms = {}
-            for name in PLATFORMS:
-                if name in stopped:
-                    platforms[name] = {"state": "stopped"}
-                elif procs[name].poll() is None:
-                    platforms[name] = {
-                        "state": "running",
-                        "uptime": int(time.time() - start_times[name]),
-                        "crashes": crash_counts[name],
-                    }
-                else:
-                    platforms[name] = {"state": "dead", "exit_code": procs[name].poll()}
+        # Keep liveness reads independent from the command lock. Commands such
+        # as Fix can hold that lock for a while; status must remain responsive
+        # so the dashboard WebSocket does not falsely mark every bot offline.
+        # Individual dict/set assignments are atomic here, and a restart race
+        # is harmless because the next two-second snapshot corrects it.
+        platforms = {}
+        for name in PLATFORMS:
+            proc = procs[name]
+            if name in stopped:
+                platforms[name] = {"state": "stopped"}
+            elif proc.poll() is None:
+                platforms[name] = {
+                    "state": "running",
+                    "uptime": int(time.time() - start_times[name]),
+                    "crashes": crash_counts[name],
+                }
+            else:
+                platforms[name] = {"state": "dead", "exit_code": proc.poll()}
         return jsonify({"ok": True, "platforms": platforms, "all_platforms": ALL_PLATFORMS})
 
     @control_app.post("/control/command")

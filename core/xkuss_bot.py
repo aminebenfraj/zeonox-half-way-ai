@@ -40,6 +40,7 @@ from core.bot import (
     _GET_QUALITY_FAILURE_JS,
     _GET_MANUAL_REVIEW_JS,
     _GET_SERVER_ERROR_JS,
+    _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS,
     _IS_FIRST_CONTACT_JS,
     _is_fatal,
     _is_context_destroyed,
@@ -51,7 +52,6 @@ from core.bot import (
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
 from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
-from core import chameleon_local
 from core.xkuss_login import (
     login_xkuss,
     click_home,
@@ -139,7 +139,6 @@ class XkussBot:
     def __init__(self, config: XkussConfig):
         self.cfg = config
         self._last_phase = None   # last logged phase, so we only log on change
-        self._local_mode = False  # set once at the top of run() — see core/chameleon_local.py
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -194,7 +193,7 @@ class XkussBot:
 
     async def _resolve_tabs(self, context, retries: int = TAB_MAX_RETRIES):
         """Re-query both tabs from the live context, matched by URL substring."""
-        tab2_pattern = chameleon_local.LOCAL_TAB_PATTERN if self._local_mode else self.cfg.tab2_pattern
+        tab2_pattern = self.cfg.tab2_pattern
         for attempt in range(retries):
             pages = context.pages
             self.log(f"Tab search (attempt {attempt + 1}/{retries}) — {len(pages)} page(s) open.")
@@ -360,9 +359,6 @@ class XkussBot:
             return False
 
     async def _generate_reply(self, tab2) -> str:
-        if self._local_mode:
-            return await chameleon_local.generate_reply(tab2, self.cfg.additional_instructions, GENERATE_TIMEOUT)
-
         old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
         gen_btn   = tab2.locator(_SEL_GEN_BTN)
         self.log(f"Waiting up to {EXTRACT_TIMEOUT}s for 'Generate Reply' button...")
@@ -656,11 +652,7 @@ class XkussBot:
         await tab1.bring_to_front()
         textarea = tab1.locator(self.cfg.sel_textarea)
         await textarea.click()
-        # Local mode: paste from the OS clipboard, same as a human copying out
-        # of our /chameleon page (see chameleon_local.paste_via_clipboard()).
-        # Falls back to setting the value directly on any clipboard hiccup.
-        if not (self._local_mode and await chameleon_local.paste_via_clipboard(tab1, textarea, reply)):
-            await textarea.fill(reply)
+        await textarea.fill(reply)
         # Trigger the character counter so the send button un-disables.
         await self._nudge_char_counter(tab1)
         wait = random.randint(15, 20)
@@ -724,10 +716,6 @@ class XkussBot:
             self.cfg.platform, "retrying", reason,
             warning=reason, checkpoint="scraping_html",
         )
-        if self._local_mode:
-            self.log("[RECOVERY] Local mode — nothing to fix; next cycle re-pastes fresh.")
-            return
-
         self.log("[RECOVERY] Failure but chat still active — restarting Chameleon job "
                  "(re-copy HTML → paste → generate).")
         try:
@@ -768,26 +756,17 @@ class XkussBot:
             context = browser.contexts[0]
             self.log(f"Browser context has {len(context.pages)} open page(s).")
 
-            self._local_mode = await chameleon_local.is_local_mode("xkuss")
-            if self._local_mode:
-                self.log("[LOCAL] Automatic Mode is ON — replies will come from this project's "
-                         "own /chameleon page (Groq), not the real Chameleon-AI.")
-
             # ── Set up both tabs: login to xkuss + chameleon ───────────────
             tab1 = await self._find_or_open_tab(context, self.cfg.tab1_pattern)
             self.log("Logging in to xkuss and pressing Home...")
             await login_xkuss(tab1, self.cfg, self.cfg.platform)
 
-            if self._local_mode:
-                tab2 = await self._find_or_open_tab(context, chameleon_local.LOCAL_TAB_PATTERN)
-                await chameleon_local.setup_local_tab(tab2, "xkuss")
-            else:
-                tab2 = await self._find_or_open_tab(context, self.cfg.tab2_pattern)
-                self.log("Setting up chameleon tab...")
-                await login_chameleon(
-                    tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
-                    self.cfg.platform, self.cfg.chameleon_chat,
-                )
+            tab2 = await self._find_or_open_tab(context, self.cfg.tab2_pattern)
+            self.log("Setting up chameleon tab...")
+            await login_chameleon(
+                tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
+                self.cfg.platform, self.cfg.chameleon_chat,
+            )
 
             self.log("Both tabs ready. Bot running.\n")
 
@@ -835,10 +814,9 @@ class XkussBot:
                             continue
 
                     # ── We are on a chat page — do the chameleon work ──────
-                    if not self._local_mode:
-                        if await self._is_chameleon_broken(tab2):
-                            await self._fix_chameleon_only(tab2)
-                        await self._ensure_chat_selected(tab2)
+                    if await self._is_chameleon_broken(tab2):
+                        await self._fix_chameleon_only(tab2)
+                    await self._ensure_chat_selected(tab2)
 
                     await tab1.bring_to_front()
                     await self._wait_for_page_ready(tab1)
@@ -849,24 +827,17 @@ class XkussBot:
                         continue
 
                     await tab2.bring_to_front()
-                    if self._local_mode:
-                        self.log(f"[LOCAL] Pasting {len(html):,} chars into our own /chameleon page...")
-                        if not await chameleon_local.paste_and_extract(tab2, html, "xkuss"):
-                            raise RuntimeError("Local Chameleon page: extraction did not produce a Generate button.")
-                        is_fc = await chameleon_local.is_first_contact(tab2)
-                        conv_data = await chameleon_local.get_conversation_data(tab2)
-                    else:
-                        await self._paste_and_extract(tab2, html)
-                        is_fc = await self._is_first_contact(tab2)
-                        conv_data = await chameleon_local.extract_conversation_data(context, html, "xkuss")
-                    last_customer_msg = conv_data["last_message"]
+                    await self._paste_and_extract(tab2, html)
+                    is_fc = await self._is_first_contact(tab2)
+                    last_customer_msg = await self._safe_evaluate(
+                        tab2, _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS
+                    )
 
                     if is_fc:
                         self.log("[FC] First Contact detected — going Home.")
-                        if not self._local_mode:
-                            await tab2.reload()
-                            await self._wait_for_page_ready(tab2, "domcontentloaded")
-                            await self._ensure_chat_selected(tab2)
+                        await tab2.reload()
+                        await self._wait_for_page_ready(tab2, "domcontentloaded")
+                        await self._ensure_chat_selected(tab2)
                         await click_home(tab1, self.cfg, self.cfg.platform)
                         cycle -= 1
                         continue
@@ -874,7 +845,7 @@ class XkussBot:
                     try:
                         reply, approval_id = await self._get_approved_reply(
                             tab1, tab2, last_customer_msg,
-                            conv_data["client_profile"], conv_data["fake_profile"],
+                            {}, {},
                         )
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "

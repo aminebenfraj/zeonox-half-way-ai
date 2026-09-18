@@ -21,10 +21,8 @@ config = JustloConfig(
 
     chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
     chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
-    # The real service follows the same Justlo/Linduu workflow. Built-in mode
-    # uses the dedicated Gnoxx extractor supplied with this project change.
+    # The real service follows the same Justlo/Linduu Chameleon workflow.
     chameleon_chat="Justlo/Linduu DE",
-    chameleon_platform_key="gnoxx",
     additional_instructions="",
 
     sel_login_link="",
