@@ -40,7 +40,6 @@ from core.bot import (
     _GET_QUALITY_FAILURE_JS,
     _GET_MANUAL_REVIEW_JS,
     _GET_SERVER_ERROR_JS,
-    _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS,
     _IS_FIRST_CONTACT_JS,
     _is_fatal,
     _is_context_destroyed,
@@ -52,6 +51,7 @@ from core.bot import (
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
 from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
+from core.chameleon_data import read_extracted_data
 from core.xkuss_login import (
     login_xkuss,
     click_home,
@@ -481,7 +481,8 @@ class XkussBot:
                 )
             await asyncio.sleep(2)
 
-    async def _get_approved_reply(self, tab1, tab2, customer_message: str = "",
+    async def _get_approved_reply(self, tab1, tab2, last_message: str = "",
+                                   customer_message: str = "",
                                    client_profile: dict | None = None, fake_profile: dict | None = None) -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
@@ -500,7 +501,8 @@ class XkussBot:
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
             await report_status(self.cfg.platform, "approval", "Waiting for approval", checkpoint="approval")
             approved, final_text, req_id = await request_approval(
-                self.cfg.platform, reply, customer_message=customer_message,
+                self.cfg.platform, reply, last_message=last_message,
+                customer_message=customer_message,
                 client_profile=client_profile, fake_profile=fake_profile,
                 chat_still_active=lambda: self._chat_still_active(tab1),
             )
@@ -829,9 +831,7 @@ class XkussBot:
                     await tab2.bring_to_front()
                     await self._paste_and_extract(tab2, html)
                     is_fc = await self._is_first_contact(tab2)
-                    last_customer_msg = await self._safe_evaluate(
-                        tab2, _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS
-                    )
+                    extracted = await read_extracted_data(tab2)
 
                     if is_fc:
                         self.log("[FC] First Contact detected — going Home.")
@@ -844,8 +844,9 @@ class XkussBot:
 
                     try:
                         reply, approval_id = await self._get_approved_reply(
-                            tab1, tab2, last_customer_msg,
-                            {}, {},
+                            tab1, tab2,
+                            extracted["last_message"], extracted["last_customer_message"],
+                            extracted["client_profile"], extracted["fake_profile"],
                         )
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "

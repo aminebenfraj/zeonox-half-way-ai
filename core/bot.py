@@ -19,6 +19,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 from core.login import login_mod_site, login_chameleon, chat_not_selected
 from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
+from core.chameleon_data import read_extracted_data
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
 # Cross-process signal: the launcher (start_all.py/launch_all.py) creates/deletes
@@ -452,9 +453,8 @@ _GET_CHAT_DURATION_JS = """
 # 'from-female') — see tab1_html_with_conversation.txt. So the first '[class*="from-male"]'
 # match in that container is the customer's most recent message. Used only for the
 # stagnant-reply check below (did OUR sent reply actually change the customer's
-# last bubble) — the dashboard's displayed "Last Message" comes from Chameleon
-# instead, see _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS, since this tab1 heuristic has
-# grabbed the wrong bubble on some platforms.
+# last bubble). Dashboard context comes from Chameleon's extracted JSON because
+# this tab1 heuristic has grabbed the wrong bubble on some platforms.
 _GET_LAST_CUSTOMER_MSG_JS = """
 () => {
     const container = document.querySelector('#scrollable-chat-container');
@@ -467,25 +467,6 @@ _GET_LAST_CUSTOMER_MSG_JS = """
     return clone.textContent.replace(/\\s+/g, ' ').trim();
 }
 """
-
-# Chameleon parses the pasted conversation itself and renders the customer's
-# actual last message in a "Letzte Kundennachricht" card (mirrors the
-# "Antwort (Deutsch)" card _GET_DE_REPLY_JS reads from) — reading it from here
-# instead of guessing at tab1's raw chat-widget DOM is what the dashboard's
-# "Last Message" field is meant to show, and doesn't depend on any
-# platform-specific bubble class.
-_GET_LAST_CUSTOMER_MSG_CHAMELEON_JS = """
-() => {
-    const spans = [...document.querySelectorAll('span')];
-    const label = spans.find(s => s.textContent.trim().toUpperCase().includes('KUNDENNACHRICHT'));
-    if (!label) return '';
-    const section = label.closest('div[class*="rounded-2xl"]') || label.parentElement;
-    if (!section) return '';
-    const p = section.querySelector('p');
-    return p ? p.textContent.trim() : '';
-}
-"""
-
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -1072,7 +1053,9 @@ class ChatBot:
                 )
             await asyncio.sleep(2)
 
-    async def _get_approved_reply(self, tab1, tab2, customer_message: str) -> tuple[str, str]:
+    async def _get_approved_reply(self, tab1, tab2, last_message: str,
+                                  customer_message: str, client_profile: dict,
+                                  fake_profile: dict) -> tuple[str, str]:
         """Generate a reply, then block on the approval dashboard before it's
         allowed to be sent. A rejection clicks 'Antwort generieren' again for a
         fresh reply and resubmits it — repeats until something is approved.
@@ -1097,7 +1080,9 @@ class ChatBot:
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
             await report_status(self.cfg.platform, "approval", "Waiting for approval", checkpoint="approval")
             approved, final_text, req_id = await request_approval(
-                self.cfg.platform, reply, customer_message=customer_message,
+                self.cfg.platform, reply, last_message=last_message,
+                customer_message=customer_message,
+                client_profile=client_profile, fake_profile=fake_profile,
                 chat_still_active=lambda: self._chat_is_open(tab1),
             )
             if approved:
@@ -1229,13 +1214,9 @@ class ChatBot:
                     await tab2.bring_to_front()
                     await self._paste_and_extract(tab2, html)
 
-                    # What the dashboard shows as "Last Message" — read from Chameleon's
-                    # own "Letzte Kundennachricht" card rather than the tab1 heuristic
-                    # above, which has picked the wrong bubble on some platforms. Falls
-                    # back to the tab1 value if Chameleon's card isn't found so the
-                    # dashboard field is never silently left blank.
-                    dashboard_customer_msg = await self._safe_evaluate(tab2, _GET_LAST_CUSTOMER_MSG_CHAMELEON_JS)
-                    dashboard_customer_msg = dashboard_customer_msg or last_customer_msg
+                    extracted = await read_extracted_data(tab2)
+                    dashboard_customer_msg = extracted["last_customer_message"] or last_customer_msg
+                    dashboard_last_msg = extracted["last_message"] or dashboard_customer_msg
 
                     if await self._is_first_contact(tab2):
                         self.log("[FC] First Contact detected — reloading chat and chameleon tabs.")
@@ -1251,7 +1232,10 @@ class ChatBot:
 
                     await self._wait_while_paused()
                     try:
-                        reply, approval_id = await self._get_approved_reply(tab1, tab2, dashboard_customer_msg)
+                        reply, approval_id = await self._get_approved_reply(
+                            tab1, tab2, dashboard_last_msg, dashboard_customer_msg,
+                            extracted["client_profile"], extracted["fake_profile"],
+                        )
                     except ManualReviewLimitExceeded:
                         await self._restart_from_scraping(
                             tab1, tab2,

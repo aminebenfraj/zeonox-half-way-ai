@@ -478,6 +478,9 @@ def create_request():
     platform = (body.get("platform") or "unknown").strip()
     reply = body.get("reply") or ""
     customer_message = body.get("customer_message") or ""
+    # Literal latest conversation message, regardless of sender. Older bot
+    # versions only send customer_message, so retain that as a display fallback.
+    last_message = body.get("last_message") or customer_message
     reply_type = (body.get("reply_type") or "").strip() or None  # e.g. "DIA" / "ASA Follow-up" (Justlo only) — None means the bot doesn't report one
     # Optional profile data supplied by a bot and shown on the dashboard so a
     # reviewer can sanity-check the context before approving.
@@ -491,6 +494,7 @@ def create_request():
     # editable / actually sent — translations are read-only context.
     reply_en = _translate_de_en(reply)
     customer_message_en = _translate_de_en(customer_message) if customer_message else None
+    last_message_en = _translate_de_en(last_message) if last_message else None
 
     with _lock:
         # A platform's own override (set on /bots) wins over the dashboard's
@@ -527,6 +531,8 @@ def create_request():
         _requests[req_id] = {
             "id": req_id,
             "platform": platform,
+            "last_message": last_message,
+            "last_message_en": last_message_en,
             "customer_message": customer_message,
             "customer_message_en": customer_message_en,
             "client_profile": client_profile,
@@ -2101,6 +2107,8 @@ function extractedDataHtml(r) {
 function pendingCardHtml(r) {
   const val = editedReplies.has(r.id) ? editedReplies.get(r.id) : r.reply;
   const pc = colorFor(r.platform);
+  const lastMessage = r.last_message || r.customer_message || "";
+  const lastMessageEn = r.last_message_en || r.customer_message_en || "";
   return `
     <div class="card" data-id="${r.id}" style="--pc:${pc}">
       <div class="card-head">
@@ -2108,13 +2116,13 @@ function pendingCardHtml(r) {
         ${r.reply_type ? `<span class="pill ${r.reply_type === "ASA Follow-up" ? "type-asa" : "type-dia"}">${escapeHtml(r.reply_type)}</span>` : ""}
         <span class="time">${timeAgo(r.created_at)}</span>
       </div>
-      ${r.customer_message ? `
+      ${lastMessage ? `
         <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
-        <div class="de-box">${escapeHtml(r.customer_message)}</div>
-        ${r.customer_message_en ? `
+        <div class="de-box">${escapeHtml(lastMessage)}</div>
+        ${lastMessageEn ? `
           <div class="translation-row">
             <span class="lang-tag tag-en">EN</span>
-            <span class="en-box">${escapeHtml(r.customer_message_en)}</span>
+            <span class="en-box">${escapeHtml(lastMessageEn)}</span>
           </div>` : ""}
         <div class="card-divider"></div>
       ` : ""}
@@ -2141,6 +2149,8 @@ function pendingCardHtml(r) {
 // check detected, and what actually went out if the guard rewrote it.
 function autoCardHtml(r) {
   const pc = colorFor(r.platform);
+  const lastMessage = r.last_message || r.customer_message || "";
+  const lastMessageEn = r.last_message_en || r.customer_message_en || "";
   const detected = r.contains_meeting === true ? "yes" : (r.contains_meeting === false ? "no" : null);
   const changed = !!(r.meeting_guard && r.meeting_guard !== "approve" && r.final_reply && r.final_reply !== r.reply);
   const actionLabel = ACTION_LABELS[r.meeting_guard] || r.meeting_guard;
@@ -2152,13 +2162,13 @@ function autoCardHtml(r) {
         <span class="status-badge ${r.status}">${r.status}</span>
         <span class="time">${timeAgo(r.decided_at || r.created_at)}</span>
       </div>
-      ${r.customer_message ? `
+      ${lastMessage ? `
         <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
-        <div class="de-box">${escapeHtml(r.customer_message)}</div>
-        ${r.customer_message_en ? `
+        <div class="de-box">${escapeHtml(lastMessage)}</div>
+        ${lastMessageEn ? `
           <div class="translation-row">
             <span class="lang-tag tag-en">EN</span>
-            <span class="en-box">${escapeHtml(r.customer_message_en)}</span>
+            <span class="en-box">${escapeHtml(lastMessageEn)}</span>
           </div>` : ""}
         <div class="card-divider"></div>
       ` : ""}

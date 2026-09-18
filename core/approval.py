@@ -62,6 +62,7 @@ async def request_approval(
     platform: str,
     reply: str,
     *,
+    last_message: str = "",
     customer_message: str = "",
     context: str = "",
     reply_type: str = "",
@@ -90,6 +91,7 @@ async def request_approval(
             json={
                 "platform": platform,
                 "reply": reply,
+                "last_message": last_message,
                 "customer_message": customer_message,
                 "context": context,
                 "reply_type": reply_type,
