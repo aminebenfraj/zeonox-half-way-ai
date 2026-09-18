@@ -102,6 +102,7 @@ async def request_approval(
         req_id = resp.json()["id"]
 
         since_chat_check = 0.0
+        since_status_ping = 0.0
         while True:
             await asyncio.sleep(POLL_INTERVAL)
             r = await client.get(f"{APPROVAL_SERVER_URL}/api/requests/{req_id}")
@@ -115,6 +116,16 @@ async def request_approval(
             if status == "cancelled":
                 raise ApprovalCancelled(req_id)
             # still "pending" -> keep polling
+
+            since_status_ping += POLL_INTERVAL
+            if since_status_ping >= 20.0:
+                since_status_ping = 0.0
+                await report_status(
+                    platform,
+                    "approval",
+                    "Waiting for approval",
+                    checkpoint="approval",
+                )
 
             if chat_still_active is not None:
                 since_chat_check += POLL_INTERVAL
@@ -180,17 +191,33 @@ async def get_chameleon_source(platform: str) -> str:
         return "real"
 
 
-async def report_status(platform: str, state: str, detail: str = ""):
-    """Best-effort: tell the dashboard what this bot is doing right now, e.g.
-    'waiting_for_chat', 'chat_detected', 'generating', 'awaiting_approval',
-    'sending', 'idle', 'error'. Powers the live per-platform detector shown on
-    the dashboard. Never allowed to break the bot cycle — a stale/missing
-    status just means the dashboard shows the platform as offline."""
+async def report_status(
+    platform: str,
+    state: str,
+    detail: str = "",
+    *,
+    retry_count: int = 0,
+    warning: str = "",
+    checkpoint: str = "",
+):
+    """Best-effort workflow telemetry for the live dashboard.
+
+    `retry_count`, `warning`, and `checkpoint` make recovery observable without
+    affecting the bot cycle. A stale/missing status only makes the dashboard
+    show the platform as offline; reporting can never stop message handling.
+    """
     try:
         async with httpx.AsyncClient(timeout=5.0, auth=_AUTH) as client:
             await client.post(
                 f"{APPROVAL_SERVER_URL}/api/status",
-                json={"platform": platform, "state": state, "detail": detail},
+                json={
+                    "platform": platform,
+                    "state": state,
+                    "detail": detail,
+                    "retry_count": max(0, int(retry_count or 0)),
+                    "warning": warning,
+                    "checkpoint": checkpoint,
+                },
             )
     except Exception:
         pass

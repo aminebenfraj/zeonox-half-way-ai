@@ -37,6 +37,7 @@ from playwright.async_api import (
 from core.bot import (
     _HTML_SERIALIZER_JS,
     _GET_DE_REPLY_JS,
+    _GET_QUALITY_FAILURE_JS,
     _GET_MANUAL_REVIEW_JS,
     _GET_SERVER_ERROR_JS,
     _IS_FIRST_CONTACT_JS,
@@ -324,6 +325,11 @@ class XkussBot:
 
     async def _paste_and_extract(self, tab2, html: str):
         self.log(f"Switching to extractor tab and pasting {len(html):,} chars of HTML...")
+        await report_status(
+            self.cfg.platform, "extracting",
+            f"Pasting and extracting {len(html):,} HTML characters",
+            checkpoint="scraping_html",
+        )
         await self._wait_for_page_ready(tab2, "domcontentloaded")
         await self._ensure_extractor_tab_active(tab2)
 
@@ -373,25 +379,36 @@ class XkussBot:
                     raise
                 self.log(f"[WARN] Could not fill additional instructions: {e}")
 
-        # Chameleon can refuse to produce a reply two different ways:
+        # Chameleon can refuse to produce a reply in three ways:
+        #  - its quality check shows "Keine sichere Antwort erstellt"
         #  - it flags the request as needing a human ("... muss MANUELL
         #    beantwortet werden", e.g. an outing/doxxing attempt)
         #  - its backend just fails outright ("Fehler: SERVER_ERROR" /
         #    "Interner Fehler. Bitte erneut versuchen.")
-        # Click 'Antwort generieren' again — up to 3 attempts total — before
-        # giving up; the caller then refreshes the chat.
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        # Quality rejections are regenerated until a real reply appears.
+        # Manual-review and backend errors retain their three-attempt cap.
+        max_non_quality_failures = 3
+        attempt = 0
+        non_quality_failures = 0
+        retry_count = 0
+        last_warning = ""
+        while True:
+            attempt += 1
+            await report_status(
+                self.cfg.platform, "generating", f"Generating reply (attempt {attempt})",
+                retry_count=retry_count, warning=last_warning, checkpoint="generating",
+            )
             if attempt > 1:
                 await gen_btn.wait_for(state="visible", timeout=EXTRACT_TIMEOUT * 1_000)
             await gen_btn.scroll_into_view_if_needed()
             await gen_btn.click()
-            self.log(f"'Generate Reply' clicked (attempt {attempt}/{max_attempts}) — "
+            self.log(f"'Generate Reply' clicked (attempt {attempt}) — "
                      f"polling for AI response (timeout: {GENERATE_TIMEOUT}s)...")
 
             t_start       = asyncio.get_event_loop().time()
             last_progress = 0.0
             deadline      = t_start + GENERATE_TIMEOUT
+            quality_failed = False
             manual_review = False
             server_error  = False
             server_error_text = ""
@@ -403,6 +420,10 @@ class XkussBot:
                         elapsed = asyncio.get_event_loop().time() - t_start
                         self.log(f"AI reply received in {elapsed:.1f}s: {reply[:80]}{'...' if len(reply) > 80 else ''}")
                         return reply
+
+                    if await self._safe_evaluate(tab2, _GET_QUALITY_FAILURE_JS):
+                        quality_failed = True
+                        break
 
                     if await self._safe_evaluate(tab2, _GET_MANUAL_REVIEW_JS):
                         manual_review = True
@@ -420,25 +441,49 @@ class XkussBot:
                 elapsed = asyncio.get_event_loop().time() - t_start
                 if elapsed - last_progress >= 15:
                     self.log(f"Still waiting for AI reply... ({elapsed:.0f}s elapsed, {GENERATE_TIMEOUT - elapsed:.0f}s remaining)")
+                    await report_status(
+                        self.cfg.platform, "generating", f"Waiting for Chameleon ({elapsed:.0f}s elapsed)",
+                        retry_count=retry_count, warning=last_warning, checkpoint="generating",
+                    )
                     last_progress = elapsed
                 await asyncio.sleep(1)
 
-            if not manual_review and not server_error:
+            if not quality_failed and not manual_review and not server_error:
                 raise RuntimeError(f"Timed out ({GENERATE_TIMEOUT}s) waiting for AI reply.")
 
-            if manual_review:
-                self.log(f"[WARN] Chameleon flagged this request for manual review "
-                         f"(attempt {attempt}/{max_attempts}) — retrying generation.")
-            else:
-                self.log(f"[WARN] Chameleon returned an error banner ({server_error_text}) "
-                         f"(attempt {attempt}/{max_attempts}) — retrying generation.")
-            if attempt < max_attempts:
+            if quality_failed:
+                retry_count += 1
+                last_warning = "Keine sichere Antwort erstellt"
+                self.log(f"[WARN] Quality check rejected the reply (attempt {attempt}): "
+                         "'Keine sichere Antwort erstellt' — regenerating until a reply is available.")
+                await report_status(
+                    self.cfg.platform, "retrying", "Chameleon quality check rejected the reply",
+                    retry_count=retry_count, warning=last_warning, checkpoint="generating",
+                )
                 await asyncio.sleep(2)
-
-        raise ManualReviewLimitExceeded(
-            "Chameleon still won't produce a reply after 3 attempts "
-            f"({'manual review' if manual_review else 'server error'})."
-        )
+                continue
+            if manual_review:
+                non_quality_failures += 1
+                retry_count += 1
+                last_warning = "Chameleon requires manual review"
+                self.log(f"[WARN] Chameleon flagged this request for manual review "
+                         f"({non_quality_failures}/{max_non_quality_failures}) — retrying generation.")
+            else:
+                non_quality_failures += 1
+                retry_count += 1
+                last_warning = server_error_text
+                self.log(f"[WARN] Chameleon returned an error banner ({server_error_text}) "
+                         f"({non_quality_failures}/{max_non_quality_failures}) — retrying generation.")
+            await report_status(
+                self.cfg.platform, "retrying", "Retrying Chameleon generation",
+                retry_count=retry_count, warning=last_warning, checkpoint="generating",
+            )
+            if non_quality_failures >= max_non_quality_failures:
+                raise ManualReviewLimitExceeded(
+                    "Chameleon still won't produce a reply after 3 attempts "
+                    f"({'manual review' if manual_review else 'server error'})."
+                )
+            await asyncio.sleep(2)
 
     async def _get_approved_reply(self, tab1, tab2, customer_message: str = "",
                                    client_profile: dict | None = None, fake_profile: dict | None = None) -> tuple[str, str]:
@@ -447,7 +492,7 @@ class XkussBot:
         ApprovalCancelled propagates to the caller (chat closed, or an operator
         clicked Cancel) so it can restart this chat's Chameleon job instead."""
         while True:
-            await report_status(self.cfg.platform, "generating")
+            await report_status(self.cfg.platform, "generating", "Generating a reply", checkpoint="generating")
             reply = await self._generate_reply(tab2)
 
             banned = contains_banned_language(reply)
@@ -457,7 +502,7 @@ class XkussBot:
                 continue
 
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
-            await report_status(self.cfg.platform, "awaiting_approval")
+            await report_status(self.cfg.platform, "approval", "Waiting for approval", checkpoint="approval")
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply, customer_message=customer_message,
                 client_profile=client_profile, fake_profile=fake_profile,
@@ -472,6 +517,10 @@ class XkussBot:
 
     async def _get_tab1_html(self, tab1) -> str:
         self.log("Capturing chat HTML...")
+        await report_status(
+            self.cfg.platform, "extracting", "Scraping fresh conversation HTML",
+            checkpoint="scraping_html",
+        )
         t0   = asyncio.get_event_loop().time()
         # Match the supplied extension's Full Page mode exactly. A selector
         # returns only a bare subtree; omitting it serializes document.body and
@@ -495,7 +544,7 @@ class XkussBot:
         is expected to sit in the waiting room until a conversation arrives.
         """
         self.log("In the waiting room — waiting for a dialog...")
-        await report_status(self.cfg.platform, "waiting_for_chat")
+        await report_status(self.cfg.platform, "waiting", "Waiting for a conversation", checkpoint="waiting")
         t_start      = asyncio.get_event_loop().time()
         last_report  = t_start
         last_rehome  = t_start
@@ -533,6 +582,7 @@ class XkussBot:
                 last_report = now
             elif now - last_report >= 30:
                 self.log(f"Still in the waiting room... ({now - t_start:.0f}s)")
+                await report_status(self.cfg.platform, "waiting", "Waiting for a conversation", checkpoint="waiting")
                 last_report = now
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -579,6 +629,29 @@ class XkussBot:
             await asyncio.sleep(0.5)
         return False
 
+    async def _wait_send_confirmed(self, tab1, timeout: float = 10.0):
+        """Wait until Xkuss clears the reply box or leaves the chat page."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                state = await self._detect_phase(tab1)
+                if state != PAGE_CHAT:
+                    return
+                empty = await tab1.evaluate(
+                    """(sel) => {
+                        const el = document.querySelector(sel);
+                        return !el || !String(el.value || '').trim();
+                    }""",
+                    self.cfg.sel_textarea,
+                )
+                if empty:
+                    return
+            except PlaywrightError as e:
+                if _is_fatal(e):
+                    raise
+            await asyncio.sleep(0.5)
+        raise RuntimeError("Send was not confirmed: the Xkuss reply box did not clear.")
+
     async def _send_reply(self, tab1, reply: str, approval_id: str | None = None):
         await tab1.bring_to_front()
         textarea = tab1.locator(self.cfg.sel_textarea)
@@ -612,12 +685,14 @@ class XkussBot:
 
             await send_btn.scroll_into_view_if_needed()
             await send_btn.click()
+            await self._wait_send_confirmed(tab1)
         except Exception as e:
             await mark_failed(approval_id, str(e))
             raise
         self.log(f"Sent: {reply[:80]}{'...' if len(reply) > 80 else ''}")
         log_sent_message(self.cfg.platform, reply)
         await mark_sent(approval_id)
+        await report_status(self.cfg.platform, "sent", "Reply confirmed sent", checkpoint="sent")
         await asyncio.sleep(2)
 
     # ── Error recovery ───────────────────────────────────────────────────────
@@ -637,7 +712,7 @@ class XkussBot:
                 raise
             return False
 
-    async def _restart_chameleon_job(self, tab1, tab2):
+    async def _restart_chameleon_job(self, tab1, tab2, reason: str = "Workflow interrupted"):
         """Re-establish a clean Chameleon (tab2) state after a mid-cycle failure.
 
         The chat is still on screen, so the next cycle will re-copy the HTML,
@@ -645,6 +720,10 @@ class XkussBot:
         workspace with a chat selected first. Best-effort: non-fatal errors are
         swallowed so the retry loop still proceeds.
         """
+        await report_status(
+            self.cfg.platform, "retrying", reason,
+            warning=reason, checkpoint="scraping_html",
+        )
         if self._local_mode:
             self.log("[RECOVERY] Local mode — nothing to fix; next cycle re-pastes fresh.")
             return
@@ -801,16 +880,21 @@ class XkussBot:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
                                  "review after 3 attempts — refreshing the chat (re-extracting "
                                  "into Chameleon; tab1 stays put so the loaded dialog isn't lost).")
-                        await self._restart_chameleon_job(tab1, tab2)
+                        await self._restart_chameleon_job(
+                            tab1, tab2,
+                            "Chameleon did not produce a usable reply after its guarded retries",
+                        )
                         cycle -= 1
                         continue
                     except ApprovalCancelled:
                         self.log("[APPROVAL] Cancelled — chat closed or operator cancelled it. "
                                  "Restarting the Chameleon job on this chat...")
-                        await self._restart_chameleon_job(tab1, tab2)
+                        await self._restart_chameleon_job(
+                            tab1, tab2, "Approval was cancelled or the conversation changed"
+                        )
                         cycle -= 1
                         continue
-                    await report_status(self.cfg.platform, "sending")
+                    await report_status(self.cfg.platform, "sending", "Pasting and sending the approved reply", checkpoint="sending")
                     await self._send_reply(tab1, reply, approval_id)
 
                     if consecutive_errors > 0:
@@ -845,7 +929,9 @@ class XkussBot:
                         self.log(f"[FATAL] {MAX_ERRORS} consecutive errors — triggering restart")
                         sys.exit(1)
                     if await self._chat_still_active(tab1):
-                        await self._restart_chameleon_job(tab1, tab2)
+                        await self._restart_chameleon_job(
+                            tab1, tab2, f"Timeout: {str(e)[:140]}"
+                        )
                         cycle -= 1
                         continue
 
@@ -864,6 +950,8 @@ class XkussBot:
                         self.log(f"[FATAL] {MAX_ERRORS} consecutive errors — triggering restart")
                         sys.exit(1)
                     if await self._chat_still_active(tab1):
-                        await self._restart_chameleon_job(tab1, tab2)
+                        await self._restart_chameleon_job(
+                            tab1, tab2, f"{type(e).__name__}: {str(e)[:140]}"
+                        )
                         cycle -= 1
                         continue

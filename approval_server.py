@@ -166,7 +166,7 @@ def _bump_state():
 # by platform name. In-memory like everything else here — a restart just means
 # every platform shows as offline until its next status ping.
 _status: dict[str, dict] = {}
-STATUS_STALE_AFTER = 30  # seconds without a ping before the dashboard treats a platform as offline
+STATUS_STALE_AFTER = 45  # seconds without a ping before the dashboard treats a platform as offline
 
 # Review mode, toggled from the dashboard (see /api/mode below). "manual" is
 # the original behaviour — every request waits in the queue for a human.
@@ -1106,17 +1106,22 @@ def mark_failed(req_id):
 
 @app.post("/api/status")
 def update_status():
-    """Bots ping this at each state transition (waiting for a chat, extracting,
-    generating, awaiting approval, sending, idle, error) — see report_status()
-    in core/approval.py. Powers the live 'detector' indicator per platform."""
+    """Receive bot stage, retry, warning, and recovery-checkpoint telemetry."""
     body = request.get_json(force=True, silent=True) or {}
     platform = (body.get("platform") or "").strip()
     if not platform:
         return jsonify({"error": "platform is required"}), 400
+    try:
+        retry_count = max(0, int(body.get("retry_count") or 0))
+    except (TypeError, ValueError):
+        retry_count = 0
     with _lock:
         _status[platform] = {
             "state": body.get("state") or "unknown",
             "detail": body.get("detail") or "",
+            "retry_count": retry_count,
+            "warning": body.get("warning") or "",
+            "checkpoint": body.get("checkpoint") or "",
             "updated_at": _now(),
         }
     _bump_state()
@@ -1401,6 +1406,21 @@ _PAGE = """<!doctype html>
   .detector-pill.live { color: var(--foreground); background: color-mix(in srgb, var(--det, var(--accent)) 16%, var(--card)); border-color: color-mix(in srgb, var(--det, var(--border)) 45%, transparent); }
   .detector-pill.live .det-dot { background: var(--det, var(--success)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--det, var(--success)) 30%, transparent); animation: pulse 2s ease-in-out infinite; }
   .detector-pill.offline { opacity: .6; }
+  .workflow-status {
+    margin: 8px 0 14px; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 10px; background: color-mix(in srgb, var(--card) 88%, transparent);
+  }
+  .workflow-steps { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+  .workflow-step {
+    font-size: 10.5px; font-weight: 650; color: var(--muted-foreground);
+    padding: 3px 7px; border-radius: 999px; border: 1px solid var(--border);
+  }
+  .workflow-step.done { color: var(--success); border-color: color-mix(in srgb, var(--success) 38%, var(--border)); }
+  .workflow-step.active { color: var(--foreground); background: color-mix(in srgb, var(--pc) 20%, var(--accent)); border-color: var(--pc); }
+  .workflow-arrow { color: var(--muted-foreground); font-size: 10px; }
+  .workflow-detail { margin-top: 7px; font-size: 11.5px; color: var(--muted-foreground); display: flex; gap: 10px; flex-wrap: wrap; }
+  .workflow-warning { color: var(--warning); }
+  .workflow-checkpoint { color: var(--info); }
   .sidebar-foot {
     padding: 12px 18px; border-top: 1px solid var(--border);
     color: var(--muted-foreground); font-size: 11.5px;
@@ -2205,28 +2225,57 @@ async function cancelCard(id, btn) {
 // bot side never breaks the dashboard.
 const STATE_META = {
   starting:           { label: "Starting…",           color: "var(--muted-foreground)" },
+  waiting:            { label: "Waiting",             color: "var(--muted-foreground)" },
   waiting_for_chat:   { label: "Waiting for a chat",   color: "var(--muted-foreground)" },
   chat_detected:      { label: "Chat detected",        color: "var(--info)" },
   extracting:         { label: "Extracting…",          color: "var(--info)" },
   generating:         { label: "Generating reply…",    color: "var(--violet)" },
+  retrying:           { label: "Retrying…",            color: "var(--warning)" },
+  approval:           { label: "Awaiting approval",    color: "var(--warning)" },
   awaiting_approval:  { label: "Awaiting approval",    color: "var(--warning)" },
   sending:            { label: "Sending…",              color: "var(--success)" },
+  sent:               { label: "Sent",                 color: "var(--success)" },
   idle:               { label: "Idle",                  color: "var(--muted-foreground)" },
   recovering:         { label: "Recovering…",           color: "var(--warning)" },
   restarting:         { label: "Restarting…",            color: "var(--info)" },
   error:              { label: "Error",                 color: "var(--destructive)" },
 };
-const STATUS_STALE_MS = 30_000; // must match STATUS_STALE_AFTER on the server
+const STATUS_STALE_MS = 45_000; // must match STATUS_STALE_AFTER on the server
 
 let liveStatus = {}; // platform -> {state, detail, updated_at}
 
 function detectorFor(name) {
   const s = liveStatus[name];
-  if (!s) return { live: false, label: "Offline", color: "var(--border)", detail: "" };
+  if (!s) return { live: false, label: "Offline", color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "" };
   const ageMs = Date.now() - new Date(s.updated_at).getTime();
-  if (ageMs > STATUS_STALE_MS) return { live: false, label: "Offline", color: "var(--border)", detail: "" };
+  if (ageMs > STATUS_STALE_MS) return { live: false, label: "Offline", color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "" };
   const meta = STATE_META[s.state] || { label: s.state, color: "var(--info)" };
-  return { live: true, label: meta.label, color: meta.color, detail: s.detail || "" };
+  return {
+    live: true, label: meta.label, color: meta.color, detail: s.detail || "", state: s.state,
+    retryCount: Number(s.retry_count || 0), warning: s.warning || "", checkpoint: s.checkpoint || "",
+  };
+}
+
+const WORKFLOW_STEPS = ["Waiting", "Extracting", "Generating", "Retrying", "Approval", "Sending", "Sent"];
+const WORKFLOW_INDEX = {
+  starting: 0, waiting: 0, waiting_for_chat: 0, idle: 0, chat_detected: 1,
+  extracting: 1, generating: 2, retrying: 3, recovering: 3, restarting: 3, error: 3,
+  approval: 4, awaiting_approval: 4, sending: 5, sent: 6,
+};
+
+function workflowStatusHtml(det) {
+  const active = WORKFLOW_INDEX[det.state] ?? 0;
+  const steps = WORKFLOW_STEPS.map((label, i) => {
+    const cls = i === active ? "active" : (i < active ? "done" : "");
+    const step = `<span class="workflow-step ${cls}">${escapeHtml(label)}</span>`;
+    return i ? `<span class="workflow-arrow">→</span>${step}` : step;
+  }).join("");
+  const details = [];
+  if (det.detail) details.push(`<span>${escapeHtml(det.detail)}</span>`);
+  if (det.retryCount) details.push(`<span>Retry ${det.retryCount}</span>`);
+  if (det.warning) details.push(`<span class="workflow-warning">${escapeHtml(det.warning)}</span>`);
+  if (det.checkpoint) details.push(`<span class="workflow-checkpoint">Restart point: ${escapeHtml(det.checkpoint)}</span>`);
+  return `<div class="workflow-status"><div class="workflow-steps">${steps}</div>${details.length ? `<div class="workflow-detail">${details.join("")}</div>` : ""}</div>`;
 }
 
 const FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"];
@@ -2552,6 +2601,7 @@ function renderSections(pending, autoByPlatform) {
           </span>
           <hr />
         </div>
+        ${workflowStatusHtml(det)}
         ${ctrlBarHtml(name)}
         ${body}
       </section>

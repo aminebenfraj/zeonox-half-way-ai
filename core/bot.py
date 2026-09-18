@@ -727,7 +727,7 @@ class ChatBot:
 
     async def _wait_for_conversation(self, tab1):
         self.log("Waiting for a new conversation...")
-        await report_status(self.cfg.platform, "waiting_for_chat")
+        await report_status(self.cfg.platform, "waiting", "Waiting for a conversation", checkpoint="waiting")
         t_start     = asyncio.get_event_loop().time()
         last_report = t_start
         while True:
@@ -754,6 +754,7 @@ class ChatBot:
             now = asyncio.get_event_loop().time()
             if now - last_report >= 30:
                 self.log(f"Still idle... ({now - t_start:.0f}s waiting for a conversation)")
+                await report_status(self.cfg.platform, "waiting", "Waiting for a conversation", checkpoint="waiting")
                 last_report = now
 
             await asyncio.sleep(POLL_INTERVAL)
@@ -761,6 +762,12 @@ class ChatBot:
 
     async def _get_tab1_html(self, tab1) -> str:
         self.log("Capturing page HTML...")
+        await report_status(
+            self.cfg.platform,
+            "extracting",
+            "Scraping fresh conversation HTML",
+            checkpoint="scraping_html",
+        )
         t0   = asyncio.get_event_loop().time()
         await _wait_for_scrape_layout(tab1)
         html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
@@ -785,6 +792,12 @@ class ChatBot:
 
     async def _paste_and_extract(self, tab2, html: str):
         self.log(f"Switching to extractor tab and pasting {len(html):,} chars of HTML...")
+        await report_status(
+            self.cfg.platform,
+            "extracting",
+            f"Pasting and extracting {len(html):,} HTML characters",
+            checkpoint="scraping_html",
+        )
         await self._wait_for_page_ready(tab2, "domcontentloaded")
         await self._ensure_extractor_tab_active(tab2)
 
@@ -826,13 +839,14 @@ class ChatBot:
         or the conversation closes/goes idle (False).
         """
         self.log("Waiting for next user message or conversation end...")
-        await report_status(self.cfg.platform, "idle", "waiting for the customer's next message")
+        await report_status(self.cfg.platform, "waiting", "Waiting for the customer's next message", checkpoint="waiting")
+        last_status = asyncio.get_event_loop().time()
         while True:
             try:
                 waiting = await tab1.query_selector(self.cfg.sel_waiting)
                 if waiting is not None:
                     self.log("Conversation closed — back to idle.")
-                    await report_status(self.cfg.platform, "waiting_for_chat")
+                    await report_status(self.cfg.platform, "waiting", "Waiting for a conversation", checkpoint="waiting")
                     return False
                 current_html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
                 if current_html != sent_html:
@@ -846,6 +860,10 @@ class ChatBot:
                     await self._wait_for_page_ready(tab1)
                 else:
                     self.log(f"[WARN] Error polling for new message: {e}")
+            now = asyncio.get_event_loop().time()
+            if now - last_status >= 20:
+                await report_status(self.cfg.platform, "waiting", "Waiting for the customer's next message", checkpoint="waiting")
+                last_status = now
             await asyncio.sleep(POLL_INTERVAL)
             await self._wait_while_paused()
 
@@ -861,6 +879,53 @@ class ChatBot:
             if _is_fatal(e):
                 raise
             return True  # unknown/transient — don't cancel on a fluke
+
+    async def _restart_from_scraping(self, tab1, tab2, reason: str) -> bool:
+        """Prepare a failed active job for a clean outer-loop restart.
+
+        No generated reply or extracted Chameleon state is reused. When the
+        conversation is still open, the next cycle always starts at
+        _get_tab1_html() and builds the job again from fresh page HTML.
+        """
+        if not await self._chat_is_open(tab1):
+            return False
+        self.log(f"[RECOVERY] {reason} — restarting from fresh HTML scraping.")
+        await report_status(
+            self.cfg.platform,
+            "retrying",
+            reason,
+            warning=reason,
+            checkpoint="scraping_html",
+        )
+        try:
+            if await self._is_chameleon_broken(tab2):
+                await self._fix_chameleon_only(tab2)
+            await self._ensure_chat_selected(tab2)
+        except PlaywrightError as e:
+            if _is_fatal(e):
+                raise
+            self.log(f"[WARN] Chameleon recovery check failed: {e}")
+        return True
+
+    async def _wait_for_send_confirmation(self, tab1, timeout: float = 10.0):
+        """Confirm the platform accepted the click before marking a reply sent."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                accepted = await tab1.evaluate(
+                    """(sel) => {
+                        const el = document.querySelector(sel);
+                        return !el || !String(el.value || '').trim();
+                    }""",
+                    self.cfg.sel_textarea,
+                )
+                if accepted:
+                    return
+            except PlaywrightError as e:
+                if _is_fatal(e):
+                    raise
+            await asyncio.sleep(0.5)
+        raise RuntimeError("Send was not confirmed: the reply box did not clear.")
 
     async def _generate_reply(self, tab2) -> str:
         old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
@@ -886,19 +951,30 @@ class ChatBot:
         #    beantwortet werden" banner (e.g. an outing/doxxing attempt)
         #  - its backend just fails outright ("Fehler: SERVER_ERROR" /
         #    "Interner Fehler. Bitte erneut versuchen.")
-        # Either way we click 'Antwort generieren' again — up to 3 attempts
-        # total — before giving up. A persistent quality-check rejection falls
-        # through to the normal error handling in run() (restart/reload as
-        # usual); a persistent manual-review banner or server error instead
-        # raises ManualReviewLimitExceeded so run() can refresh the chat
-        # immediately.
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        # A quality-check rejection is explicitly retryable: keep clicking
+        # 'Antwort generieren' until Chameleon exposes a real reply. Manual
+        # review and backend-error banners retain their three-attempt cap so a
+        # genuinely broken request cannot pin the bot here forever.
+        max_non_quality_failures = 3
+        attempt = 0
+        non_quality_failures = 0
+        retry_count = 0
+        last_warning = ""
+        while True:
+            attempt += 1
+            await report_status(
+                self.cfg.platform,
+                "generating",
+                f"Generating reply (attempt {attempt})",
+                retry_count=retry_count,
+                warning=last_warning,
+                checkpoint="generating",
+            )
             if attempt > 1:
                 await gen_btn.wait_for(state="visible", timeout=EXTRACT_TIMEOUT * 1_000)
             await gen_btn.scroll_into_view_if_needed()
             await gen_btn.click()
-            self.log(f"'Generate Reply' clicked (attempt {attempt}/{max_attempts}) — "
+            self.log(f"'Generate Reply' clicked (attempt {attempt}) — "
                      f"polling for AI response (timeout: {GENERATE_TIMEOUT}s)...")
 
             t_start        = asyncio.get_event_loop().time()
@@ -938,6 +1014,14 @@ class ChatBot:
                 if elapsed - last_progress >= 15:
                     remaining = GENERATE_TIMEOUT - elapsed
                     self.log(f"Still waiting for AI reply... ({elapsed:.0f}s elapsed, {remaining:.0f}s remaining)")
+                    await report_status(
+                        self.cfg.platform,
+                        "generating",
+                        f"Waiting for Chameleon ({elapsed:.0f}s elapsed)",
+                        retry_count=retry_count,
+                        warning=last_warning,
+                        checkpoint="generating",
+                    )
                     last_progress = elapsed
 
                 await asyncio.sleep(1)
@@ -946,26 +1030,47 @@ class ChatBot:
                 raise RuntimeError(f"Timed out ({GENERATE_TIMEOUT}s) waiting for AI reply.")
 
             if manual_review:
+                non_quality_failures += 1
+                retry_count += 1
+                last_warning = "Chameleon requires manual review"
                 self.log(f"[WARN] Chameleon flagged this request for manual review "
-                         f"(attempt {attempt}/{max_attempts}) — retrying generation.")
+                         f"({non_quality_failures}/{max_non_quality_failures}) — retrying generation.")
             elif server_error:
+                non_quality_failures += 1
+                retry_count += 1
+                last_warning = server_error_text
                 self.log(f"[WARN] Chameleon returned an error banner ({server_error_text}) "
-                         f"(attempt {attempt}/{max_attempts}) — retrying generation.")
+                         f"({non_quality_failures}/{max_non_quality_failures}) — retrying generation.")
             else:
-                self.log(f"[WARN] Quality check rejected the reply (attempt {attempt}/{max_attempts}): "
-                         "'Keine sichere Antwort erstellt'.")
-            if attempt < max_attempts:
+                retry_count += 1
+                last_warning = "Keine sichere Antwort erstellt"
+                self.log(f"[WARN] Quality check rejected the reply (attempt {attempt}): "
+                         "'Keine sichere Antwort erstellt' — regenerating until a reply is available.")
+                await report_status(
+                    self.cfg.platform,
+                    "retrying",
+                    "Chameleon quality check rejected the reply",
+                    retry_count=retry_count,
+                    warning=last_warning,
+                    checkpoint="generating",
+                )
                 await asyncio.sleep(2)
+                continue
 
-        if manual_review or server_error:
-            raise ManualReviewLimitExceeded(
-                "Chameleon still won't produce a reply after 3 attempts "
-                f"({'manual review' if manual_review else 'server error'})."
+            await report_status(
+                self.cfg.platform,
+                "retrying",
+                "Retrying Chameleon generation",
+                retry_count=retry_count,
+                warning=last_warning,
+                checkpoint="generating",
             )
-        raise RuntimeError(
-            "Quality check rejected the AI reply on all 3 attempts "
-            "('Keine sichere Antwort erstellt') — giving up."
-        )
+            if non_quality_failures >= max_non_quality_failures:
+                raise ManualReviewLimitExceeded(
+                    "Chameleon still won't produce a reply after 3 attempts "
+                    f"({'manual review' if manual_review else 'server error'})."
+                )
+            await asyncio.sleep(2)
 
     async def _get_approved_reply(self, tab1, tab2, customer_message: str) -> tuple[str, str]:
         """Generate a reply, then block on the approval dashboard before it's
@@ -980,7 +1085,7 @@ class ChatBot:
         the caller restarts/redetects rather than looping here.
         """
         while True:
-            await report_status(self.cfg.platform, "generating")
+            await report_status(self.cfg.platform, "generating", "Generating a reply", checkpoint="generating")
             reply = await self._generate_reply(tab2)
 
             banned = contains_banned_language(reply)
@@ -990,7 +1095,7 @@ class ChatBot:
                 continue
 
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
-            await report_status(self.cfg.platform, "awaiting_approval")
+            await report_status(self.cfg.platform, "approval", "Waiting for approval", checkpoint="approval")
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply, customer_message=customer_message,
                 chat_still_active=lambda: self._chat_is_open(tab1),
@@ -1148,23 +1253,21 @@ class ChatBot:
                     try:
                         reply, approval_id = await self._get_approved_reply(tab1, tab2, dashboard_customer_msg)
                     except ManualReviewLimitExceeded:
-                        self.log("[RECOVERY] Chameleon kept flagging this request for manual "
-                                 "review after 3 attempts — refreshing the chat page.")
-                        await tab1.reload()
-                        await self._wait_for_page_ready(tab1, "domcontentloaded")
-                        await self._wait_for_conversation(tab1)
+                        await self._restart_from_scraping(
+                            tab1, tab2,
+                            "Chameleon did not produce a usable reply after its guarded retries",
+                        )
                         cycle -= 1
                         continue
                     except ApprovalCancelled:
-                        self.log("[APPROVAL] Cancelled — chat closed or operator cancelled it. "
-                                 "Reloading the chat page and redetecting...")
-                        await tab1.reload()
-                        await self._wait_for_page_ready(tab1, "domcontentloaded")
-                        await self._wait_for_conversation(tab1)
+                        await self._restart_from_scraping(
+                            tab1, tab2,
+                            "Approval was cancelled or the conversation changed",
+                        )
                         cycle -= 1
                         continue
 
-                    await report_status(self.cfg.platform, "sending")
+                    await report_status(self.cfg.platform, "sending", "Pasting and sending the approved reply", checkpoint="sending")
                     await tab1.bring_to_front()
                     textarea = tab1.locator(self.cfg.sel_textarea)
                     await textarea.click()
@@ -1177,12 +1280,14 @@ class ChatBot:
                     await self._wait_while_paused()
                     try:
                         await tab1.locator(self.cfg.sel_send_btn).click()
+                        await self._wait_for_send_confirmation(tab1)
                     except Exception as e:
                         await mark_failed(approval_id, str(e))
                         raise
                     self.log(f"Sent: {reply[:80]}{'...' if len(reply) > 80 else ''}")
                     log_sent_message(self.cfg.platform, reply)
                     await mark_sent(approval_id)
+                    await report_status(self.cfg.platform, "sent", "Reply confirmed sent", checkpoint="sent")
                     await asyncio.sleep(2)
 
                     if self._stagnant_count >= STAGNANT_CYCLES_BEFORE_RELOGIN:
@@ -1248,6 +1353,9 @@ class ChatBot:
                         first_error_time = None
                         cycle -= 1
                         continue
+                    if await self._restart_from_scraping(tab1, tab2, f"Timeout: {str(e)[:140]}"):
+                        cycle -= 1
+                        continue
 
                 except Exception as e:
                     if _is_fatal(e):
@@ -1270,5 +1378,8 @@ class ChatBot:
                         await self._handle_relogin_and_fix_chameleon(tab1, tab2)
                         consecutive_errors = 0
                         first_error_time = None
+                        cycle -= 1
+                        continue
+                    if await self._restart_from_scraping(tab1, tab2, f"{type(e).__name__}: {str(e)[:140]}"):
                         cycle -= 1
                         continue
