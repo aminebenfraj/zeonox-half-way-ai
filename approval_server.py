@@ -49,6 +49,7 @@ import httpx
 from flask import Flask, jsonify, request, Response
 
 from core.launcher import is_cdp_ready
+from core import push_notifications
 
 
 try:
@@ -553,8 +554,47 @@ def create_request():
             "_seq": next(_order),
         }
         _prune_history_locked()
+        created_request = dict(_requests[req_id])
+        pending_count = sum(1 for item in _requests.values() if item["status"] == "pending")
     _bump_state()
+    if not auto:
+        push_notifications.queue_approval(created_request, pending_count)
     return jsonify({"id": req_id, "auto": auto, "meeting_guard": meeting_guard}), 201
+
+
+@app.get("/api/push/config")
+def push_config():
+    return jsonify({
+        "enabled": push_notifications.is_available(),
+        "public_key": push_notifications.PUBLIC_KEY,
+        "subscriptions": push_notifications.subscription_count(),
+    })
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe():
+    if not push_notifications.is_available():
+        return jsonify({
+            "ok": False,
+            "error": "Web Push is not configured. Check pywebpush and VAPID settings.",
+        }), 503
+    body = request.get_json(force=True, silent=True) or {}
+    subscription = body.get("subscription") or body
+    try:
+        count = push_notifications.add_subscription(subscription)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if body.get("send_test", True):
+        push_notifications.queue_test(subscription.get("endpoint", ""))
+    return jsonify({"ok": True, "subscriptions": count})
+
+
+@app.delete("/api/push/subscribe")
+def push_unsubscribe():
+    body = request.get_json(force=True, silent=True) or {}
+    endpoint = body.get("endpoint") or ""
+    count = push_notifications.remove_subscription(endpoint)
+    return jsonify({"ok": True, "subscriptions": count})
 
 
 @app.get("/api/mode")
@@ -902,6 +942,12 @@ _PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="theme-color" content="#09090b" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Zenox" />
+<link rel="manifest" href="/static/manifest.webmanifest" />
+<link rel="apple-touch-icon" href="/static/icons/zenox-180.png" />
 <title>Chat Approval Dashboard</title>
 <style>
   :root {
@@ -980,6 +1026,8 @@ _PAGE = """<!doctype html>
   }
   .sound-toggle:hover { filter: brightness(1.1); }
   .sound-toggle.muted { color: var(--muted-foreground); }
+  .sound-toggle.push-active { color: var(--success); border-color: color-mix(in srgb, var(--success) 50%, var(--border)); }
+  .sound-toggle.push-warn { color: var(--warning); }
   nav { padding: 10px; flex: 1; }
   .nav-label {
     font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
@@ -1459,6 +1507,7 @@ _PAGE = """<!doctype html>
     </button>
     <p class="mode-toggle-hint" id="modeToggleHint">Every reply waits here for Approve, Reject or Cancel.</p>
     <button id="soundToggle" class="sound-toggle" onclick="toggleSound()">🔔 Sound on</button>
+    <button id="pushToggle" class="sound-toggle" onclick="togglePushNotifications()">📲 Enable phone notifications</button>
     <a href="/bots" class="sound-toggle" style="margin-top:8px;text-decoration:none;">🤖 Bots (start / stop / configure)</a>
     <span class="live-badge" id="liveBadge" title="How this dashboard is getting updates"><span class="dot"></span><span id="liveBadgeLabel">Connecting…</span></span>
   </div>
@@ -1610,6 +1659,9 @@ const slug = (s) => "plat-" + (s || "unknown").toLowerCase().replace(/[^a-z0-9]+
 const editedReplies = new Map();
 let knownPlatforms = [];
 let currentMode = "manual";
+let serviceWorkerRegistration = null;
+let currentPushSubscription = null;
+let pushConfigured = false;
 
 // --- Notification sound: chimes whenever a new chat starts waiting for approval. ---
 let soundEnabled = localStorage.getItem("approvalSoundEnabled") !== "0";
@@ -1667,6 +1719,127 @@ function toggleSound() {
   unlockAudio();
   if (soundEnabled) playNotifySound();
   renderSoundToggle();
+}
+
+// ── Installable app + background Web Push notifications ────────────────
+function base64UrlToBytes(value) {
+  const padding = "=".repeat((4 - value.length % 4) % 4);
+  const raw = atob((value + padding).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from([...raw].map(char => char.charCodeAt(0)));
+}
+
+function isStandaloneApp() {
+  return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+}
+
+function isIOS() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent);
+}
+
+function renderPushToggle(state, detail) {
+  const btn = document.getElementById("pushToggle");
+  if (!btn) return;
+  btn.disabled = state === "unsupported" || state === "unconfigured";
+  btn.classList.toggle("push-active", state === "enabled");
+  btn.classList.toggle("push-warn", state === "needs-install" || state === "denied");
+  const labels = {
+    enabled: "✅ Phone notifications on",
+    disabled: "📲 Enable phone notifications",
+    "needs-install": "➕ Add app to Home Screen first",
+    denied: "🚫 Notifications blocked in Settings",
+    unconfigured: "⚠️ Push server not configured",
+    unsupported: "Notifications unavailable",
+  };
+  btn.textContent = labels[state] || "📲 Enable phone notifications";
+  btn.title = detail || "";
+}
+
+async function initPushNotifications() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+    renderPushToggle("unsupported", "This browser does not support Web Push.");
+    return;
+  }
+  if (isIOS() && !isStandaloneApp()) {
+    renderPushToggle("needs-install", "In Safari, use Share → Add to Home Screen, then open the Zenox icon.");
+    return;
+  }
+  try {
+    const configRes = await fetch("/api/push/config");
+    const config = await configRes.json();
+    pushConfigured = !!config.enabled && !!config.public_key;
+    if (!pushConfigured) {
+      renderPushToggle("unconfigured", "Restart the dashboard after installing requirements and configuring VAPID.");
+      return;
+    }
+    serviceWorkerRegistration = await navigator.serviceWorker.register("/service-worker.js", { scope: "/" });
+    serviceWorkerRegistration = await navigator.serviceWorker.ready;
+    currentPushSubscription = await serviceWorkerRegistration.pushManager.getSubscription();
+    if (Notification.permission === "denied") renderPushToggle("denied");
+    else renderPushToggle(currentPushSubscription ? "enabled" : "disabled");
+  } catch (error) {
+    renderPushToggle("unsupported", String(error));
+  }
+}
+
+async function togglePushNotifications() {
+  if (isIOS() && !isStandaloneApp()) {
+    toast("Add Zenox to your Home Screen", {
+      type: "info",
+      detail: "Open this page in Safari, tap Share, choose Add to Home Screen, then open the Zenox icon."
+    });
+    return;
+  }
+  if (!pushConfigured || !serviceWorkerRegistration) {
+    await initPushNotifications();
+    if (!pushConfigured || !serviceWorkerRegistration) return;
+  }
+
+  try {
+    currentPushSubscription = await serviceWorkerRegistration.pushManager.getSubscription();
+    if (currentPushSubscription) {
+      const endpoint = currentPushSubscription.endpoint;
+      await fetch("/api/push/subscribe", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint })
+      });
+      await currentPushSubscription.unsubscribe();
+      currentPushSubscription = null;
+      renderPushToggle("disabled");
+      toast("Phone notifications disabled", { type: "info" });
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") {
+      renderPushToggle("denied");
+      toast("Notifications were not allowed", {
+        type: "error",
+        detail: "Enable Zenox in iPhone Settings → Notifications, then try again."
+      });
+      return;
+    }
+    const config = await (await fetch("/api/push/config")).json();
+    currentPushSubscription = await serviceWorkerRegistration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: base64UrlToBytes(config.public_key)
+    });
+    const response = await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subscription: currentPushSubscription.toJSON(), send_test: true })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    renderPushToggle("enabled");
+    toast("Phone notifications enabled", {
+      type: "success",
+      detail: "A test notification is being sent now."
+    });
+  } catch (error) {
+    renderPushToggle("disabled", String(error));
+    toast("Could not enable notifications", { type: "error", detail: String(error) });
+  }
 }
 
 function renderModeToggle() {
@@ -2110,7 +2283,7 @@ function pendingCardHtml(r) {
   const lastMessage = r.last_message || r.customer_message || "";
   const lastMessageEn = r.last_message_en || r.customer_message_en || "";
   return `
-    <div class="card" data-id="${r.id}" style="--pc:${pc}">
+    <div class="card" id="approval-${r.id}" data-id="${r.id}" style="--pc:${pc}">
       <div class="card-head">
         <span class="badge">${escapeHtml(r.platform)}</span>
         ${r.reply_type ? `<span class="pill ${r.reply_type === "ASA Follow-up" ? "type-asa" : "type-dia"}">${escapeHtml(r.reply_type)}</span>` : ""}
@@ -2343,6 +2516,17 @@ function applySnapshot(data) {
   }
   knownPendingIds = currentPendingIds;
   renderSections(pendingList, autoByPlatform);
+  if (navigator.setAppBadge) {
+    if (pendingList.length) navigator.setAppBadge(pendingList.length).catch(() => {});
+    else if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
+  }
+  const requestedApproval = new URLSearchParams(location.search).get("approval");
+  if (requestedApproval) {
+    requestAnimationFrame(() => {
+      const card = document.getElementById(`approval-${requestedApproval}`);
+      if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  }
 
   renderSystemStatus();
 }
@@ -2449,6 +2633,7 @@ async function init() {
     knownPlatforms = [];
   }
   renderSoundToggle();
+  initPushNotifications();
   refresh();
   connectLive();
   // Only polls while the live socket is down — see setLiveIndicator() above.
@@ -2830,6 +3015,14 @@ loadInitial();
 @app.get("/")
 def dashboard():
     return Response(_PAGE, mimetype="text/html")
+
+
+@app.get("/service-worker.js")
+def service_worker():
+    response = app.send_static_file("service-worker.js")
+    response.headers["Service-Worker-Allowed"] = "/"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/bots")

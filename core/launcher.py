@@ -6,6 +6,10 @@ import time
 import urllib.request
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 APPROVAL_SERVER_PORT = int(os.environ.get("APPROVAL_SERVER_PORT", "8799"))
 
 # launch_all.py's in-process control API (restart/stop/fix/checkinall/... as
@@ -84,12 +88,10 @@ def is_approval_server_ready(port: int = APPROVAL_SERVER_PORT) -> bool:
 
 def start_approval_server(port: int = APPROVAL_SERVER_PORT) -> subprocess.Popen:
     base_dir = Path(__file__).resolve().parent.parent
-    # Default to listening on all interfaces (not just 127.0.0.1) so the
-    # dashboard is reachable from a phone/other device on the same network —
-    # an explicit HOST already set in the environment always wins. This is the
-    # approval dashboard only; the control API (CONTROL_SERVER_PORT) stays
-    # hardcoded to 127.0.0.1 in launch_all.py regardless.
-    env = {"HOST": "0.0.0.0", **os.environ, "APPROVAL_SERVER_PORT": str(port)}
+    # Keep the application private on this machine. Tailscale Serve terminates
+    # HTTPS and proxies the tailnet-only URL to this loopback listener.
+    # An explicit HOST from .env still wins when a different setup is needed.
+    env = {"HOST": "127.0.0.1", **os.environ, "APPROVAL_SERVER_PORT": str(port)}
     return subprocess.Popen(
         [sys.executable, "-u", str(base_dir / "approval_server.py")],
         stdout=subprocess.DEVNULL,
@@ -143,9 +145,9 @@ def ensure_approval_server(port: int = APPROVAL_SERVER_PORT):
     if wait_for_approval_server(port):
         print(f"[Launcher] Approval dashboard ready: http://127.0.0.1:{port}  "
               f"(open this in a browser — replies wait here for your Approve/Reject)")
-        lan_ip = _lan_ip()
-        if lan_ip:
-            print(f"[Launcher] Same-network devices (e.g. your phone): http://{lan_ip}:{port}")
+        tailscale_url = os.environ.get("TAILSCALE_DASHBOARD_URL", "").rstrip("/")
+        if tailscale_url:
+            print(f"[Launcher] Private phone URL (Tailscale): {tailscale_url}/")
     else:
         print("[ERROR] Approval dashboard did not come up in time. Bots will stall waiting for it.")
     return proc

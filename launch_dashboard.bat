@@ -1,9 +1,9 @@
 @echo off
 cd /d "%~dp0"
-set HOST=0.0.0.0
 echo Starting approval dashboard (no bots)...
 echo   On this PC:        http://127.0.0.1:8799/
-echo   From phone/other device on the same network:
-for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /c:"IPv4 Address"') do echo     http://%%a:8799/  (trim the leading space)
+echo   From your phone:   see TAILSCALE_DASHBOARD_URL in .env
+echo.
+echo Run setup_tailscale.bat once before using the phone URL.
 python approval_server.py
 pause

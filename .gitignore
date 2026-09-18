@@ -36,6 +36,12 @@ coverage.xml
 # Environment variables
 .env
 .env.*
+!.env.example
+
+# Local Web Push credentials and phone subscriptions
+secrets/
+.push_subscriptions.json
+.push_subscriptions.json.tmp
 
 # IDE/editor directories
 .vscode/
@@ -62,9 +68,6 @@ note_logs.log
 
 # checkinall runtime snapshot (used to compute daily earnings delta)
 .checkinall_state.json
-
-# approval_server.py's persisted custom AI instructions (operator-edited via /bots)
-custom_instructions.json
 
 # Downloaded or external projects
 playwright-report/
