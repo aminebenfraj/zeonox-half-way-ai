@@ -4,13 +4,15 @@ Client for the local approval dashboard (approval_server.py).
 
 Every bot (core/bot.py's ChatBot, XkussBot, JustloBot) calls request_approval()
 after generating a reply and BEFORE pasting/sending it. This blocks the bot's
-cycle until a human clicks Approve, Reject or Cancel on the dashboard:
+cycle until a human clicks Approve, Reject, Cancel, or Skip on the dashboard:
   - Approve -> returns the (possibly hand-edited) reply text; the bot pastes
     and sends it.
   - Reject  -> returns None; the bot clicks 'Antwort generieren' again for a
     fresh reply and submits that one for approval instead.
   - Cancel  -> raises ApprovalCancelled; the bot abandons this reply attempt
     and restarts/redetects the chat instead of retrying it.
+  - Skip    -> raises ApprovalSkipped; supported bots actively leave the current
+    conversation instead of generating or sending anything.
 
 Bots also pass a `chat_still_active` check into request_approval() so a reply
 whose chat closes out from under it (customer ended the conversation, tab
@@ -58,6 +60,19 @@ class ApprovalCancelled(Exception):
         self.request_id = request_id
 
 
+class ApprovalSkipped(Exception):
+    """Raised when the dashboard asks the bot to transfer/skip the live conversation.
+
+    The request remains ``skip_requested`` until the platform bot confirms the
+    real UI action with mark_skipped(), so dashboard history never claims the
+    conversation was skipped when the browser click actually failed.
+    """
+
+    def __init__(self, request_id: str | None = None):
+        super().__init__(f"Approval request {request_id} requested a conversation skip")
+        self.request_id = request_id
+
+
 async def request_approval(
     platform: str,
     reply: str,
@@ -83,7 +98,8 @@ async def request_approval(
     `chat_check_interval` seconds) before a decision is made. In the latter
     case the now-orphaned dashboard card is cancelled server-side too, so it
     doesn't sit in the queue forever after the conversation it belonged to has
-    disappeared.
+    disappeared. Raises ApprovalSkipped when a supported approval card's
+    "Skip conversation" action is clicked.
     """
     async with httpx.AsyncClient(timeout=timeout, auth=_AUTH) as client:
         resp = await client.post(
@@ -117,6 +133,8 @@ async def request_approval(
                 return False, None, req_id
             if status == "cancelled":
                 raise ApprovalCancelled(req_id)
+            if status == "skip_requested":
+                raise ApprovalSkipped(req_id)
             # still "pending" -> keep polling
 
             since_status_ping += POLL_INTERVAL
@@ -168,6 +186,20 @@ async def mark_failed(request_id: str | None, error: str = ""):
             )
     except Exception:
         pass
+
+
+async def mark_skipped(request_id: str | None, result: str = "skipped"):
+    """Confirm that a transfer-or-skip platform action succeeded."""
+    if not request_id:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0, auth=_AUTH) as client:
+            await client.post(
+                f"{APPROVAL_SERVER_URL}/api/requests/{request_id}/skipped",
+                json={"result": result},
+            )
+    except Exception:
+        pass  # dashboard bookkeeping only; the browser action already succeeded
 
 
 async def report_status(

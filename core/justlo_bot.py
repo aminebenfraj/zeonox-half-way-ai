@@ -62,7 +62,10 @@ from core.bot import (
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
-from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
+from core.approval import (
+    request_approval, mark_sent, mark_failed, mark_skipped, report_status,
+    ApprovalCancelled, ApprovalSkipped,
+)
 from core.chameleon_data import read_extracted_data
 from core.justlo_login import (
     login_justlo,
@@ -777,16 +780,16 @@ class JustloBot:
         await btn.click()
         await asyncio.sleep(2)
 
-    async def _handover_first_contact(self, tab1) -> bool:
+    async def _handover_first_contact(self, tab1) -> str | None:
         """Click 'Übergeben' and hand a First Contact dialog to another moderator.
 
         Opens the transfer popup, picks any name in the list EXCEPT our own
         account (self.cfg.username), and confirms with 'OK'. This keeps the
         console moving on a First Contact instead of stalling on it, so the bot
         never has to sit and wait on a dialog it isn't going to write into.
-        Returns True on a confirmed handover, False if anything went wrong
-        (popup never opened, or only our own name was in the list) — the caller
-        treats either outcome as "done with this dialog" either way.
+        Returns ``"transferred"`` after a confirmed handover, ``"skipped"``
+        when nobody else is available and Überspringen succeeds, or ``None``
+        if the platform action fails.
         """
         self.log("[FC] Clicking 'Übergeben' to hand the dialog to another moderator...")
         try:
@@ -810,7 +813,7 @@ class JustloBot:
                     await asyncio.sleep(0.5)
                 await tab1.locator(self.cfg.sel_skip_btn).click()
                 await asyncio.sleep(1.5)
-                return False
+                return "skipped"
 
             pick = random.choice(candidates)
             self.log(f"[FC] Handing dialog to '{names[pick]}' (excluding own account '{own}').")
@@ -820,12 +823,50 @@ class JustloBot:
             ok_btn = popup.locator("a[role='button']:has-text('OK')")
             await ok_btn.first.click()
             await asyncio.sleep(1.5)
-            return True
+            return "transferred"
         except PlaywrightError as e:
             if _is_fatal(e):
                 raise
             self.log(f"[WARN] Handover failed: {e}")
-            return False
+            return None
+
+    async def _run_fc_exit_workflow(self, tab1, tab2, sig) -> str:
+        """Transfer/skip the current dialog, reset Chameleon, then wait again.
+
+        This is the single exit path used both for Chameleon-detected First
+        Contacts and for the dashboard's Transfer / Skip action.
+        """
+        result = await self._handover_first_contact(tab1)
+        if result is None:
+            raise RuntimeError("Übergeben/Überspringen did not complete")
+
+        await tab2.reload()
+        await self._wait_for_page_ready(tab2, "domcontentloaded")
+        # Reload is a React SPA remount — domcontentloaded fires long before
+        # the combobox exists, so give it a moment to hydrate.
+        try:
+            await tab2.locator(_SEL_COMBOBOX).first.wait_for(
+                state="visible", timeout=15_000
+            )
+        except Exception:
+            pass
+        await self._ensure_chat_selected(tab2)
+        await self._ensure_extractor_tab_active(tab2)
+
+        # Prevent the wait loop from selecting the same conversation again.
+        self._last_sig = sig
+        await report_status(
+            self.cfg.platform,
+            "waiting",
+            "Waiting for a conversation",
+            checkpoint="waiting",
+        )
+        self.log(
+            "[WAIT] Conversation transferred — waiting for another conversation."
+            if result == "transferred"
+            else "[WAIT] Conversation skipped — waiting for another conversation."
+        )
+        return result
 
     async def _send_reply(self, tab1, reply: str, approval_id: str | None = None):
         await tab1.bring_to_front()
@@ -1022,21 +1063,7 @@ class JustloBot:
                         # only when it says so, never based on the local DOM grid.
                         self.log("[FC] Chameleon flagged First Contact — "
                                  "handing over via 'Übergeben'.")
-                        await self._handover_first_contact(tab1)
-                        await tab2.reload()
-                        await self._wait_for_page_ready(tab2, "domcontentloaded")
-                        # Reload is a React SPA remount — domcontentloaded fires long
-                        # before the combobox exists, so give it a moment to hydrate.
-                        try:
-                            await tab2.locator(_SEL_COMBOBOX).first.wait_for(
-                                state="visible", timeout=15_000
-                            )
-                        except Exception:
-                            pass
-                        await self._ensure_chat_selected(tab2)
-                        await self._ensure_extractor_tab_active(tab2)
-                        # Mark this one handled so the wait loop holds for a new one.
-                        self._last_sig = sig
+                        await self._run_fc_exit_workflow(tab1, tab2, sig)
                         cycle -= 1
                         continue
 
@@ -1055,6 +1082,16 @@ class JustloBot:
                             tab1, tab2,
                             "Chameleon did not produce a usable reply after its guarded retries",
                         )
+                        cycle -= 1
+                        continue
+                    except ApprovalSkipped as skipped:
+                        self.log("[APPROVAL] Transfer/skip requested — trying 'Übergeben' first.")
+                        try:
+                            result = await self._run_fc_exit_workflow(tab1, tab2, sig)
+                        except Exception as e:
+                            await mark_failed(skipped.request_id, f"Transfer/skip failed: {e}")
+                            raise
+                        await mark_skipped(skipped.request_id, result=result)
                         cycle -= 1
                         continue
                     except ApprovalCancelled:

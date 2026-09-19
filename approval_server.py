@@ -17,6 +17,8 @@ Endpoints:
   POST /api/requests/<id>/approve -> body {edited_reply?}
   POST /api/requests/<id>/reject
   POST /api/requests/<id>/cancel  -> abandon it; bot restarts/redetects instead of regenerating
+  POST /api/requests/<id>/skip    -> request transfer, falling back to skip when unavailable
+  POST /api/requests/<id>/skipped -> bot confirms the platform UI action succeeded
   POST /api/requests/<id>/sent    -> bot confirms the approved reply went out
   POST /api/requests/<id>/failed  -> body {error?}
   GET  /api/mode                  -> {mode: "manual"|"auto"} — the dashboard's review mode
@@ -193,6 +195,7 @@ _mode = "manual"
 _mode_overrides: dict[str, str] = {}
 
 SELF_MANAGED_PLATFORMS = ("xkuss", "justlo", "linduu", "gnoxx")
+SKIPPABLE_APPROVAL_PLATFORMS = frozenset(SELF_MANAGED_PLATFORMS)
 
 # ── Bot process management (see /bots) ──────────────────────────────────────
 # Only the self-managed platforms: each does its own Chrome launch +
@@ -459,11 +462,12 @@ def test_groq():
 
 def _prune_history_locked():
     """Cap total stored requests so a long-running dashboard doesn't leak memory.
-    Only ever drops decided (non-pending) requests, oldest first."""
+    Only ever drops fully decided requests, oldest first. A skip request stays
+    protected until its bot acknowledges the browser action."""
     if len(_requests) <= MAX_HISTORY:
         return
     decided = sorted(
-        (r for r in _requests.values() if r["status"] != "pending"),
+        (r for r in _requests.values() if r["status"] not in ("pending", "skip_requested")),
         key=lambda r: r["_seq"],
     )
     overflow = len(_requests) - MAX_HISTORY
@@ -726,6 +730,51 @@ def cancel_request(req_id):
             return jsonify({"error": f"already {r['status']}"}), 409
         r["status"] = "cancelled"
         r["decided_at"] = _now()
+    _bump_state()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/requests/<req_id>/skip")
+def skip_request(req_id):
+    """Ask a supported bot to transfer or leave its loaded conversation.
+
+    The request stays ``skip_requested`` until the bot acknowledges that the
+    real platform UI action succeeded. Xkuss leaves via Home. The shared
+    Justlo/Linduu/Gnoxx engine tries ``Übergeben`` first and presses
+    ``Überspringen`` only when no other moderator is available.
+    """
+    with _lock:
+        r = _requests.get(req_id)
+        if not r:
+            return jsonify({"error": "not found"}), 404
+        if r["status"] != "pending":
+            return jsonify({"error": f"already {r['status']}"}), 409
+        platform = (r.get("platform") or "").strip().lower()
+        if platform not in SKIPPABLE_APPROVAL_PLATFORMS:
+            return jsonify({
+                "error": "Skip conversation is only available for Xkuss, Justlo, Linduu, and Gnoxx"
+            }), 400
+        r["status"] = "skip_requested"
+        r["decided_at"] = _now()
+    _bump_state()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/requests/<req_id>/skipped")
+def mark_request_skipped(req_id):
+    """Bot acknowledgement that the transfer-or-skip action succeeded."""
+    body = request.get_json(force=True, silent=True) or {}
+    result = (body.get("result") or "skipped").strip().lower()
+    if result not in ("skipped", "transferred"):
+        return jsonify({"error": "result must be 'skipped' or 'transferred'"}), 400
+    with _lock:
+        r = _requests.get(req_id)
+        if not r:
+            return jsonify({"error": "not found"}), 404
+        if r["status"] != "skip_requested":
+            return jsonify({"error": f"cannot mark skipped from {r['status']}"}), 409
+        r["status"] = result
+        r["sent_at"] = _now()
     _bump_state()
     return jsonify({"ok": True})
 
@@ -1191,6 +1240,7 @@ _PAGE = """<!doctype html>
   .status-badge.approved, .status-badge.sent { background: rgba(34,197,94,.15); color: var(--success); }
   .status-badge.rejected, .status-badge.failed { background: rgba(239,68,68,.15); color: var(--destructive); }
   .status-badge.cancelled { background: rgba(161,161,170,.18); color: var(--muted-foreground); }
+  .status-badge.skip_requested, .status-badge.skipped, .status-badge.transferred { background: rgba(249,115,22,.16); color: #fb923c; }
   .status-badge.pending { background: rgba(234,179,8,.15); color: var(--warning); }
 
   .card-divider { height: 1px; background: var(--border); margin: 14px 0; }
@@ -1271,6 +1321,8 @@ _PAGE = """<!doctype html>
   .btn-reject:hover { background: rgba(239,68,68,.1); }
   .btn-cancel { background: transparent; color: var(--muted-foreground); border-color: var(--border); }
   .btn-cancel:hover { background: var(--accent); color: var(--foreground); }
+  .btn-skip { background: transparent; color: #fb923c; border-color: rgba(249,115,22,.45); }
+  .btn-skip:hover { background: rgba(249,115,22,.12); }
   .hint { color: var(--muted-foreground); font-size: 11.5px; }
 
   .history-list { display: flex; flex-direction: column; gap: 8px; }
@@ -1957,7 +2009,10 @@ const ACTION_MESSAGES = {
   approve: { verb: "Approving", done: "Approved — queued for pasting & sending", type: "success" },
   reject:  { verb: "Regenerating", done: "Rejected — generating a new reply now", type: "info" },
   cancel:  { verb: "Cancelling", done: "Cancelled — the bot will restart this chat", type: "warning" },
+  skip:    { verb: "Transferring", done: "Transfer requested — the bot will skip only if nobody is online", type: "warning" },
 };
+
+const SKIPPABLE_CARD_PLATFORMS = new Set(["xkuss", "justlo", "linduu", "gnoxx"]);
 
 async function act(id, action, body, btn) {
   // Disable the whole card's action row (not just the clicked button) so a
@@ -2005,6 +2060,18 @@ async function cancelCard(id, btn) {
   );
   if (!ok) return;
   act(id, "cancel", null, btn);
+}
+
+async function skipConversationCard(id, platform, btn) {
+  const ok = await showConfirm(
+    platform.toLowerCase() === "xkuss" ? "Skip this conversation?" : "Transfer this conversation?",
+    platform.toLowerCase() === "xkuss"
+      ? "The bot will leave this Xkuss dialog via Home. No reply will be sent."
+      : `The bot will press “Übergeben” in ${platform} and send the conversation to another online moderator. If nobody is online, it will press “Überspringen” instead.`,
+    { confirmLabel: platform.toLowerCase() === "xkuss" ? "Skip conversation" : "Transfer / skip", danger: true },
+  );
+  if (!ok) return;
+  act(id, "skip", null, btn);
 }
 
 // Human labels + accent per bot state, reported via POST /api/status
@@ -2282,6 +2349,7 @@ function pendingCardHtml(r) {
   const pc = colorFor(r.platform);
   const lastMessage = r.last_message || r.customer_message || "";
   const lastMessageEn = r.last_message_en || r.customer_message_en || "";
+  const canSkipConversation = SKIPPABLE_CARD_PLATFORMS.has(String(r.platform || "").toLowerCase());
   return `
     <div class="card" id="approval-${r.id}" data-id="${r.id}" style="--pc:${pc}">
       <div class="card-head">
@@ -2310,8 +2378,9 @@ function pendingCardHtml(r) {
       <div class="actions">
         <button class="btn-approve" onclick="approveCard('${r.id}', this)">Approve &amp; Send</button>
         <button class="btn-reject" onclick="act('${r.id}', 'reject', null, this)">Reject &amp; Regenerate</button>
+        ${canSkipConversation ? `<button class="btn-skip" onclick="skipConversationCard('${r.id}', '${escapeHtml(r.platform)}', this)">${String(r.platform).toLowerCase() === "xkuss" ? "Skip conversation" : "Transfer / Skip"}</button>` : ""}
         <button class="btn-cancel" onclick="cancelCard('${r.id}', this)">Cancel</button>
-        <span class="hint">Edit the German text above before approving to send your own wording. Cancel abandons this reply and restarts the chat.</span>
+        <span class="hint">Edit the German text above before approving. Transfer / Skip hands the conversation to another online moderator, or skips it when none are available. Cancel abandons this reply and restarts the same chat.</span>
       </div>
     </div>
   `;
@@ -2452,6 +2521,7 @@ function renderSections(pending, autoByPlatform) {
 }
 
 function historyCardHtml(r) {
+  const skipState = r.status === "skip_requested" || r.status === "skipped" || r.status === "transferred";
   return `
     <div class="history-card" style="--pc:${colorFor(r.platform)}">
       <div class="card-head">
@@ -2461,8 +2531,14 @@ function historyCardHtml(r) {
         ${r.meeting_guard ? `<span class="status-badge" style="background:rgba(234,179,8,.15);color:var(--warning)" title="Meeting detected — reply rewritten in German">guard: ${escapeHtml(r.meeting_guard)}</span>` : ""}
         <span class="time">${timeAgo(r.decided_at || r.sent_at || r.created_at)}</span>
       </div>
-      <div class="history-reply">${escapeHtml(r.final_reply || r.reply)}</div>
-      ${r.reply_en ? `<div class="history-en">${escapeHtml(r.reply_en)}</div>` : ""}
+      <div class="history-reply">${skipState
+        ? escapeHtml(
+            r.status === "transferred" ? "Conversation transferred to another moderator — no reply sent."
+            : r.status === "skipped" ? "Nobody else was online; conversation skipped — no reply sent."
+            : "Transfer requested — waiting for the bot to transfer or skip the conversation."
+          )
+        : escapeHtml(r.final_reply || r.reply)}</div>
+      ${!skipState && r.reply_en ? `<div class="history-en">${escapeHtml(r.reply_en)}</div>` : ""}
       ${r.error ? `<div class="history-error">Error: ${escapeHtml(r.error)}</div>` : ""}
     </div>
   `;
@@ -2537,7 +2613,7 @@ async function refresh() {
   try {
     const [pendingRes, historyRes, statusRes, modeRes, botsRes] = await Promise.all([
       fetch("/api/requests?status=pending"),
-      fetch("/api/requests?status=approved,rejected,cancelled,sent,failed&limit=300"),
+      fetch("/api/requests?status=approved,rejected,cancelled,skip_requested,skipped,transferred,sent,failed&limit=300"),
       fetch("/api/status"),
       fetch("/api/mode"),
       fetch("/api/bots/status"),

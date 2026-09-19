@@ -50,7 +50,10 @@ from core.bot import (
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
-from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
+from core.approval import (
+    request_approval, mark_sent, mark_failed, mark_skipped, report_status,
+    ApprovalCancelled, ApprovalSkipped,
+)
 from core.chameleon_data import read_extracted_data
 from core.xkuss_login import (
     login_xkuss,
@@ -856,6 +859,26 @@ class XkussBot:
                             tab1, tab2,
                             "Chameleon did not produce a usable reply after its guarded retries",
                         )
+                        cycle -= 1
+                        continue
+                    except ApprovalSkipped as skipped:
+                        self.log("[APPROVAL] Skip requested — leaving this dialog via Home.")
+                        try:
+                            await click_home(tab1, self.cfg, self.cfg.platform)
+                        except Exception as e:
+                            await mark_failed(skipped.request_id, f"Skip failed: {e}")
+                            raise
+                        await mark_skipped(skipped.request_id)
+                        await report_status(
+                            self.cfg.platform, "waiting", "Conversation skipped",
+                            checkpoint="waiting",
+                        )
+                        try:
+                            await tab2.reload()
+                            await self._wait_for_page_ready(tab2, "domcontentloaded")
+                            await self._ensure_chat_selected(tab2)
+                        except Exception as e:
+                            self.log(f"[WARN] Conversation was skipped, but Chameleon reset failed: {e}")
                         cycle -= 1
                         continue
                     except ApprovalCancelled:
