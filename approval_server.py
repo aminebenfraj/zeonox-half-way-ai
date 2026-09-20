@@ -1581,7 +1581,7 @@ _PAGE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#09090b" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -1619,7 +1619,7 @@ _PAGE = """<!doctype html>
 
   /* ── Sidebar ─────────────────────────────────────────────────────── */
   #sidebar {
-    width: var(--sidebar-w); flex: none; height: 100vh; position: sticky; top: 0;
+    width: var(--sidebar-w); flex: none; height: 100vh; height: 100dvh; position: sticky; top: 0;
     background: var(--card); border-right: 1px solid var(--border);
     display: flex; flex-direction: column; overflow-y: auto;
   }
@@ -2059,30 +2059,36 @@ _PAGE = """<!doctype html>
      hamburger in the mobile top bar) instead of a permanent column, and
      layouts that assumed side-by-side space collapse to a single column. */
   @media (max-width: 860px) {
-    body { display: block; }
+    body { display: block; min-height: 100vh; min-height: 100dvh; }
 
     #mobileBar {
       display: flex; align-items: center; gap: 12px;
       position: sticky; top: 0; z-index: 30;
-      padding: 12px 14px; background: var(--card); border-bottom: 1px solid var(--border);
+      min-height: 60px;
+      padding: max(8px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left));
+      background: rgba(9,11,18,.94); border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(18px) saturate(125%);
     }
     #hamburger {
       display: flex; flex-direction: column; justify-content: center; gap: 4px;
-      width: 38px; height: 38px; padding: 0; border-radius: 8px;
+      flex: none; width: 44px; height: 44px; padding: 0; border-radius: 10px;
       background: var(--accent); border: 1px solid var(--border); cursor: pointer;
     }
     #hamburger span { display: block; width: 16px; height: 2px; background: var(--foreground); margin: 0 auto; border-radius: 2px; }
     #mobileBar .brand-text { font-weight: 600; font-size: 14.5px; }
     #mobileBar .brand-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--success); box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
     #mobileBar .mobile-pending {
-      margin-left: auto; font-size: 12px; font-weight: 700; color: var(--warning);
+      margin-left: auto; min-width: 0; max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: 12px; font-weight: 700; color: var(--warning);
       background: rgba(234,179,8,.15); border-radius: 999px; padding: 3px 10px;
     }
 
     #sidebar {
-      position: fixed; top: 0; left: 0; z-index: 50; width: min(84vw, 300px);
+      position: fixed; top: 0; bottom: 0; left: 0; z-index: 50; width: min(84vw, 300px);
+      height: 100vh; height: 100dvh; padding-bottom: env(safe-area-inset-bottom);
       transform: translateX(-100%); transition: transform .22s ease;
       box-shadow: 8px 0 24px rgba(0,0,0,.4);
+      overscroll-behavior: contain;
     }
     #sidebar.open { transform: translateX(0); }
     #backdrop.open {
@@ -2090,7 +2096,10 @@ _PAGE = """<!doctype html>
       background: rgba(0,0,0,.55); backdrop-filter: blur(1px);
     }
 
-    #main { padding: 16px 14px 48px; }
+    #main {
+      width: 100%;
+      padding: 16px max(14px, env(safe-area-inset-right)) calc(48px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+    }
     .page-head h1 { font-size: 18px; }
     .page-head p { font-size: 13px; }
 
@@ -2100,8 +2109,15 @@ _PAGE = """<!doctype html>
 
     .cards-grid { grid-template-columns: 1fr; }
     .card { padding: 14px; }
+    .card:hover { transform: none; }
 
     .platform-head h2 { font-size: 14.5px; }
+
+    .api-health-head { align-items: stretch; }
+    .api-health-head > div { min-width: 0; }
+    .btn-api-check, .btn-money { min-height: 44px; }
+    .system-ctrl-actions { align-items: stretch; flex-direction: column; }
+    .system-ctrl-status { overflow-wrap: anywhere; }
 
     /* Full-width, stacked action buttons are far easier to hit accurately
        with a thumb than two small side-by-side buttons. */
@@ -2114,7 +2130,25 @@ _PAGE = """<!doctype html>
        trigger an unwanted zoom-in. */
     textarea.reply-input { font-size: 16px; min-height: 100px; }
 
+    .nav-item, .sound-toggle, .mode-toggle { min-height: 44px; }
     .nav-item { padding: 10px 12px; font-size: 14px; }
+
+    .profile-cols { display: block; }
+    .profile-col { min-width: 0; width: 100%; }
+    .profile-col + .profile-col { margin-top: 14px; }
+    .profile-row { display: grid; grid-template-columns: minmax(78px, 36%) minmax(0, 1fr); }
+    .profile-row .k { min-width: 0; }
+    .profile-row > span:last-child, .last-message, .proposed, .en-box, .history-reply, .history-en {
+      min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+    }
+    .extracted-data summary { min-height: 44px; flex-wrap: wrap; }
+  }
+
+  @media (max-width: 420px) {
+    .modal-actions { flex-direction: column-reverse; }
+    .modal-actions button { width: 100%; min-height: 44px; }
+    #modalRoot { padding: 14px; padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+    #toastRoot { right: 10px; bottom: max(10px, env(safe-area-inset-bottom)); width: calc(100vw - 20px); }
   }
 
   /* ── Toasts ──────────────────────────────────────────────────────────── */
@@ -2223,7 +2257,12 @@ _PAGE = """<!doctype html>
     background-size: 42px 42px;
     mask-image: linear-gradient(to bottom, #000, transparent 72%);
   }
-  #sidebar, #main, #mobileBar { position: relative; z-index: 1; }
+  #main { position: relative; z-index: 1; }
+  #sidebar, #mobileBar { z-index: 1; }
+  @media (max-width: 860px) {
+    #mobileBar { z-index: 30; }
+    #sidebar { z-index: 50; }
+  }
   #sidebar {
     background: rgba(9,11,18,.88); backdrop-filter: blur(18px) saturate(125%);
     box-shadow: 18px 0 50px rgba(0,0,0,.18);
@@ -2275,12 +2314,12 @@ _PAGE = """<!doctype html>
 <div id="toastRoot" aria-live="polite"></div>
 <div id="modalRoot"></div>
 <header id="mobileBar">
-  <button id="hamburger" onclick="toggleDrawer()" aria-label="Toggle platform menu"><span></span><span></span><span></span></button>
+  <button id="hamburger" onclick="toggleDrawer()" aria-label="Toggle platform menu" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
   <span class="brand-dot"></span>
   <span class="brand-text">Chat Approval</span>
   <span class="mobile-pending" id="mobilePendingBadge">0 pending</span>
 </header>
-<div id="backdrop" onclick="closeDrawer()"></div>
+<div id="backdrop" onclick="closeDrawer()" aria-hidden="true"></div>
 
 <aside id="sidebar">
   <div class="brand">
@@ -2424,17 +2463,20 @@ function showConfirm(title, body, opts) {
 function openDrawer() {
   document.getElementById("sidebar").classList.add("open");
   document.getElementById("backdrop").classList.add("open");
+  document.getElementById("hamburger").setAttribute("aria-expanded", "true");
   document.body.classList.add("drawer-open");
 }
 function closeDrawer() {
   document.getElementById("sidebar").classList.remove("open");
   document.getElementById("backdrop").classList.remove("open");
+  document.getElementById("hamburger").setAttribute("aria-expanded", "false");
   document.body.classList.remove("drawer-open");
 }
 function toggleDrawer() {
   document.getElementById("sidebar").classList.contains("open") ? closeDrawer() : openDrawer();
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
+window.addEventListener("resize", () => { if (window.innerWidth > 860) closeDrawer(); });
 
 function goToSection(name) {
   document.getElementById(slug(name)).scrollIntoView({ behavior: "smooth", block: "start" });
@@ -3565,7 +3607,7 @@ _BOTS_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Bots — Launcher</title>
 <style>
   :root {
@@ -3579,7 +3621,7 @@ _BOTS_PAGE = r"""<!doctype html>
     --warning: #eab308; --info: #38bdf8; --violet: #a78bfa;
     --ring: #6366f1; --radius: 10px;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body {
     margin: 0; background: var(--background); color: var(--foreground);
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Arial, sans-serif;
@@ -3745,8 +3787,32 @@ _BOTS_PAGE = r"""<!doctype html>
   summary:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--info); outline-offset: 3px; }
   @keyframes disclosure-in { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
   @media (max-width: 760px) {
-    body { padding: 16px 14px 42px; }
+    body {
+      min-height: 100vh; min-height: 100dvh;
+      padding: max(16px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) calc(42px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+    }
     .bots-grid { grid-template-columns: 1fr; }
+    .bot-card { min-width: 0; padding: 15px 14px; }
+    .topbar { align-items: flex-start; margin-bottom: 18px; }
+    .topbar > div { min-width: 0; flex: 1 1 210px; }
+    .back-link { min-height: 44px; display: inline-flex; align-items: center; }
+    .start-stop-row { gap: 10px; }
+    .start-stop-row button { flex: 1; min-width: 0; min-height: 46px; }
+    .toggle-row { align-items: flex-start; flex-wrap: wrap; }
+    .toggle-name { padding-top: 11px; }
+    .toggle-switch-btn { min-height: 44px; max-width: 100%; }
+    .toggle-switch-label { overflow-wrap: anywhere; }
+    details.steps-block summary { min-height: 44px; display: flex; align-items: center; }
+    ol.steps-list { padding-left: 22px; overflow-wrap: anywhere; }
+    .bot-card-head { align-items: flex-start; }
+    .status-pill { flex: none; max-width: 50%; text-align: center; overflow-wrap: anywhere; }
+    .toast { overflow-wrap: anywhere; }
+  }
+  @media (max-width: 420px) {
+    .modal-actions { flex-direction: column-reverse; }
+    .modal-actions button { width: 100%; min-height: 44px; }
+    #modalRoot { padding: 14px; padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+    #toastRoot { right: 10px; bottom: max(10px, env(safe-area-inset-bottom)); width: calc(100vw - 20px); }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
