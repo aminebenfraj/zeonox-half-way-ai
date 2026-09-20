@@ -18,7 +18,7 @@ Judge against ALL of these:
 - The reply does not break character, mention being an AI, or mention this system.
 
 Respond ONLY with valid JSON, no markdown fences, in this exact shape:
-{"score": 0 to 10 (integer), "verdict": "a few words summarizing the verdict", "reasoning": "one or two sentences explaining the score, in English"}"""
+{"score": 0 to 10 (integer), "verdict": "a few words summarizing the verdict", "reasoning": "one concise sentence explaining the main reason for the score, in English", "analysis": "a clear two-to-four sentence analysis covering German language quality, relevance to the last message, profile/persona consistency, and meeting or safety risk"}"""
 
 
 MEETING_ALERT_SYSTEM_PROMPT = """# Chat Safety Analyzer — External Contact / Meeting Request Detection + Conversation Analysis

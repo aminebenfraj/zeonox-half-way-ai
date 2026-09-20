@@ -910,7 +910,8 @@ JUDGE_MODEL = os.environ.get("OPENROUTER_MODEL", "cognitivecomputations/dolphin-
 def _judge_reply(platform: str, last_message: str, customer_message: str,
                   client_profile: dict, fake_profile: dict, reply: str) -> dict:
     """Runs the judge prompt on a reply. Returns
-    {"ok": True, "score", "verdict", "reasoning"} or {"ok": False, "error"}."""
+    {"ok": True, "score", "verdict", "reasoning", "analysis"} or
+    {"ok": False, "error"}."""
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         return {"ok": False, "error": "OPENROUTER_API_KEY is not set"}
@@ -950,7 +951,9 @@ def _judge_reply(platform: str, last_message: str, customer_message: str,
         response.raise_for_status()
         raw = response.json()["choices"][0]["message"]["content"] or "{}"
     except Exception as e:
+        _record_api_failure("openrouter", e)
         return {"ok": False, "error": str(e)}
+    _record_api_success("openrouter", "Judge request succeeded")
 
     raw = raw.strip()
     if raw.startswith("```"):
@@ -972,6 +975,7 @@ def _judge_reply(platform: str, last_message: str, customer_message: str,
         "score": score,
         "verdict": str(data.get("verdict") or "").strip(),
         "reasoning": str(data.get("reasoning") or "").strip(),
+        "analysis": str(data.get("analysis") or data.get("reasoning") or "").strip(),
     }
 
 
@@ -1072,7 +1076,9 @@ def create_request():
     )
     judge_score = judge_result.get("score") if judge_result["ok"] else None
     judge_verdict = judge_result.get("verdict") if judge_result["ok"] else None
-    judge_reasoning = judge_result.get("reasoning") if judge_result["ok"] else judge_result.get("error")
+    judge_reasoning = judge_result.get("reasoning") if judge_result["ok"] else None
+    judge_analysis = judge_result.get("analysis") if judge_result["ok"] else None
+    judge_error = None if judge_result["ok"] else judge_result.get("error")
     if auto and judge_score != 10:
         if judge_result["ok"]:
             print(f"[Judge] {platform} reply scored {judge_score}/10 — holding for manual review")
@@ -1108,6 +1114,8 @@ def create_request():
             "judge_score": judge_score,
             "judge_verdict": judge_verdict,
             "judge_reasoning": judge_reasoning,
+            "judge_analysis": judge_analysis,
+            "judge_error": judge_error,
             "meeting_alert_requested": meeting_alert_requested,
             "meeting_alert_reason": meeting_alert_reason,
             "conversation_tone": conversation_tone,
@@ -1826,7 +1834,7 @@ _PAGE = """<!doctype html>
     border: 1px dashed var(--border); border-radius: var(--radius); font-size: 13px;
   }
 
-  .cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+  .cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 14px; }
 
   .card {
     background: var(--card); border: 1px solid var(--border);
@@ -1862,7 +1870,56 @@ _PAGE = """<!doctype html>
   .guard-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 2px; flex-wrap: wrap; }
   .guard-row .test-label { color: var(--muted-foreground); font-size: 12px; }
   .pill.unchecked { background: var(--accent); color: var(--muted-foreground); }
-  .judge-reasoning { font-size: 12px; color: var(--muted-foreground); margin: 0 0 10px; }
+  .message-judge-grid {
+    display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(220px, .65fr);
+    align-items: stretch; gap: 12px; margin: 0 0 14px;
+  }
+  .message-pane { min-width: 0; }
+  .judge-panel {
+    --judge-color: var(--muted-foreground); position: relative; overflow: hidden;
+    border: 1px solid color-mix(in srgb, var(--judge-color) 38%, var(--border));
+    border-radius: 12px; padding: 12px; background:
+      linear-gradient(145deg, color-mix(in srgb, var(--judge-color) 9%, var(--card)), rgba(10,12,18,.72));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.035);
+  }
+  .judge-panel.excellent { --judge-color: var(--success); }
+  .judge-panel.review { --judge-color: var(--warning); }
+  .judge-panel.risk, .judge-panel.error { --judge-color: var(--destructive); }
+  .judge-panel::before {
+    content: ""; position: absolute; inset: 0 0 auto; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--judge-color), transparent);
+  }
+  .judge-head { display: flex; align-items: center; gap: 10px; }
+  .judge-score {
+    display: grid; place-items: center; width: 54px; height: 54px; flex: none;
+    border-radius: 50%; border: 2px solid var(--judge-color); color: var(--judge-color);
+    background: color-mix(in srgb, var(--judge-color) 9%, transparent);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--judge-color) 18%, transparent);
+    font-size: 18px; line-height: 1; font-weight: 800;
+  }
+  .judge-score small { display: block; font-size: 8px; margin-top: -8px; opacity: .72; }
+  .judge-eyebrow { color: var(--muted-foreground); font-size: 9px; font-weight: 750; text-transform: uppercase; letter-spacing: .09em; }
+  .judge-verdict { margin-top: 2px; color: var(--foreground); font-size: 13px; line-height: 1.25; font-weight: 750; }
+  .judge-reason { margin: 10px 0 0; color: var(--muted-foreground); font-size: 11.5px; line-height: 1.5; }
+  .judge-reason strong { color: var(--foreground); }
+  .judge-analysis { margin-top: 10px; border-top: 1px solid var(--border); }
+  .judge-analysis summary {
+    cursor: pointer; list-style: none; user-select: none; padding: 9px 0 0;
+    color: var(--judge-color); font-size: 11px; font-weight: 700;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  .judge-analysis summary::-webkit-details-marker { display: none; }
+  .judge-analysis summary::after { content: "+"; font-size: 15px; transition: transform .18s ease; }
+  .judge-analysis[open] summary::after { content: "−"; transform: rotate(180deg); }
+  .judge-analysis-body {
+    padding: 9px 0 1px; color: var(--muted-foreground); font-size: 11.5px;
+    line-height: 1.55; border-top: 1px solid color-mix(in srgb, var(--judge-color) 18%, transparent);
+    margin-top: 8px;
+  }
+  @media (max-width: 760px) {
+    .cards-grid { grid-template-columns: 1fr; }
+    .message-judge-grid { grid-template-columns: 1fr; }
+  }
   .meeting-alert-banner { display: flex; align-items: flex-start; gap: 10px; border: 2px solid var(--destructive); background: rgba(239,68,68,.12); border-radius: 12px; padding: 10px 14px; margin: 0 0 12px; }
   .meeting-alert-banner .title { font-size: 11px; font-weight: 700; color: var(--destructive); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 2px; }
   .meeting-alert-banner .reason { font-size: 12px; color: var(--destructive); }
@@ -3040,16 +3097,32 @@ function extractedDataHtml(r) {
   `;
 }
 
-// Judge AI score pill + reasoning, shared by pending and auto-pilot cards.
-function judgeRowHtml(r) {
-  if (r.judge_score === null || r.judge_score === undefined) return "";
-  const cls = r.judge_score === 10 ? "yes" : (r.judge_score >= 7 ? "action-procrastinate" : "action-decline");
+// Judge side panel, shared by pending and auto-pilot cards. It is deliberately
+// always rendered: unavailable/failed judging must be visible, never silently
+// confused with a missing UI feature.
+function judgePanelHtml(r) {
+  const hasScore = r.judge_score !== null && r.judge_score !== undefined && Number.isFinite(Number(r.judge_score));
+  const score = hasScore ? Number(r.judge_score) : null;
+  const state = hasScore ? (score === 10 ? "excellent" : (score >= 7 ? "review" : "risk")) : (r.judge_error ? "error" : "unchecked");
+  const verdict = hasScore ? (r.judge_verdict || (score === 10 ? "Ready to send" : "Human review advised")) : (r.judge_error ? "Judge unavailable" : "Not evaluated");
+  const reason = r.judge_reasoning || r.judge_error || "No Judge result is attached to this request. New cards receive a live score after the updated server starts.";
+  const analysis = r.judge_analysis || r.judge_reasoning || r.judge_error || "There is no analysis for this request.";
+  const disclosureKey = `judge:${r.id}`;
   return `
-    <div class="guard-row">
-      <span class="test-label">Judge score</span>
-      <span class="pill ${cls}">${r.judge_score}/10${r.judge_verdict ? " · " + escapeHtml(r.judge_verdict) : ""}</span>
-    </div>
-    ${r.judge_reasoning ? `<div class="judge-reasoning">${escapeHtml(r.judge_reasoning)}</div>` : ""}
+    <aside class="judge-panel ${state}" aria-label="AI Judge result">
+      <div class="judge-head">
+        <div class="judge-score">${hasScore ? score : "—"}${hasScore ? "<small>/10</small>" : ""}</div>
+        <div>
+          <div class="judge-eyebrow">AI Judge</div>
+          <div class="judge-verdict">${escapeHtml(verdict)}</div>
+        </div>
+      </div>
+      <p class="judge-reason"><strong>Why:</strong> ${escapeHtml(reason)}</p>
+      <details class="judge-analysis" data-ui-key="${disclosureKey}" ${openDisclosurePanels.has(disclosureKey) ? "open" : ""}>
+        <summary>View full analysis</summary>
+        <div class="judge-analysis-body">${escapeHtml(analysis)}</div>
+      </details>
+    </aside>
   `;
 }
 
@@ -3099,16 +3172,21 @@ function pendingCardHtml(r) {
       </div>
       ${meetingAlertBannerHtml(r)}
       ${conversationAnalysisHtml(r)}
-      ${lastMessage ? `
-        <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
-        <div class="de-box">${escapeHtml(lastMessage)}</div>
-        ${lastMessageEn ? `
-          <div class="translation-row">
-            <span class="lang-tag tag-en">EN</span>
-            <span class="en-box">${escapeHtml(lastMessageEn)}</span>
-          </div>` : ""}
-        <div class="card-divider"></div>
-      ` : ""}
+      <div class="message-judge-grid">
+        <div class="message-pane">
+          ${lastMessage ? `
+            <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
+            <div class="de-box">${escapeHtml(lastMessage)}</div>
+            ${lastMessageEn ? `
+              <div class="translation-row">
+                <span class="lang-tag tag-en">EN</span>
+                <span class="en-box">${escapeHtml(lastMessageEn)}</span>
+              </div>` : ""}
+          ` : '<div class="empty-state">No message context supplied.</div>'}
+        </div>
+        ${judgePanelHtml(r)}
+      </div>
+      <div class="card-divider"></div>
       <div class="field-label reply-label">Proposed reply <span class="lang-tag tag-de">DE · editable</span></div>
       <textarea class="reply-input" id="ta-${r.id}"
         oninput="editedReplies.set('${r.id}', this.value)">${escapeHtml(val)}</textarea>
@@ -3116,7 +3194,6 @@ function pendingCardHtml(r) {
         <span class="lang-tag tag-en">EN</span>
         <span class="en-box">${r.reply_en ? escapeHtml(r.reply_en) : "(translation unavailable)"}</span>
       </div>
-      ${judgeRowHtml(r)}
       ${extractedDataHtml(r)}
       <div class="actions">
         <button class="btn-approve" onclick="approveCard('${r.id}', this)">Approve &amp; Send</button>
@@ -3173,7 +3250,7 @@ function autoCardHtml(r) {
           : `<span class="pill ${detected}">${detected === "yes" ? "Yes" : "No"}</span>`}
         ${r.meeting_guard ? `<span class="pill action-${escapeHtml(r.meeting_guard)}">${escapeHtml(actionLabel)}</span>` : ""}
       </div>
-      ${judgeRowHtml(r)}
+      ${judgePanelHtml(r)}
       ${changed ? `
         <div class="card-divider"></div>
         <div class="field-label changed-label">Guard changed it to <span class="lang-tag tag-de">DE · sent</span></div>
