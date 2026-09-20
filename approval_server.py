@@ -33,6 +33,7 @@ any live status, and resets the review mode back to "manual"; the affected
 bot's next generate/status ping simply creates a fresh one.
 """
 
+import asyncio
 import concurrent.futures
 import hmac
 import itertools
@@ -70,7 +71,7 @@ except ImportError:
 
 try:
     from groq import Groq
-except ImportError:  # the "Test AI Key" panel is a nice-to-have — dashboard still works without it
+except ImportError:  # Groq-backed translation/meeting checks remain optional
     Groq = None
 
 # $PORT is what most cloud hosts (Render, Railway, etc.) inject; fall back to
@@ -480,6 +481,108 @@ _TRANSLATION_SYSTEM_PROMPT = (
     "English translation, with no notes, labels, or quotation marks."
 )
 
+# Provider health is updated by real translation/meeting-guard calls and by the
+# dashboard's explicit "Check now" action. It intentionally stores only a
+# masked key suffix, never the credential itself.
+_api_health_lock = threading.Lock()
+_api_health: dict[str, dict] = {
+    "groq": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
+    "openrouter": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
+}
+
+
+def _masked_api_key(env_name: str) -> str:
+    value = (os.environ.get(env_name) or "").strip()
+    if not value:
+        return ""
+    return f"••••{value[-4:]}" if len(value) > 4 else "••••"
+
+
+def _retry_after_seconds(error: Exception) -> int:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        return max(1, int(float(raw)))
+    except (TypeError, ValueError):
+        pass
+
+    message = str(error)
+    match = re.search(r"(?:try again|retry)(?: in| after)?\s*(?:(\d+(?:\.\d+)?)m)?\s*(\d+(?:\.\d+)?)?s", message, re.I)
+    if match:
+        minutes = float(match.group(1) or 0)
+        seconds = float(match.group(2) or 0)
+        return max(1, int(minutes * 60 + seconds))
+    return 60
+
+
+def _record_api_success(provider: str, detail: str = "Available") -> None:
+    with _api_health_lock:
+        _api_health[provider] = {
+            "state": "ready",
+            "checked_at": _now(),
+            "cooldown_until": None,
+            "detail": detail,
+        }
+    _bump_state()
+
+
+def _record_api_failure(provider: str, error: Exception) -> None:
+    response = getattr(error, "response", None)
+    status_code = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+    is_cooldown = status_code == 429 or "429" in str(error) or "rate limit" in str(error).lower()
+    cooldown_until = None
+    if is_cooldown:
+        cooldown_until = time.time() + _retry_after_seconds(error)
+        detail = "Rate limit reached"
+    else:
+        detail = f"HTTP {status_code}" if status_code else str(error).strip()[:160]
+        detail = detail or "Provider check failed"
+    with _api_health_lock:
+        _api_health[provider] = {
+            "state": "cooldown" if is_cooldown else "error",
+            "checked_at": _now(),
+            "cooldown_until": cooldown_until,
+            "detail": detail,
+        }
+    _bump_state()
+
+
+def _api_health_snapshot() -> list[dict]:
+    providers = (
+        ("groq", "Groq", "GROQ_API_KEY", GROQ_TRANSLATION_MODEL),
+        ("openrouter", "OpenRouter", "OPENROUTER_API_KEY", OPENROUTER_TRANSLATION_MODEL),
+    )
+    now = time.time()
+    with _api_health_lock:
+        stored = {name: dict(value) for name, value in _api_health.items()}
+    result = []
+    for name, label, env_name, model in providers:
+        configured = bool((os.environ.get(env_name) or "").strip())
+        item = stored[name]
+        state = item["state"] if configured else "not_configured"
+        cooldown_until = item.get("cooldown_until")
+        if state == "cooldown" and cooldown_until and cooldown_until <= now:
+            state = "unchecked"
+            cooldown_until = None
+            item["detail"] = "Cooldown elapsed; check again"
+        result.append({
+            "provider": name,
+            "label": label,
+            "configured": configured,
+            "key_hint": _masked_api_key(env_name),
+            "model": model,
+            "state": state,
+            "detail": item.get("detail") or "",
+            "checked_at": item.get("checked_at"),
+            "cooldown_until": (
+                datetime.fromtimestamp(cooldown_until).isoformat(timespec="seconds")
+                if cooldown_until else None
+            ),
+            "cooldown_seconds": max(0, int(cooldown_until - now)) if cooldown_until else 0,
+        })
+    return result
+
 
 def _translation_messages(text: str) -> list[dict[str, str]]:
     return [
@@ -492,15 +595,20 @@ def _translate_with_groq(text: str) -> str | None:
     client = _get_groq_test_client()
     if client is None:
         return None
-    response = client.chat.completions.create(
-        model=GROQ_TRANSLATION_MODEL,
-        messages=_translation_messages(text),
-        temperature=0,
-        max_completion_tokens=1200,
-        top_p=1,
-        reasoning_effort="low",
-        timeout=8.0,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_TRANSLATION_MODEL,
+            messages=_translation_messages(text),
+            temperature=0,
+            max_completion_tokens=1200,
+            top_p=1,
+            reasoning_effort="low",
+            timeout=8.0,
+        )
+    except Exception as error:
+        _record_api_failure("groq", error)
+        raise
+    _record_api_success("groq", "Translation request succeeded")
     return (response.choices[0].message.content or "").strip() or None
 
 
@@ -515,18 +623,23 @@ def _translate_with_openrouter(text: str) -> str | None:
         "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
         "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
     }
-    response = httpx.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers=headers,
-        json={
-            "model": OPENROUTER_TRANSLATION_MODEL,
-            "messages": _translation_messages(text),
-            "temperature": 0,
-            "max_tokens": 1200,
-        },
-        timeout=12.0,
-    )
-    response.raise_for_status()
+    try:
+        response = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": OPENROUTER_TRANSLATION_MODEL,
+                "messages": _translation_messages(text),
+                "temperature": 0,
+                "max_tokens": 1200,
+            },
+            timeout=12.0,
+        )
+        response.raise_for_status()
+    except Exception as error:
+        _record_api_failure("openrouter", error)
+        raise
+    _record_api_success("openrouter", "Translation request succeeded")
     data = response.json()
     return (data["choices"][0]["message"]["content"] or "").strip() or None
 
@@ -561,12 +674,10 @@ def _now() -> str:
 
 
 # ── Meeting guard (Groq) ─────────────────────────────────────────────────────
-# Two consumers share this: the dashboard's "Test AI Key" panel (a sandbox —
-# nothing it does gets sent anywhere), and the live Auto-pilot path in
-# create_request() below, which actually uses the verdict to decide what gets
-# auto-sent. Lazily constructed (not at import time) so a missing/invalid key
-# only disables these features instead of the whole dashboard, and so a key
-# added to .env after the server started still works without a restart.
+# The live Auto-pilot path in create_request() uses this verdict before it can
+# auto-send. Lazily constructed so a missing/invalid key only disables the
+# guard instead of the whole dashboard, and a newly configured key is picked up
+# without restarting the process.
 GROQ_TEST_MODEL = "openai/gpt-oss-120b"
 _GROQ_TEST_SYSTEM_PROMPT = """You are reviewing a chat message on behalf of a user.
 
@@ -624,7 +735,9 @@ def _classify_message_with_groq(message: str) -> dict:
             response_format={"type": "json_object"},
         )
     except Exception as e:
+        _record_api_failure("groq", e)
         return {"ok": False, "error": str(e), "status": 502}
+    _record_api_success("groq", "Meeting guard request succeeded")
 
     raw = resp.choices[0].message.content or "{}"
     try:
@@ -640,16 +753,72 @@ def _classify_message_with_groq(message: str) -> dict:
     }
 
 
-@app.post("/api/test-groq")
-def test_groq():
-    body = request.get_json(force=True, silent=True) or {}
-    message = (body.get("message") or "").strip()
-    if not message:
-        return jsonify({"ok": False, "error": "message is required"}), 400
+def _probe_groq_key() -> None:
+    client = _get_groq_test_client()
+    if client is None:
+        if (os.environ.get("GROQ_API_KEY") or "").strip():
+            _record_api_failure("groq", RuntimeError("groq package is not installed"))
+        return
+    try:
+        client.chat.completions.create(
+            model=GROQ_TRANSLATION_MODEL,
+            messages=[{"role": "user", "content": "Reply only with OK."}],
+            temperature=0,
+            max_completion_tokens=8,
+            reasoning_effort="low",
+            timeout=8.0,
+        )
+    except Exception as error:
+        _record_api_failure("groq", error)
+        return
+    _record_api_success("groq", "Key check succeeded")
 
-    result = _classify_message_with_groq(message)
-    status = result.pop("status", 200)
-    return jsonify(result), status
+
+def _probe_openrouter_key() -> None:
+    api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if not api_key:
+        return
+    try:
+        response = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
+                "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
+            },
+            json={
+                "model": OPENROUTER_TRANSLATION_MODEL,
+                "messages": [{"role": "user", "content": "Reply only with OK."}],
+                "temperature": 0,
+                "max_tokens": 4,
+            },
+            timeout=12.0,
+        )
+        response.raise_for_status()
+    except Exception as error:
+        _record_api_failure("openrouter", error)
+        return
+    _record_api_success("openrouter", "Key check succeeded")
+
+
+@app.get("/api/ai-keys/status")
+def ai_key_status():
+    return jsonify(_api_health_snapshot())
+
+
+@app.post("/api/ai-keys/check")
+def check_ai_keys():
+    # Run both small probes concurrently so one slow provider cannot hold up the
+    # other's result. This is only triggered by the dashboard button.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_probe_groq_key), pool.submit(_probe_openrouter_key)]
+        for future in futures:
+            try:
+                future.result(timeout=15)
+            except Exception:
+                pass
+    return jsonify({"ok": True, "providers": _api_health_snapshot()})
 
 
 
@@ -1056,6 +1225,7 @@ def health():
 # one poll every couple seconds, not N.
 _control_cache_lock = threading.Lock()
 _control_cache: dict = {"ok": False, "available": False, "error": "not checked yet"}
+_checkinall_lock = threading.Lock()
 
 
 _CONTROL_TIMEOUT = httpx.Timeout(connect=0.5, read=1.5, write=1.5, pool=1.5)
@@ -1140,6 +1310,7 @@ def _full_snapshot() -> dict:
         "history": _requests_snapshot(pending=False, limit=300),
         "status": status,
         "mode": mode,
+        "ai_keys": _api_health_snapshot(),
         "control": _control_status_cached(),
         "bots": {p: _bot_status(p) for p in SELF_MANAGED_PLATFORMS},
     }
@@ -1173,6 +1344,22 @@ def control_command():
     cmd = (body.get("cmd") or "").strip()
     if not cmd:
         return jsonify({"ok": False, "error": "cmd is required"}), 400
+    if cmd.lower() in ("checkinall", "checkinsall", "ca"):
+        # Run this here instead of proxying it to launch_all.py. That keeps the
+        # dashboard calculator on the current extraction code even when the
+        # long-running launcher was started before an update.
+        if not _checkinall_lock.acquire(blocking=False):
+            return jsonify({"ok": False, "error": "Check-in All is already running"}), 409
+        try:
+            from core.checkinall import gather_and_write
+            platforms = ["gold", "gold2", "diamond", "platin", "s69", "ml",
+                         "xkuss", "justlo", "linduu", "gnoxx"]
+            text, path = asyncio.run(gather_and_write(platforms))
+            return jsonify({"ok": True, "output": f"{text}\n[checkinall] Note saved to {path}"})
+        except Exception as error:
+            return jsonify({"ok": False, "error": f"Check-in All failed: {error}"}), 500
+        finally:
+            _checkinall_lock.release()
     try:
         r = httpx.post(
             f"{LAUNCHER_CONTROL_URL}/control/command",
@@ -1383,6 +1570,32 @@ _PAGE = """<!doctype html>
     background: var(--muted); border: 1px solid var(--border); border-radius: 8px;
     padding: 9px 11px; white-space: pre-wrap; font-size: 13.5px; margin-top: 2px;
   }
+  .api-health-box {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px; margin-bottom: 26px;
+  }
+  .api-health-head { display: flex; align-items: center; gap: 14px; justify-content: space-between; flex-wrap: wrap; }
+  .api-health-head h2 { font-size: 14.5px; margin: 0 0 3px; font-weight: 650; }
+  .api-health-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+  .api-key-card {
+    position: relative; overflow: hidden; padding: 13px 14px; border: 1px solid var(--border);
+    border-radius: 10px; background: color-mix(in srgb, var(--muted) 72%, transparent);
+  }
+  .api-key-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 2px; background: var(--muted-foreground); }
+  .api-key-card.ready::before { background: var(--success); box-shadow: 0 0 16px var(--success); }
+  .api-key-card.cooldown::before { background: var(--warning); box-shadow: 0 0 16px var(--warning); }
+  .api-key-card.error::before, .api-key-card.not_configured::before { background: var(--destructive); }
+  .api-key-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .api-key-name { font-size: 13px; font-weight: 750; }
+  .api-key-state { font-size: 10px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border); }
+  .api-key-card.ready .api-key-state { color: var(--success); border-color: color-mix(in srgb, var(--success) 42%, var(--border)); }
+  .api-key-card.cooldown .api-key-state { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 42%, var(--border)); }
+  .api-key-card.error .api-key-state, .api-key-card.not_configured .api-key-state { color: var(--destructive); }
+  .api-key-meta { margin-top: 8px; color: var(--muted-foreground); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+  .api-key-meta code { color: var(--foreground); font-size: 11px; }
+  .btn-api-check { background: var(--primary); color: #fff; white-space: nowrap; }
+  .btn-api-check:disabled { opacity: .6; }
+  @media (max-width: 720px) { .api-health-grid { grid-template-columns: 1fr; } }
 
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 30px; }
   .stat-card {
@@ -1734,6 +1947,70 @@ _PAGE = """<!doctype html>
   .system-status .chip.warn .dot { background: var(--warning); animation: pulse 1.4s ease-in-out infinite; }
   .system-status .chip.bad { color: var(--destructive); }
   .system-status .chip.bad .dot { background: var(--destructive); }
+
+  /* ── Futuristic glass / depth pass ────────────────────────────────── */
+  html { color-scheme: dark; }
+  body {
+    background:
+      radial-gradient(circle at 18% -12%, rgba(56,189,248,.12), transparent 34%),
+      radial-gradient(circle at 88% 8%, rgba(99,102,241,.14), transparent 30%),
+      linear-gradient(145deg, #05070c 0%, #090b12 52%, #070910 100%);
+    background-attachment: fixed;
+  }
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0; opacity: .18;
+    background-image:
+      linear-gradient(rgba(148,163,184,.07) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148,163,184,.07) 1px, transparent 1px);
+    background-size: 42px 42px;
+    mask-image: linear-gradient(to bottom, #000, transparent 72%);
+  }
+  #sidebar, #main, #mobileBar { position: relative; z-index: 1; }
+  #sidebar {
+    background: rgba(9,11,18,.88); backdrop-filter: blur(18px) saturate(125%);
+    box-shadow: 18px 0 50px rgba(0,0,0,.18);
+  }
+  .card, .stat-card, .test-box, .api-health-box, .system-ctrl-box, .workflow-status, .history-card {
+    background: linear-gradient(145deg, rgba(24,24,30,.92), rgba(12,15,24,.9));
+    box-shadow: 0 14px 36px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.025);
+    backdrop-filter: blur(12px);
+  }
+  .card {
+    position: relative; overflow: hidden;
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+  .card::after {
+    content: ""; position: absolute; inset: 0 0 auto; height: 1px; pointer-events: none;
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--pc, var(--primary)) 55%, transparent), transparent);
+  }
+  .card:hover {
+    transform: translateY(-2px);
+    border-color: color-mix(in srgb, var(--pc, var(--border)) 45%, var(--border));
+    box-shadow: 0 18px 46px rgba(0,0,0,.28), 0 0 26px color-mix(in srgb, var(--pc, transparent) 8%, transparent);
+  }
+  .extracted-data {
+    margin-top: 14px; border: 1px solid color-mix(in srgb, var(--warning) 24%, var(--border));
+    border-radius: 10px; background: rgba(234,179,8,.035); overflow: hidden;
+  }
+  .extracted-data summary {
+    padding: 10px 12px; user-select: none; display: flex; align-items: center; gap: 4px;
+    transition: color .15s ease, background .15s ease;
+  }
+  .extracted-data summary:hover { background: rgba(234,179,8,.07); color: #fde047; }
+  .extracted-data summary::before { content: "＋"; width: 16px; display: inline-block; transition: transform .18s ease; }
+  .extracted-data[open] summary::before { content: "−"; transform: rotate(180deg); }
+  .extracted-data .profile-cols { margin: 0; padding: 12px; border-top: 1px solid rgba(234,179,8,.14); }
+  .extracted-data[open] .profile-cols { animation: disclosure-in .18s ease-out; }
+  summary:focus-visible, button:focus-visible, a:focus-visible {
+    outline: 2px solid var(--info); outline-offset: 3px;
+  }
+  button { transition: transform .14s ease, filter .14s ease, box-shadow .14s ease, background .14s ease; }
+  button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(0,0,0,.22); }
+  button:active:not(:disabled) { transform: translateY(0) scale(.985); }
+  @keyframes disclosure-in { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
 </style>
 </head>
 <body>
@@ -1779,26 +2056,26 @@ _PAGE = """<!doctype html>
 
   <div class="system-status" id="systemStatus"></div>
 
-  <div class="test-box">
-    <div class="test-box-head">
-      <h2>Test AI Key</h2>
-      <span class="test-box-sub">Checks the Groq API key works, and shows how it classifies a sample message as meeting-related or not — separate from the bots, nothing here gets sent.</span>
+  <div class="api-health-box">
+    <div class="api-health-head">
+      <div>
+        <h2>AI API Key Health</h2>
+        <span class="test-box-sub">See which configured key is ready, rate-limited, or unavailable. Keys are always masked.</span>
+      </div>
+      <button class="btn-api-check" id="apiKeyCheckBtn" onclick="checkApiKeys()">Check now</button>
     </div>
-    <textarea id="testMessageInput" class="test-input" placeholder="Paste a sample incoming message, e.g. &quot;Are you free Thursday at 3pm?&quot;"></textarea>
-    <div class="test-actions">
-      <button class="btn-test" id="testRunBtn" onclick="runGroqTest()">Test</button>
-      <span class="test-status" id="testStatus"></span>
+    <div class="api-health-grid" id="apiKeyHealth">
+      <div class="api-key-card unchecked"><div class="api-key-name">Loading provider status…</div></div>
     </div>
-    <div class="test-result" id="testResult" style="display:none"></div>
   </div>
 
   <div class="system-ctrl-box">
     <div class="system-ctrl-head">
       <h2>Bot Controls</h2>
-      <span class="test-box-sub">Same commands as launch_all.py's terminal — restart/fix per platform below, or check total earnings across every account here.</span>
+      <span class="test-box-sub">Restart/fix individual bots below, or fill the earnings calculator automatically from every live account.</span>
     </div>
     <div class="system-ctrl-actions">
-      <button class="btn-money" id="checkinAllBtn" onclick="runCheckinAll()">Check-in All (money)</button>
+      <button class="btn-money" id="checkinAllBtn" onclick="runCheckinAll()">Check-in All Calculator</button>
       <span class="system-ctrl-status" id="checkinAllStatus"></span>
     </div>
     <div class="ctrl-output" id="checkinAllOutput">
@@ -1806,7 +2083,7 @@ _PAGE = """<!doctype html>
       <div class="ctrl-output-body" id="checkinAllOutputBody"></div>
     </div>
     <div class="ctrl-unavailable" id="ctrlUnavailableNote" style="display:none">
-      Bot controls unavailable — launch_all.py's control API isn't reachable. Start the bots with <code>python launch_all.py</code> on this machine to enable Restart/Fix/Checkinall buttons.
+      Launcher bot controls are offline, so Restart/Fix are unavailable. Check-in All still reads any browser tabs that are currently open.
     </div>
   </div>
 
@@ -1910,8 +2187,20 @@ const slug = (s) => "plat-" + (s || "unknown").toLowerCase().replace(/[^a-z0-9]+
 // Edits the reviewer has typed are kept here (keyed by request id) so a
 // background refresh can never silently wipe out in-progress wording changes.
 const editedReplies = new Map();
+// Live snapshots rebuild cards. Persist disclosure state separately so an
+// open Extracted data panel never collapses just because telemetry refreshed.
+const openDisclosurePanels = new Set();
+document.addEventListener("toggle", (event) => {
+  const details = event.target;
+  if (!(details instanceof HTMLDetailsElement)) return;
+  const key = details.dataset.uiKey;
+  if (!key) return;
+  if (details.open) openDisclosurePanels.add(key);
+  else openDisclosurePanels.delete(key);
+}, true);
 let knownPlatforms = [];
 let currentMode = "manual";
+let apiKeyHealthState = [];
 let serviceWorkerRegistration = null;
 let currentPushSubscription = null;
 let pushConfigured = false;
@@ -2145,49 +2434,50 @@ const ACTION_LABELS = {
   decline: "Decline",
 };
 
-async function runGroqTest() {
-  const input = document.getElementById("testMessageInput");
-  const btn = document.getElementById("testRunBtn");
-  const statusEl = document.getElementById("testStatus");
-  const resultEl = document.getElementById("testResult");
-  const message = input.value.trim();
+function renderApiKeyHealth(items) {
+  if (Array.isArray(items)) apiKeyHealthState = items;
+  const root = document.getElementById("apiKeyHealth");
+  if (!root) return;
+  const labels = {
+    ready: "Ready",
+    cooldown: "Cooldown",
+    error: "Error",
+    not_configured: "Not configured",
+    unchecked: "Not checked",
+  };
+  root.innerHTML = apiKeyHealthState.map(item => {
+    const cooldown = item.state === "cooldown"
+      ? ` · retry in ${Math.max(0, Number(item.cooldown_seconds || 0))}s`
+      : "";
+    const checked = item.checked_at ? `Last checked ${timeAgo(item.checked_at)}` : "No live check yet";
+    const key = item.key_hint ? `<code>${escapeHtml(item.key_hint)}</code>` : "No key in .env";
+    return `
+      <div class="api-key-card ${escapeHtml(item.state)}">
+        <div class="api-key-top">
+          <span class="api-key-name">${escapeHtml(item.label)}</span>
+          <span class="api-key-state">${escapeHtml(labels[item.state] || item.state)}</span>
+        </div>
+        <div class="api-key-meta">
+          ${key} · ${escapeHtml(item.model || "No model")}<br>
+          ${escapeHtml(item.detail || checked)}${escapeHtml(cooldown)}${item.detail ? `<br>${escapeHtml(checked)}` : ""}
+        </div>
+      </div>`;
+  }).join("") || '<div class="api-key-card unchecked"><div class="api-key-name">No providers found</div></div>';
+}
 
-  resultEl.style.display = "none";
-  if (!message) {
-    statusEl.textContent = "Type a message first.";
-    return;
-  }
-
-  btn.disabled = true;
-  statusEl.textContent = "Testing…";
+async function checkApiKeys() {
+  const btn = document.getElementById("apiKeyCheckBtn");
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Checking…'; }
   try {
-    const res = await fetch("/api/test-groq", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message }),
-    });
+    const res = await fetch("/api/ai-keys/check", { method: "POST" });
     const data = await res.json().catch(() => ({}));
-    resultEl.style.display = "block";
-
-    if (!res.ok || !data.ok) {
-      resultEl.innerHTML = `<div class="test-error">Key not working: ${escapeHtml(data.error || `HTTP ${res.status}`)}</div>`;
-      return;
-    }
-
-    const actionLabel = ACTION_LABELS[data.action] || data.action;
-    resultEl.innerHTML = `
-      <div class="test-ok">✓ Key works — got a live response from Groq.</div>
-      <div class="test-row"><span class="test-label">Contains meeting?</span><span class="pill ${data.contains_meeting ? "yes" : "no"}">${data.contains_meeting ? "Yes" : "No"}</span></div>
-      <div class="test-row"><span class="test-label">Action</span><span class="pill action-${escapeHtml(data.action)}">${escapeHtml(actionLabel)}</span></div>
-      <div class="test-row"><span class="test-label">Reply</span></div>
-      <div class="test-reply-box">${escapeHtml(data.reply)}</div>
-    `;
-  } catch (e) {
-    resultEl.style.display = "block";
-    resultEl.innerHTML = `<div class="test-error">Request failed: ${escapeHtml(String(e))}</div>`;
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    renderApiKeyHealth(data.providers || []);
+    toast("AI key status updated", { type: "success" });
+  } catch (error) {
+    toast("Could not check AI keys", { type: "error", detail: String(error) });
   } finally {
-    btn.disabled = false;
-    statusEl.textContent = "";
+    if (btn) { btn.disabled = false; btn.textContent = "Check now"; }
   }
 }
 
@@ -2376,6 +2666,7 @@ function colorFor(name) {
 // launch_all.py platform slug ("s69", "justlo", ...) capitalized, so no
 // separate name-mapping table is needed here.
 let controlsAvailable = false;
+let checkinAllRunning = false;
 let controlPlatformState = {}; // slug -> {state, uptime, crashes, exit_code}
 let botProcessState = {}; // dashboard-managed bot Popen/CDP state from /api/bots/status
 // Last command output per platform, kept here (not just in the DOM) because
@@ -2495,8 +2786,9 @@ async function runCheckinAll() {
   const statusEl = document.getElementById("checkinAllStatus");
   const outEl = document.getElementById("checkinAllOutput");
   const outBody = document.getElementById("checkinAllOutputBody");
+  checkinAllRunning = true;
   btn.disabled = true;
-  statusEl.textContent = "Running — opening 'Meine Statistiken' on every account, this can take a minute…";
+  statusEl.textContent = "Reading Gold stats, Xkuss INs, and Justlo/Linduu/Gnoxx monthly counters…";
   outEl.classList.remove("show");
   try {
     const res = await fetch("/api/control/command", {
@@ -2511,6 +2803,7 @@ async function runCheckinAll() {
     outBody.textContent = `Request failed: ${e}`;
     outEl.classList.add("show");
   } finally {
+    checkinAllRunning = false;
     statusEl.textContent = "";
     btn.disabled = false;
   }
@@ -2528,8 +2821,9 @@ function extractedDataHtml(r) {
   const hasClient = r.client_profile && Object.keys(r.client_profile).length;
   const hasFake = r.fake_profile && Object.keys(r.fake_profile).length;
   if (!hasClient && !hasFake) return "";
+  const disclosureKey = `extracted:${r.id}`;
   return `
-    <details class="extracted-data">
+    <details class="extracted-data" data-ui-key="${disclosureKey}" ${openDisclosurePanels.has(disclosureKey) ? "open" : ""}>
       <summary>Extracted data <span class="hint-inline">— review before approving</span></summary>
       <div class="profile-cols">
         <div class="profile-col">
@@ -2719,6 +3013,11 @@ function renderSections(pending, autoByPlatform) {
   // Drop edit-buffers for requests that are no longer pending (decided elsewhere).
   const stillPending = new Set(pending.map(r => r.id));
   for (const id of [...editedReplies.keys()]) if (!stillPending.has(id)) editedReplies.delete(id);
+  for (const key of [...openDisclosurePanels]) {
+    if (key.startsWith("extracted:") && !stillPending.has(key.slice("extracted:".length))) {
+      openDisclosurePanels.delete(key);
+    }
+  }
 }
 
 function historyCardHtml(r) {
@@ -2761,6 +3060,7 @@ function renderHistory(items) {
 function applySnapshot(data) {
   if (data.status) liveStatus = data.status;
   if (typeof data.mode === "string") currentMode = data.mode;
+  if (data.ai_keys) renderApiKeyHealth(data.ai_keys);
   renderModeToggle();
 
   if (data.control) {
@@ -2769,7 +3069,7 @@ function applySnapshot(data) {
   }
   if (data.bots) botProcessState = data.bots;
   const checkinBtn = document.getElementById("checkinAllBtn");
-  if (checkinBtn) checkinBtn.disabled = !controlsAvailable;
+  if (checkinBtn) checkinBtn.disabled = checkinAllRunning;
   const unavailNote = document.getElementById("ctrlUnavailableNote");
   if (unavailNote) unavailNote.style.display = controlsAvailable ? "none" : "block";
 
@@ -2812,17 +3112,19 @@ async function refresh() {
   // Never yank the textarea out from under someone mid-keystroke.
   if (document.activeElement && document.activeElement.classList.contains("reply-input")) return;
   try {
-    const [pendingRes, historyRes, statusRes, modeRes, botsRes] = await Promise.all([
+    const [pendingRes, historyRes, statusRes, modeRes, botsRes, apiKeysRes] = await Promise.all([
       fetch("/api/requests?status=pending"),
       fetch("/api/requests?status=approved,rejected,cancelled,skip_requested,skipped,transferred,sent,failed&limit=300"),
       fetch("/api/status"),
       fetch("/api/mode"),
       fetch("/api/bots/status"),
+      fetch("/api/ai-keys/status"),
     ]);
     await refreshControlStatus();
     applySnapshot({
       status: await statusRes.json(),
       mode: ((await modeRes.json()).mode) || "manual",
+      ai_keys: await apiKeysRes.json(),
       control: { available: controlsAvailable, platforms: controlPlatformState },
       bots: await botsRes.json(),
       history: await historyRes.json(),
@@ -3054,6 +3356,73 @@ _BOTS_PAGE = r"""<!doctype html>
   .modal-actions .modal-confirm.danger { background: var(--destructive); }
   .spinner { display: inline-block; width: 12px; height: 12px; border-radius: 999px; border: 2px solid currentColor; border-right-color: transparent; opacity: .8; animation: spin .6s linear infinite; vertical-align: -2px; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Futuristic glass / depth pass ────────────────────────────────── */
+  html { color-scheme: dark; min-height: 100%; }
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at 14% -10%, rgba(56,189,248,.13), transparent 32%),
+      radial-gradient(circle at 92% 4%, rgba(99,102,241,.15), transparent 29%),
+      linear-gradient(145deg, #05070c, #090b12 54%, #070910);
+    background-attachment: fixed; position: relative;
+  }
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .2;
+    background-image:
+      linear-gradient(rgba(148,163,184,.07) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148,163,184,.07) 1px, transparent 1px);
+    background-size: 42px 42px;
+    mask-image: linear-gradient(to bottom, #000, transparent 78%);
+  }
+  .topbar, .bots-grid { position: relative; z-index: 1; }
+  .topbar h1 {
+    background: linear-gradient(90deg, #fff, #7dd3fc 48%, #a5b4fc);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .back-link { background: rgba(15,18,28,.72); backdrop-filter: blur(10px); transition: all .16s ease; }
+  .back-link:hover { border-color: rgba(56,189,248,.4); box-shadow: 0 0 24px rgba(56,189,248,.08); }
+  .bot-card {
+    position: relative; overflow: hidden;
+    background: linear-gradient(145deg, rgba(24,24,30,.92), rgba(11,14,23,.9));
+    box-shadow: 0 16px 42px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.03);
+    backdrop-filter: blur(14px) saturate(120%);
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+  .bot-card::before {
+    content: ""; position: absolute; inset: 0 0 auto; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(56,189,248,.45), rgba(99,102,241,.4), transparent);
+  }
+  .bot-card:hover {
+    transform: translateY(-3px); border-color: rgba(99,102,241,.35);
+    box-shadow: 0 22px 56px rgba(0,0,0,.34), 0 0 34px rgba(99,102,241,.07);
+  }
+  details.steps-block {
+    border: 1px solid var(--border); border-radius: 10px; padding: 0; overflow: hidden;
+    background: rgba(9,11,18,.5);
+  }
+  details.steps-block summary {
+    list-style: none; padding: 10px 12px; user-select: none;
+    display: flex; align-items: center; gap: 7px; transition: background .15s ease, color .15s ease;
+  }
+  details.steps-block summary::-webkit-details-marker { display: none; }
+  details.steps-block summary::before { content: "＋"; color: var(--info); width: 15px; transition: transform .18s ease; }
+  details.steps-block[open] summary::before { content: "−"; transform: rotate(180deg); }
+  details.steps-block summary:hover { background: rgba(56,189,248,.055); color: var(--foreground); }
+  details.steps-block .steps-list { margin: 0; padding: 11px 18px 12px 34px; border-top: 1px solid var(--border); animation: disclosure-in .18s ease-out; }
+  details.steps-block .steps-list li::marker { color: var(--info); font-weight: 700; }
+  button { transition: transform .14s ease, filter .14s ease, box-shadow .14s ease, background .14s ease; }
+  button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(0,0,0,.24); }
+  button:active:not(:disabled) { transform: translateY(0) scale(.985); }
+  summary:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--info); outline-offset: 3px; }
+  @keyframes disclosure-in { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
+  @media (max-width: 760px) {
+    body { padding: 16px 14px 42px; }
+    .bots-grid { grid-template-columns: 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
 </style>
 </head>
 <body>
@@ -3138,22 +3507,37 @@ const PLATFORMS = [
 // every fetch/render/action below is always scoped to one `slug`, never "all".
 const state = {};
 for (const p of PLATFORMS) {
-  state[p.slug] = { approvalEffective: "manual", running: false, managedBy: null, liveDetail: "", stopping: false };
+  state[p.slug] = { approvalEffective: "manual", running: false, managedBy: null, liveDetail: "", stopping: false, stepsOpen: false };
 }
 
 function stepsFor(slug, approval) {
   const approvalStep = approval === "auto"
-    ? "Skip approval — the reply is used immediately (no one reviews it)"
-    : "Wait for you to Approve or Reject it on the main Approval Dashboard";
+    ? "Run the meeting guard, then continue automatically without waiting for a reviewer"
+    : "Pause on the Approval Dashboard: Approve sends it, Reject regenerates, Cancel abandons it, and Transfer/Skip leaves the chat";
+  if (slug === "xkuss") {
+    return [
+      "Log in, open Home, and keep the Dialog Scanner running",
+      "Detect when Home opens a new conversation and verify the chat is really active",
+      "Capture the conversation HTML and inject it into Chameleon-AI AgentWorkspace",
+      "Extract the data; if Chameleon marks First Contact, leave through Home and return to waiting",
+      "Click \"Antwort generieren\" and wait for Chameleon's complete reply",
+      approvalStep,
+      "If Transfer/Skip was requested, click Home and confirm the dashboard action completed",
+      "Otherwise paste the approved reply, wait about 15–20 seconds, and send it",
+      "Click Home again, reset Chameleon, and wait for a different conversation",
+    ];
+  }
   return [
-    "Detect an incoming chat",
-    "Capture that chat's HTML",
-    "Paste it into the real Chameleon-AI AgentWorkspace",
-    "Click \"Antwort generieren\" and wait for a reply",
+    "Log in, open Mod, start Play, and keep the moderation queue scanner active",
+    "Detect a newly loaded conversation and verify the customer/message grid is ready",
+    "Capture the conversation HTML and inject it into Chameleon-AI AgentWorkspace",
+    "Extract the data and let Chameleon decide whether this is First Contact",
+    "For First Contact: click \"Übergeben\"; if nobody is online, click \"Überspringen\" and confirm \"Ja\"",
+    "For a normal chat: click \"Antwort generieren\" and wait for Chameleon's complete reply",
     approvalStep,
-    "Copy the reply text",
-    "Paste it into the chat's reply box",
-    "Wait about 15–20 seconds, then send",
+    "A dashboard Transfer/Skip request uses the same Übergeben → Überspringen → Ja fallback",
+    "Otherwise paste the approved reply, wait about 15–20 seconds, and send it",
+    "Reset Chameleon and return to Waiting until the scanner loads another conversation",
   ];
 }
 
@@ -3185,7 +3569,7 @@ function renderCard(slug, label) {
         </button>
       </div>
 
-      <details class="steps-block">
+      <details class="steps-block" ${s.stepsOpen ? "open" : ""} ontoggle="state['${slug}'].stepsOpen = this.open">
         <summary>What happens, step by step</summary>
         <ol class="steps-list">${steps.map(st => `<li>${escapeHtml(st)}</li>`).join("")}</ol>
       </details>

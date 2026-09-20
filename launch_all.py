@@ -49,8 +49,10 @@ SELF_MANAGED      = ["xkuss", "justlo", "linduu", "gnoxx"]
 KNOWN_PLATFORMS   = REACT_PLATFORMS + SELF_MANAGED
 # `python launch_all.py` with no args starts exactly these platforms.
 DEFAULT_PLATFORMS = ["gold", "ml", "platin", "s69", "diamond", "xkuss", "justlo", "linduu", "gnoxx"]
-# Stats-capable platforms ('checkins'/'checkinall' read the React mod-site dialog).
+# ``checkins`` reads the React mod-site dialog. ``checkinall`` additionally
+# reads Xkuss's INs link and the monthly counters on Justlo/Linduu/Gnoxx.
 ALL_PLATFORMS     = REACT_PLATFORMS
+CHECKINALL_PLATFORMS = [p for p in REACT_PLATFORMS if p != "gold3"] + SELF_MANAGED
 
 _CLI_ALIASES = {"plat": "platin", "g2": "gold2", "g3": "gold3", "lindu": "linduu", "just": "justlo", "gnox": "gnoxx"}
 
@@ -456,7 +458,7 @@ def run_bots():
 
     def _cmd_checkinall():
         from core.checkinall import gather_and_write
-        text, path = asyncio.run(gather_and_write([p for p in ALL_PLATFORMS if p != "gold3"]))
+        text, path = asyncio.run(gather_and_write(CHECKINALL_PLATFORMS))
         print(text, flush=True)
         print(f"[checkinall] Note saved to {path}", flush=True)
 
