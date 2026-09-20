@@ -117,6 +117,7 @@ _SEL_COMBOBOX      = "button[role='combobox']"
 # the stable grid id rather than '#gridview-NNNN-body'.
 _SEL_TRANSFER_POPUP = ".x-window:has(#user-select-grid)"
 _SEL_TRANSFER_ROWS  = "#user-select-grid .x-grid-row"
+_SEL_SKIP_CONFIRM   = ".x-window:visible:has-text('Überspringen'):has-text('Sind Sie sicher?')"
 _GET_TRANSFER_NAMES_JS = """() => {
   const rows = document.querySelectorAll('#user-select-grid .x-grid-row');
   return Array.from(rows).map((row) => {
@@ -780,6 +781,20 @@ class JustloBot:
         await btn.click()
         await asyncio.sleep(2)
 
+    async def _confirm_skip_dialog(self, tab1, *, wait: bool = True) -> bool:
+        """Click ``Ja`` in the visible Überspringen confirmation dialog."""
+        confirm = tab1.locator(_SEL_SKIP_CONFIRM).last
+        if wait:
+            await confirm.wait_for(state="visible", timeout=10_000)
+        elif await confirm.count() == 0 or not await confirm.is_visible():
+            return False
+
+        yes_btn = confirm.locator("a[role='button']:has-text('Ja')")
+        await yes_btn.first.click()
+        await confirm.wait_for(state="hidden", timeout=10_000)
+        await asyncio.sleep(1.0)
+        return True
+
     async def _handover_first_contact(self, tab1) -> str | None:
         """Click 'Übergeben' and hand a First Contact dialog to another moderator.
 
@@ -812,7 +827,11 @@ class JustloBot:
                     await cancel_btn.first.click()
                     await asyncio.sleep(0.5)
                 await tab1.locator(self.cfg.sel_skip_btn).click()
-                await asyncio.sleep(1.5)
+
+                # Überspringen is not complete until its confirmation window
+                # is accepted. Do not reset Chameleon or report waiting while
+                # the modal is still holding the current conversation open.
+                await self._confirm_skip_dialog(tab1)
                 return "skipped"
 
             pick = random.choice(candidates)
@@ -974,6 +993,16 @@ class JustloBot:
                 tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
                 self.cfg.platform, self.cfg.chameleon_chat,
             )
+
+            # A worker restart can happen after Überspringen was clicked but
+            # before its confirmation was accepted. Clear that exact modal so
+            # the console can really return to its waiting scanner.
+            if await self._confirm_skip_dialog(tab1, wait=False):
+                self.log("[RECOVERY] Confirmed the pending Überspringen dialog with 'Ja'.")
+                await report_status(
+                    self.cfg.platform, "waiting", "Waiting for a conversation",
+                    checkpoint="waiting",
+                )
 
             self.log("Both tabs ready. Bot running.\n")
 

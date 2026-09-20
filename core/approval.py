@@ -26,20 +26,70 @@ thing with that — it never falls back to auto-sending.
 """
 
 import asyncio
+import base64
+import json
 import os
 from datetime import datetime
 from typing import Awaitable, Callable
 
 import httpx
 
+try:
+    from simple_websocket import Client as WebSocketClient
+except ImportError:  # flask-sock normally installs this; HTTP remains the fallback
+    WebSocketClient = None
+
 APPROVAL_SERVER_URL = os.environ.get("APPROVAL_SERVER_URL", "http://127.0.0.1:8799")
 POLL_INTERVAL = 2  # seconds between "is it decided yet?" checks
+WS_RECONNECT_INTERVAL = 2.0
 
 # Matches APPROVAL_USER/APPROVAL_PASS on the server (see approval_server.py).
 # None when unset, which disables auth on both sides for local dev.
 _AUTH_USER = os.environ.get("APPROVAL_USER")
 _AUTH_PASS = os.environ.get("APPROVAL_PASS")
 _AUTH = (_AUTH_USER, _AUTH_PASS) if _AUTH_USER and _AUTH_PASS else None
+
+
+def _approval_ws_url() -> str:
+    base = APPROVAL_SERVER_URL.rstrip("/")
+    if base.startswith("https://"):
+        base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        base = "ws://" + base[len("http://"):]
+    return f"{base}/ws/live"
+
+
+def _approval_ws_headers() -> dict[str, str]:
+    if not _AUTH:
+        return {}
+    raw = f"{_AUTH[0]}:{_AUTH[1]}".encode("utf-8")
+    return {"Authorization": f"Basic {base64.b64encode(raw).decode('ascii')}"}
+
+
+def _request_from_snapshot(payload: str | bytes, request_id: str) -> dict | None:
+    """Find one approval request in a /ws/live full snapshot."""
+    data = json.loads(payload)
+    if data.get("type") != "snapshot":
+        return None
+    for bucket in (data.get("pending") or [], data.get("history") or []):
+        for item in bucket:
+            if item.get("id") == request_id:
+                return item
+    return None
+
+
+def _decision_result(data: dict, reply: str, request_id: str):
+    """Convert a request snapshot into a completed decision, if any."""
+    status = data.get("status")
+    if status == "approved":
+        return True, (data.get("final_reply") or reply), request_id
+    if status == "rejected":
+        return False, None, request_id
+    if status == "cancelled":
+        raise ApprovalCancelled(request_id)
+    if status == "skip_requested":
+        raise ApprovalSkipped(request_id)
+    return None
 
 
 class ApprovalRejected(Exception):
@@ -119,38 +169,70 @@ async def request_approval(
         resp.raise_for_status()
         req_id = resp.json()["id"]
 
-        since_chat_check = 0.0
-        since_status_ping = 0.0
-        while True:
-            await asyncio.sleep(POLL_INTERVAL)
-            r = await client.get(f"{APPROVAL_SERVER_URL}/api/requests/{req_id}")
-            r.raise_for_status()
-            data = r.json()
-            status = data.get("status")
-            if status == "approved":
-                return True, (data.get("final_reply") or reply), req_id
-            if status == "rejected":
-                return False, None, req_id
-            if status == "cancelled":
-                raise ApprovalCancelled(req_id)
-            if status == "skip_requested":
-                raise ApprovalSkipped(req_id)
-            # still "pending" -> keep polling
+        loop = asyncio.get_running_loop()
+        next_chat_check = loop.time() + chat_check_interval
+        next_status_ping = loop.time() + 20.0
+        next_ws_retry = loop.time()
+        ws = None
 
-            since_status_ping += POLL_INTERVAL
-            if since_status_ping >= 20.0:
-                since_status_ping = 0.0
-                await report_status(
-                    platform,
-                    "approval",
-                    "Waiting for approval",
-                    checkpoint="approval",
-                )
+        try:
+            while True:
+                now = loop.time()
 
-            if chat_still_active is not None:
-                since_chat_check += POLL_INTERVAL
-                if since_chat_check >= chat_check_interval:
-                    since_chat_check = 0.0
+                # WebSocket is the primary decision channel. /ws/live sends an
+                # immediate full snapshot on connect and another one for every
+                # Approve/Reject/Cancel/Skip mutation, so dashboard actions are
+                # consumed without waiting for the old two-second HTTP poll.
+                if ws is None and WebSocketClient is not None and now >= next_ws_retry:
+                    try:
+                        ws = await asyncio.to_thread(
+                            WebSocketClient,
+                            _approval_ws_url(),
+                            headers=_approval_ws_headers(),
+                            ping_interval=20,
+                        )
+                    except Exception:
+                        ws = None
+                        next_ws_retry = now + WS_RECONNECT_INTERVAL
+
+                data = None
+                if ws is not None:
+                    try:
+                        payload = await asyncio.to_thread(ws.receive, 1.0)
+                        if payload is not None:
+                            data = _request_from_snapshot(payload, req_id)
+                    except Exception:
+                        try:
+                            await asyncio.to_thread(ws.close)
+                        except Exception:
+                            pass
+                        ws = None
+                        next_ws_retry = loop.time() + WS_RECONNECT_INTERVAL
+                else:
+                    # Socket unavailable/reconnecting: retain the original HTTP
+                    # behavior as a fail-safe so a decision can never be lost.
+                    await asyncio.sleep(POLL_INTERVAL)
+                    r = await client.get(f"{APPROVAL_SERVER_URL}/api/requests/{req_id}")
+                    r.raise_for_status()
+                    data = r.json()
+
+                if data is not None:
+                    decision = _decision_result(data, reply, req_id)
+                    if decision is not None:
+                        return decision
+
+                now = loop.time()
+                if now >= next_status_ping:
+                    next_status_ping = now + 20.0
+                    await report_status(
+                        platform,
+                        "approval",
+                        "Waiting for approval",
+                        checkpoint="approval",
+                    )
+
+                if chat_still_active is not None and now >= next_chat_check:
+                    next_chat_check = now + chat_check_interval
                     try:
                         still_there = await chat_still_active()
                     except Exception:
@@ -161,6 +243,12 @@ async def request_approval(
                         except Exception:
                             pass  # dashboard bookkeeping only — still abandon locally below
                         raise ApprovalCancelled(req_id)
+        finally:
+            if ws is not None:
+                try:
+                    await asyncio.to_thread(ws.close)
+                except Exception:
+                    pass
 
 
 async def mark_sent(request_id: str | None):
@@ -223,6 +311,7 @@ async def report_status(
                 f"{APPROVAL_SERVER_URL}/api/status",
                 json={
                     "platform": platform,
+                    "pid": os.getpid(),
                     "state": state,
                     "detail": detail,
                     "retry_count": max(0, int(retry_count or 0)),

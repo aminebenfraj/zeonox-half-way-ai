@@ -56,9 +56,10 @@ from core import push_notifications
 
 try:
     from flask_sock import Sock
-    from simple_websocket import ConnectionClosed
+    from simple_websocket import Client as WebSocketClient, ConnectionClosed
 except ImportError:  # live-push is a nice-to-have — dashboard falls back to HTTP polling without it
     Sock = None
+    WebSocketClient = None
     ConnectionClosed = Exception
 
 try:
@@ -209,6 +210,144 @@ _SELF_MANAGED_CDP_PORTS = {"xkuss": 9227, "justlo": 9229, "linduu": 9230, "gnoxx
 _bot_procs: dict[str, subprocess.Popen] = {}
 
 
+def _pid_is_running(pid: int | None) -> bool:
+    """Return whether a reported worker PID is still alive."""
+    if not pid or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _reported_bot_pid(platform: str) -> int | None:
+    """Read the latest PID reported by this platform's worker telemetry."""
+    with _lock:
+        entry = next(
+            (value for key, value in _status.items() if key.strip().lower() == platform),
+            None,
+        )
+        raw_pid = entry.get("pid") if entry else None
+    try:
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return None
+    return pid if _pid_is_running(pid) else None
+
+
+def _terminate_process_tree(pid: int | None) -> bool:
+    """Force-stop one bot worker and all children, including its CMD window."""
+    if not pid or pid == os.getpid():
+        return False
+    if not _pid_is_running(pid):
+        return True
+    if sys.platform == "win32":
+        completed = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return completed.returncode == 0 or not _pid_is_running(pid)
+
+    try:
+        os.kill(pid, 15)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and _pid_is_running(pid):
+            time.sleep(0.05)
+        if _pid_is_running(pid):
+            os.kill(pid, 9)
+        return not _pid_is_running(pid)
+    except OSError:
+        return not _pid_is_running(pid)
+
+
+def _stop_via_launcher(platform: str) -> bool:
+    """Tell launch_all.py not to restart a worker that Stop is terminating."""
+    try:
+        response = httpx.post(
+            f"{LAUNCHER_CONTROL_URL}/control/command",
+            json={"cmd": "stop", "target": platform},
+            timeout=2.5,
+        )
+        return response.is_success and bool(response.json().get("ok"))
+    except Exception:
+        return False
+
+
+def _cdp_listener_pid(port: int) -> int | None:
+    """Resolve only the process listening on one dedicated CDP port."""
+    if sys.platform != "win32":
+        return None
+    try:
+        completed = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        pattern = re.compile(
+            rf"^\s*TCP\s+\S*:{port}\s+\S+\s+LISTENING\s+(\d+)\s*$",
+            re.IGNORECASE,
+        )
+        for line in completed.stdout.splitlines():
+            match = pattern.match(line)
+            if match:
+                return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _close_platform_chrome(port: int) -> bool:
+    """Close exactly the Chrome instance exposed on this platform's CDP port."""
+    if not is_cdp_ready(port):
+        return True
+
+    # Ask Chrome to shut down cleanly first. Each platform has its own CDP port
+    # and profile, so Browser.close cannot touch unrelated Chrome windows.
+    if WebSocketClient is not None:
+        try:
+            version = httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=2.0).json()
+            debugger_url = version.get("webSocketDebuggerUrl")
+            if debugger_url:
+                ws = WebSocketClient(debugger_url)
+                try:
+                    ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+                    ws.receive(timeout=1.0)
+                finally:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and is_cdp_ready(port):
+        time.sleep(0.05)
+    if not is_cdp_ready(port):
+        return True
+
+    # If the browser ignored CDP shutdown, kill only the listener resolved from
+    # this exact dedicated port. Never search by process name or close all Chrome.
+    browser_pid = _cdp_listener_pid(port)
+    return _terminate_process_tree(browser_pid) if browser_pid else False
+
+
 def _bot_status(platform: str) -> dict:
     """Best-effort status for one self-managed platform. Distinguishes a bot
     this dashboard started (has a tracked Popen) from one that's merely
@@ -220,10 +359,15 @@ def _bot_status(platform: str) -> dict:
         return {"running": True, "pid": proc.pid, "managed_by": "dashboard"}
     if proc is not None:
         _bot_procs.pop(platform, None)  # exited -- stop tracking it as running
-    port = _SELF_MANAGED_CDP_PORTS[platform]
-    if is_cdp_ready(port):
-        return {"running": True, "pid": None, "managed_by": "external"}
-    return {"running": False, "pid": None, "managed_by": None}
+    reported_pid = _reported_bot_pid(platform)
+    if reported_pid:
+        return {"running": True, "pid": reported_pid, "managed_by": "external"}
+    return {
+        "running": False,
+        "pid": None,
+        "managed_by": None,
+        "browser_open": is_cdp_ready(_SELF_MANAGED_CDP_PORTS[platform]),
+    }
 
 
 @app.get("/api/bots/status")
@@ -261,16 +405,66 @@ def bots_stop(platform):
     platform = platform.strip().lower()
     if platform not in SELF_MANAGED_PLATFORMS:
         return jsonify({"ok": False, "error": f"platform must be one of {SELF_MANAGED_PLATFORMS}"}), 400
+
+    port = _SELF_MANAGED_CDP_PORTS[platform]
     proc = _bot_procs.get(platform)
-    if proc is None or proc.poll() is not None:
+    pids = set()
+    if proc is not None and proc.poll() is None:
+        pids.add(proc.pid)
+    reported_pid = _reported_bot_pid(platform)
+    if reported_pid:
+        pids.add(reported_pid)
+
+    # When launch_all.py owns this bot, this marks it intentionally stopped so
+    # its crash monitor does not immediately relaunch the process we terminate.
+    _stop_via_launcher(platform)
+
+    worker_stopped = True
+    for pid in pids:
+        worker_stopped = _terminate_process_tree(pid) and worker_stopped
+    _bot_procs.pop(platform, None)
+    browser_stopped = _close_platform_chrome(port)
+
+    label = next(p for p in SELF_MANAGED_PLATFORMS if p == platform).capitalize()
+    now = _now()
+    with _lock:
+        # A stopped bot cannot complete an approval. Remove its cards from the
+        # actionable queue instead of leaving permanent orphan approvals.
+        for item in _requests.values():
+            if (
+                (item.get("platform") or "").strip().lower() == platform
+                and item.get("status") in ("pending", "skip_requested")
+            ):
+                item["status"] = "cancelled"
+                item["decided_at"] = now
+        _status[label] = {
+            "state": "stopped",
+            "detail": "Bot and browser stopped",
+            "retry_count": 0,
+            "warning": "",
+            "checkpoint": "stopped",
+            "pid": None,
+            "updated_at": now,
+        }
+    _bump_state()
+
+    if not worker_stopped or not browser_stopped:
+        failed = []
+        if not worker_stopped:
+            failed.append("bot process")
+        if not browser_stopped:
+            failed.append("Chrome")
         return jsonify({
             "ok": False,
-            "error": f"{platform} isn't running under this dashboard's control "
-                     "(either stopped already, or started some other way -- stop it from wherever it was started).",
-        }), 409
-    proc.terminate()
-    _bot_procs.pop(platform, None)
-    return jsonify({"ok": True})
+            "error": f"Could not fully stop {platform}: {', '.join(failed)}",
+            "worker_stopped": worker_stopped,
+            "browser_stopped": browser_stopped,
+        }), 500
+    return jsonify({
+        "ok": True,
+        "worker_stopped": True,
+        "browser_stopped": True,
+    })
 
 
 # Translation calls use the configured Groq account first and OpenRouter as a
@@ -814,8 +1008,15 @@ def update_status():
         retry_count = max(0, int(body.get("retry_count") or 0))
     except (TypeError, ValueError):
         retry_count = 0
+    try:
+        pid = int(body.get("pid")) if body.get("pid") is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    if pid is not None and pid <= 0:
+        pid = None
     with _lock:
         _status[platform] = {
+            "pid": pid,
             "state": body.get("state") or "unknown",
             "detail": body.get("detail") or "",
             "retry_count": retry_count,
@@ -1560,7 +1761,7 @@ _PAGE = """<!doctype html>
     <p class="mode-toggle-hint" id="modeToggleHint">Every reply waits here for Approve, Reject or Cancel.</p>
     <button id="soundToggle" class="sound-toggle" onclick="toggleSound()">🔔 Sound on</button>
     <button id="pushToggle" class="sound-toggle" onclick="togglePushNotifications()">📲 Enable phone notifications</button>
-    <a href="/bots" class="sound-toggle" style="margin-top:8px;text-decoration:none;">🤖 Bots (start / stop / configure)</a>
+    <a href="/bots" class="sound-toggle" style="margin-top:8px;text-decoration:none;">🤖 Bots</a>
     <span class="live-badge" id="liveBadge" title="How this dashboard is getting updates"><span class="dot"></span><span id="liveBadgeLabel">Connecting…</span></span>
   </div>
   <nav>
@@ -2937,7 +3138,7 @@ const PLATFORMS = [
 // every fetch/render/action below is always scoped to one `slug`, never "all".
 const state = {};
 for (const p of PLATFORMS) {
-  state[p.slug] = { approvalEffective: "manual", running: false, managedBy: null, liveDetail: "" };
+  state[p.slug] = { approvalEffective: "manual", running: false, managedBy: null, liveDetail: "", stopping: false };
 }
 
 function stepsFor(slug, approval) {
@@ -2959,8 +3160,8 @@ function stepsFor(slug, approval) {
 function renderCard(slug, label) {
   const s = state[slug];
   const running = s.running;
-  const statusClass = running ? (s.managedBy === "external" ? "external" : "running") : "";
-  const statusText = running ? (s.managedBy === "external" ? "Running (external)" : "Running") : "Stopped";
+  const statusClass = s.stopping ? "external" : (running ? (s.managedBy === "external" ? "external" : "running") : "");
+  const statusText = s.stopping ? "Stopping…" : (running ? (s.managedBy === "external" ? "Running (external)" : "Running") : "Stopped");
   const steps = stepsFor(slug, s.approvalEffective);
 
   return `
@@ -2972,8 +3173,8 @@ function renderCard(slug, label) {
       <div class="live-line">${escapeHtml(s.liveDetail || "")}</div>
 
       <div class="start-stop-row">
-        <button class="btn-start" ${running ? "disabled" : ""} onclick="startBot('${slug}')">Start</button>
-        <button class="btn-stop" ${(!running || s.managedBy !== "dashboard") ? "disabled" : ""} onclick="stopBot('${slug}')">Stop</button>
+        <button class="btn-start" ${(running || s.stopping) ? "disabled" : ""} onclick="startBot('${slug}')">Start</button>
+        <button class="btn-stop" ${(!running || s.stopping) ? "disabled" : ""} onclick="stopBot('${slug}')">${s.stopping ? "Stopping…" : "Stop"}</button>
       </div>
 
       <div class="toggle-row">
@@ -3017,12 +3218,22 @@ async function startBot(slug) {
 
 async function stopBot(slug) {
   showError(slug, "");
+  state[slug].stopping = true;
+  render();
   try {
     const res = await fetch(`/api/bots/${slug}/stop`, { method: "POST" });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) showError(slug, data.error || `HTTP ${res.status}`);
+    if (!res.ok || !data.ok) {
+      showError(slug, data.error || `HTTP ${res.status}`);
+    } else {
+      state[slug].running = false;
+      state[slug].managedBy = null;
+      state[slug].liveDetail = "stopped — Bot and browser stopped";
+    }
   } catch (e) {
     showError(slug, "Request failed: " + e);
+  } finally {
+    state[slug].stopping = false;
   }
   await refreshStatus();
 }
