@@ -1055,7 +1055,7 @@ class ChatBot:
 
     async def _get_approved_reply(self, tab1, tab2, last_message: str,
                                   customer_message: str, client_profile: dict,
-                                  fake_profile: dict) -> tuple[str, str]:
+                                  fake_profile: dict, messages: list[dict] | None = None) -> tuple[str, str]:
         """Generate a reply, then block on the approval dashboard before it's
         allowed to be sent. A rejection clicks 'Antwort generieren' again for a
         fresh reply and resubmits it — repeats until something is approved.
@@ -1083,6 +1083,7 @@ class ChatBot:
                 self.cfg.platform, reply, last_message=last_message,
                 customer_message=customer_message,
                 client_profile=client_profile, fake_profile=fake_profile,
+                messages=messages,
                 chat_still_active=lambda: self._chat_is_open(tab1),
             )
             if approved:
@@ -1235,6 +1236,7 @@ class ChatBot:
                         reply, approval_id = await self._get_approved_reply(
                             tab1, tab2, dashboard_last_msg, dashboard_customer_msg,
                             extracted["client_profile"], extracted["fake_profile"],
+                            extracted["messages"],
                         )
                     except ManualReviewLimitExceeded:
                         await self._restart_from_scraping(

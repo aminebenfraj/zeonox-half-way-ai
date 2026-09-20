@@ -52,6 +52,7 @@ import httpx
 from flask import Flask, jsonify, request, Response
 
 from core.launcher import is_cdp_ready
+from prompts import JUDGE_SYSTEM_PROMPT, MEETING_ALERT_SYSTEM_PROMPT
 from core import push_notifications
 
 
@@ -753,6 +754,82 @@ def _classify_message_with_groq(message: str) -> dict:
     }
 
 
+# ── Meeting-alert analyzer (Groq) ────────────────────────────────────────────
+# Advisory only, never blocking: unlike the meeting guard above (which
+# rewrites the fake account's own reply), this looks at the whole conversation
+# for (a) the CLIENT pushing toward a real meeting, phone number, or
+# off-platform contact, and (b) a running read on tone/direction/what the
+# client seems to expect -- both just surfaced on the dashboard for a human to
+# see. Runs on every request regardless of auto/manual mode.
+MEETING_ALERT_MODEL = os.environ.get("MEETING_ALERT_MODEL", "openai/gpt-oss-20b")
+
+_EMPTY_MEETING_ALERT = {
+    "ok": True,
+    "requested": False,
+    "reason": "",
+    "tone": "",
+    "direction": "",
+    "client_expectation": "",
+}
+
+
+def _meeting_alert_transcript(messages: list[dict]) -> str:
+    lines = []
+    for m in messages[-10:]:
+        sender = "FAKE" if (m.get("sender") or "").strip().lower() == "fake_account" else "CLIENT"
+        text = (m.get("text") or "").strip()
+        if text:
+            lines.append(f"{sender}: {text}")
+    return "\n".join(lines)
+
+
+def _analyze_meeting_alert(messages: list[dict]) -> dict:
+    """Runs the meeting-alert + conversation-analysis prompt on the last 10
+    turns of `messages`. Returns
+    {"ok": True, "requested", "reason", "tone", "direction", "client_expectation"}
+    or {"ok": False, "error"}. Returns the all-blank version above without
+    calling the model at all if there's no conversation yet."""
+    transcript = _meeting_alert_transcript(messages)
+    if not transcript:
+        return dict(_EMPTY_MEETING_ALERT)
+
+    client = _get_groq_test_client()
+    if client is None:
+        reason = "groq package not installed" if Groq is None else "GROQ_API_KEY is not set"
+        return {"ok": False, "error": reason}
+
+    try:
+        resp = client.chat.completions.create(
+            model=MEETING_ALERT_MODEL,
+            messages=[
+                {"role": "system", "content": MEETING_ALERT_SYSTEM_PROMPT},
+                {"role": "user", "content": f"CONVERSATION (oldest first):\n{transcript}"},
+            ],
+            temperature=0,
+            max_completion_tokens=300,
+            top_p=1,
+            reasoning_effort="low",
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    raw = resp.choices[0].message.content or "{}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "model returned invalid JSON", "raw": raw}
+
+    return {
+        "ok": True,
+        "requested": data.get("requested") is True,
+        "reason": str(data.get("reason") or "").strip(),
+        "tone": str(data.get("tone") or "").strip(),
+        "direction": str(data.get("direction") or "").strip(),
+        "client_expectation": str(data.get("client_expectation") or "").strip(),
+    }
+
+
 def _probe_groq_key() -> None:
     client = _get_groq_test_client()
     if client is None:
@@ -821,6 +898,81 @@ def check_ai_keys():
     return jsonify({"ok": True, "providers": _api_health_snapshot()})
 
 
+# ── Judge (OpenRouter) ───────────────────────────────────────────────────────
+# A second, independent AI opinion on every reply that reaches the approval
+# queue. Lazily reads the API key per-call (same reasoning as the meeting
+# guard above). Fails safe: any error here is treated by create_request() as
+# "not a 10", i.e. falls back to manual review exactly like a failed meeting
+# guard check does.
+JUDGE_MODEL = os.environ.get("OPENROUTER_MODEL", "cognitivecomputations/dolphin-mistral-24b-venice-edition")
+
+
+def _judge_reply(platform: str, last_message: str, customer_message: str,
+                  client_profile: dict, fake_profile: dict, reply: str) -> dict:
+    """Runs the judge prompt on a reply. Returns
+    {"ok": True, "score", "verdict", "reasoning"} or {"ok": False, "error"}."""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return {"ok": False, "error": "OPENROUTER_API_KEY is not set"}
+
+    payload = {
+        "platform": platform,
+        "conversation": {
+            "last_message": last_message,
+            "customer_message": customer_message,
+        },
+        "client_profile": client_profile,
+        "fake_profile": fake_profile,
+        "proposed_reply": reply,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
+        "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
+    }
+
+    try:
+        response = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": JUDGE_MODEL,
+                "messages": [
+                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                "temperature": 0,
+                "max_tokens": 500,
+            },
+            timeout=20.0,
+        )
+        response.raise_for_status()
+        raw = response.json()["choices"][0]["message"]["content"] or "{}"
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "model returned invalid JSON", "raw": raw}
+
+    try:
+        score = max(0, min(10, int(data.get("score"))))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "model returned invalid score"}
+
+    return {
+        "ok": True,
+        "score": score,
+        "verdict": str(data.get("verdict") or "").strip(),
+        "reasoning": str(data.get("reasoning") or "").strip(),
+    }
 
 
 def _prune_history_locked():
@@ -854,6 +1006,7 @@ def create_request():
     # reviewer can sanity-check the context before approving.
     client_profile = body.get("client_profile") or {}
     fake_profile = body.get("fake_profile") or {}
+    messages = body.get("messages") or []
     if not reply.strip():
         return jsonify({"error": "reply is required"}), 400
 
@@ -863,6 +1016,16 @@ def create_request():
     reply_en = _translate_de_en(reply)
     customer_message_en = _translate_de_en(customer_message) if customer_message else None
     last_message_en = _translate_de_en(last_message) if last_message else None
+
+    # Meeting-alert analyzer: advisory only, never affects auto/manual routing
+    # -- just a warning banner + a running conversation read for whoever ends
+    # up looking at this request.
+    alert_result = _analyze_meeting_alert(messages)
+    meeting_alert_requested = alert_result.get("requested", False) if alert_result["ok"] else False
+    meeting_alert_reason = alert_result.get("reason") if alert_result["ok"] else alert_result.get("error")
+    conversation_tone = alert_result.get("tone", "") if alert_result["ok"] else ""
+    conversation_direction = alert_result.get("direction", "") if alert_result["ok"] else ""
+    conversation_client_expectation = alert_result.get("client_expectation", "") if alert_result["ok"] else ""
 
     with _lock:
         # A platform's own override (set on /bots) wins over the dashboard's
@@ -893,6 +1056,30 @@ def create_request():
             if result["contains_meeting"] and result["reply"]:
                 final_reply = result["reply"]
 
+    # Judge AI: a second opinion, scored against the conversation and both
+    # profiles, on every reply reaching the queue (auto or manual) so the
+    # dashboard can always show a score pill. In auto mode, only a perfect
+    # 10 is allowed through -- anything else (including a failed judge call)
+    # falls back to manual review, same fail-safe pattern as the meeting
+    # guard above.
+    judge_result = _judge_reply(
+        platform=platform,
+        last_message=last_message,
+        customer_message=customer_message,
+        client_profile=client_profile,
+        fake_profile=fake_profile,
+        reply=final_reply,
+    )
+    judge_score = judge_result.get("score") if judge_result["ok"] else None
+    judge_verdict = judge_result.get("verdict") if judge_result["ok"] else None
+    judge_reasoning = judge_result.get("reasoning") if judge_result["ok"] else judge_result.get("error")
+    if auto and judge_score != 10:
+        if judge_result["ok"]:
+            print(f"[Judge] {platform} reply scored {judge_score}/10 — holding for manual review")
+        else:
+            print(f"[Judge] OpenRouter check failed for {platform} — holding for manual review: {judge_result.get('error')}")
+        auto = False
+
     req_id = str(uuid.uuid4())
     with _lock:
         now = _now()
@@ -918,6 +1105,14 @@ def create_request():
             "auto": auto,
             "meeting_guard": meeting_guard,
             "contains_meeting": contains_meeting,
+            "judge_score": judge_score,
+            "judge_verdict": judge_verdict,
+            "judge_reasoning": judge_reasoning,
+            "meeting_alert_requested": meeting_alert_requested,
+            "meeting_alert_reason": meeting_alert_reason,
+            "conversation_tone": conversation_tone,
+            "conversation_direction": conversation_direction,
+            "conversation_client_expectation": conversation_client_expectation,
             "_seq": next(_order),
         }
         _prune_history_locked()
@@ -1667,6 +1862,12 @@ _PAGE = """<!doctype html>
   .guard-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 2px; flex-wrap: wrap; }
   .guard-row .test-label { color: var(--muted-foreground); font-size: 12px; }
   .pill.unchecked { background: var(--accent); color: var(--muted-foreground); }
+  .judge-reasoning { font-size: 12px; color: var(--muted-foreground); margin: 0 0 10px; }
+  .meeting-alert-banner { display: flex; align-items: flex-start; gap: 10px; border: 2px solid var(--destructive); background: rgba(239,68,68,.12); border-radius: 12px; padding: 10px 14px; margin: 0 0 12px; }
+  .meeting-alert-banner .title { font-size: 11px; font-weight: 700; color: var(--destructive); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 2px; }
+  .meeting-alert-banner .reason { font-size: 12px; color: var(--destructive); }
+  .conversation-analysis { display: flex; flex-direction: column; gap: 3px; background: var(--accent); border-radius: 10px; padding: 8px 12px; margin: 0 0 12px; font-size: 12px; color: var(--muted-foreground); }
+  .conversation-analysis .ca-label { font-weight: 700; color: var(--foreground); margin-right: 6px; }
   .changed-label { color: var(--warning) !important; }
 
   .field-label {
@@ -2839,6 +3040,50 @@ function extractedDataHtml(r) {
   `;
 }
 
+// Judge AI score pill + reasoning, shared by pending and auto-pilot cards.
+function judgeRowHtml(r) {
+  if (r.judge_score === null || r.judge_score === undefined) return "";
+  const cls = r.judge_score === 10 ? "yes" : (r.judge_score >= 7 ? "action-procrastinate" : "action-decline");
+  return `
+    <div class="guard-row">
+      <span class="test-label">Judge score</span>
+      <span class="pill ${cls}">${r.judge_score}/10${r.judge_verdict ? " · " + escapeHtml(r.judge_verdict) : ""}</span>
+    </div>
+    ${r.judge_reasoning ? `<div class="judge-reasoning">${escapeHtml(r.judge_reasoning)}</div>` : ""}
+  `;
+}
+
+// Advisory-only: the CLIENT (not the fake account) pushed for a real
+// meeting, phone number, or off-platform contact somewhere in the
+// conversation. Never blocks anything -- just a heads-up for whoever reviews
+// this card.
+function meetingAlertBannerHtml(r) {
+  if (!r.meeting_alert_requested) return "";
+  return `
+    <div class="meeting-alert-banner">
+      <span>⚠️</span>
+      <div>
+        <div class="title">Meeting / contact request detected</div>
+        <div class="reason">${escapeHtml(r.meeting_alert_reason || "")}</div>
+      </div>
+    </div>
+  `;
+}
+
+// Advisory-only: a running read on the conversation as a whole -- tone,
+// where it's heading, and what the client seems to expect from it. Shown
+// even when no alert fired, since it's useful context on every reply.
+function conversationAnalysisHtml(r) {
+  if (!r.conversation_tone && !r.conversation_direction && !r.conversation_client_expectation) return "";
+  return `
+    <div class="conversation-analysis">
+      ${r.conversation_tone ? `<div><span class="ca-label">Tone</span> ${escapeHtml(r.conversation_tone)}</div>` : ""}
+      ${r.conversation_direction ? `<div><span class="ca-label">Direction</span> ${escapeHtml(r.conversation_direction)}</div>` : ""}
+      ${r.conversation_client_expectation ? `<div><span class="ca-label">Client expects</span> ${escapeHtml(r.conversation_client_expectation)}</div>` : ""}
+    </div>
+  `;
+}
+
 function pendingCardHtml(r) {
   const val = editedReplies.has(r.id) ? editedReplies.get(r.id) : r.reply;
   const pc = colorFor(r.platform);
@@ -2852,6 +3097,8 @@ function pendingCardHtml(r) {
         ${r.reply_type ? `<span class="pill ${r.reply_type === "ASA Follow-up" ? "type-asa" : "type-dia"}">${escapeHtml(r.reply_type)}</span>` : ""}
         <span class="time">${timeAgo(r.created_at)}</span>
       </div>
+      ${meetingAlertBannerHtml(r)}
+      ${conversationAnalysisHtml(r)}
       ${lastMessage ? `
         <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
         <div class="de-box">${escapeHtml(lastMessage)}</div>
@@ -2869,6 +3116,7 @@ function pendingCardHtml(r) {
         <span class="lang-tag tag-en">EN</span>
         <span class="en-box">${r.reply_en ? escapeHtml(r.reply_en) : "(translation unavailable)"}</span>
       </div>
+      ${judgeRowHtml(r)}
       ${extractedDataHtml(r)}
       <div class="actions">
         <button class="btn-approve" onclick="approveCard('${r.id}', this)">Approve &amp; Send</button>
@@ -2899,6 +3147,8 @@ function autoCardHtml(r) {
         <span class="status-badge ${r.status}">${r.status}</span>
         <span class="time">${timeAgo(r.decided_at || r.created_at)}</span>
       </div>
+      ${meetingAlertBannerHtml(r)}
+      ${conversationAnalysisHtml(r)}
       ${lastMessage ? `
         <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
         <div class="de-box">${escapeHtml(lastMessage)}</div>
@@ -2923,6 +3173,7 @@ function autoCardHtml(r) {
           : `<span class="pill ${detected}">${detected === "yes" ? "Yes" : "No"}</span>`}
         ${r.meeting_guard ? `<span class="pill action-${escapeHtml(r.meeting_guard)}">${escapeHtml(actionLabel)}</span>` : ""}
       </div>
+      ${judgeRowHtml(r)}
       ${changed ? `
         <div class="card-divider"></div>
         <div class="field-label changed-label">Guard changed it to <span class="lang-tag tag-de">DE · sent</span></div>

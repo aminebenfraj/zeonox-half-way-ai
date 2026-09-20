@@ -133,6 +133,7 @@ async def request_approval(
     reply_type: str = "",
     client_profile: dict | None = None,
     fake_profile: dict | None = None,
+    messages: list[dict] | None = None,
     timeout: float = 20.0,
     chat_still_active: Callable[[], Awaitable[bool]] | None = None,
     chat_check_interval: float = 6.0,
@@ -163,6 +164,7 @@ async def request_approval(
                 "reply_type": reply_type,
                 "client_profile": client_profile or {},
                 "fake_profile": fake_profile or {},
+                "messages": messages or [],
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             },
         )

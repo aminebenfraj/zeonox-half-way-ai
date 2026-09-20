@@ -89,11 +89,24 @@ def normalize_chameleon_data(raw: dict) -> dict:
                 if last_customer:
                     break
 
+    # Normalized transcript for the meeting-alert analyzer -- which side sent
+    # each message matters more than anything else there (see
+    # approval_server.py's _analyze_meeting_alert), so resolve it once here.
+    normalized_messages = [
+        {
+            "sender": "client" if _is_customer(message) else "fake_account",
+            "text": _message_text(message),
+        }
+        for message in messages
+        if isinstance(message, dict) and _message_text(message)
+    ]
+
     return {
         "last_message": last_message,
         "last_customer_message": last_customer,
         "client_profile": _flatten_profile(raw.get("client") or raw.get("client_information")),
         "fake_profile": _flatten_profile(raw.get("fake_account")),
+        "messages": normalized_messages,
     }
 
 
@@ -104,6 +117,7 @@ async def read_extracted_data(tab2, timeout_ms: int = 5_000) -> dict:
         "last_customer_message": "",
         "client_profile": {},
         "fake_profile": {},
+        "messages": [],
     }
     try:
         json_button = tab2.get_by_role("button", name="JSON", exact=True)

@@ -549,7 +549,8 @@ class JustloBot:
 
     async def _get_approved_reply(self, tab1, tab2, reply_type: str = "", last_message: str = "",
                                    customer_message: str = "",
-                                   client_profile: dict | None = None, fake_profile: dict | None = None) -> tuple[str, str]:
+                                   client_profile: dict | None = None, fake_profile: dict | None = None,
+                                   messages: list[dict] | None = None) -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
@@ -572,6 +573,7 @@ class JustloBot:
                 last_message=last_message,
                 customer_message=customer_message,
                 client_profile=client_profile, fake_profile=fake_profile,
+                messages=messages,
                 chat_still_active=lambda: self._chat_still_active(tab1),
             )
             if approved:
@@ -1102,6 +1104,7 @@ class JustloBot:
                             tab1, tab2, reply_type,
                             extracted["last_message"], extracted["last_customer_message"],
                             extracted["client_profile"], extracted["fake_profile"],
+                            extracted["messages"],
                         )
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
