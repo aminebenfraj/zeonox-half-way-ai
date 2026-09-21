@@ -1805,6 +1805,13 @@ _PAGE = """<!doctype html>
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
     padding: 14px 16px;
   }
+  .stat-card.actionable {
+    width: 100%; color: inherit; font: inherit; text-align: left; cursor: pointer;
+    transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+  }
+  .stat-card.actionable:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--warning); }
+  .stat-card.actionable:focus-visible { outline: 2px solid var(--warning); outline-offset: 2px; }
+  .stat-card.actionable:disabled { cursor: default; opacity: .65; }
   .stat-card .label { font-size: 12px; color: var(--muted-foreground); margin-bottom: 6px; }
   .stat-card .value { font-size: 24px; font-weight: 650; letter-spacing: -.02em; }
   .stat-card.warn .value { color: var(--warning); }
@@ -1842,6 +1849,11 @@ _PAGE = """<!doctype html>
     border-left-color: color-mix(in srgb, var(--pc, var(--border)) 70%, var(--border));
     border-radius: var(--radius);
     padding: 16px 18px; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+  }
+  .card.review-target { animation: review-target-pulse 1.4s ease-out; }
+  @keyframes review-target-pulse {
+    0%, 35% { border-color: var(--warning); box-shadow: 0 0 0 4px rgba(234,179,8,.24), 0 14px 36px rgba(0,0,0,.28); }
+    100% { box-shadow: 0 1px 2px rgba(0,0,0,.25); }
   }
   .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
   .badge {
@@ -2080,8 +2092,9 @@ _PAGE = """<!doctype html>
     #mobileBar .mobile-pending {
       margin-left: auto; min-width: 0; max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       font-size: 12px; font-weight: 700; color: var(--warning);
-      background: rgba(234,179,8,.15); border-radius: 999px; padding: 3px 10px;
+      background: rgba(234,179,8,.15); border: 0; border-radius: 999px; padding: 3px 10px; cursor: pointer;
     }
+    #mobileBar .mobile-pending:disabled { cursor: default; opacity: .65; }
 
     #sidebar {
       position: fixed; top: 0; bottom: 0; left: 0; z-index: 50; width: min(84vw, 300px);
@@ -2317,7 +2330,7 @@ _PAGE = """<!doctype html>
   <button id="hamburger" onclick="toggleDrawer()" aria-label="Toggle platform menu" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
   <span class="brand-dot"></span>
   <span class="brand-text">Chat Approval</span>
-  <span class="mobile-pending" id="mobilePendingBadge">0 pending</span>
+  <button type="button" class="mobile-pending" id="mobilePendingBadge" onclick="goToPendingReview()" disabled>0 pending</button>
 </header>
 <div id="backdrop" onclick="closeDrawer()" aria-hidden="true"></div>
 
@@ -2385,7 +2398,7 @@ _PAGE = """<!doctype html>
   </div>
 
   <div class="stats">
-    <div class="stat-card warn"><div class="label">Pending review</div><div class="value" id="statPending">0</div></div>
+    <button type="button" class="stat-card warn actionable" id="pendingReviewCard" onclick="goToPendingReview()" disabled aria-label="Open the next pending approval"><div class="label">Pending review</div><div class="value" id="statPending">0</div></button>
     <div class="stat-card ok"><div class="label">Sent today</div><div class="value" id="statSent">0</div></div>
     <div class="stat-card bad"><div class="label">Rejected today</div><div class="value" id="statRejected">0</div></div>
     <div class="stat-card"><div class="label">Platforms active</div><div class="value" id="statPlatforms">0</div></div>
@@ -2482,6 +2495,24 @@ function goToSection(name) {
   document.getElementById(slug(name)).scrollIntoView({ behavior: "smooth", block: "start" });
   closeDrawer();
 }
+
+function goToPendingReview() {
+  const card = nextPendingReviewId
+    ? document.getElementById(`approval-${nextPendingReviewId}`)
+    : document.querySelector("#sections .card[data-id]");
+  if (!card) {
+    toast("No approvals are waiting", { type: "info", duration: 2200 });
+    return;
+  }
+  closeDrawer();
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  card.setAttribute("tabindex", "-1");
+  card.focus({ preventScroll: true });
+  card.classList.remove("review-target");
+  void card.offsetWidth;
+  card.classList.add("review-target");
+  window.setTimeout(() => card.classList.remove("review-target"), 1500);
+}
 const slug = (s) => "plat-" + (s || "unknown").toLowerCase().replace(/[^a-z0-9]+/g, "-");
 
 // Edits the reviewer has typed are kept here (keyed by request id) so a
@@ -2504,6 +2535,7 @@ let apiKeyHealthState = [];
 let serviceWorkerRegistration = null;
 let currentPushSubscription = null;
 let pushConfigured = false;
+let nextPendingReviewId = null;
 
 // --- Notification sound: chimes whenever a new chat starts waiting for approval. ---
 let soundEnabled = localStorage.getItem("approvalSoundEnabled") !== "0";
@@ -3304,6 +3336,9 @@ function autoCardHtml(r) {
 }
 
 function renderSections(pending, autoByPlatform) {
+  // Snapshots arrive newest-first. Review the oldest request first so no card
+  // can remain buried while newer approvals continue to arrive.
+  nextPendingReviewId = pending.length ? pending[pending.length - 1].id : null;
   const byPlatform = new Map();
   for (const r of pending) {
     if (!byPlatform.has(r.platform)) byPlatform.set(r.platform, []);
@@ -3378,7 +3413,14 @@ function renderSections(pending, autoByPlatform) {
 
   document.getElementById("statPending").textContent = pending.length;
   document.getElementById("statPlatforms").textContent = byPlatform.size;
-  document.getElementById("mobilePendingBadge").textContent = `${pending.length} pending`;
+  const pendingReviewCard = document.getElementById("pendingReviewCard");
+  pendingReviewCard.disabled = !pending.length;
+  pendingReviewCard.setAttribute("aria-label", pending.length
+    ? `Open the oldest of ${pending.length} pending approvals`
+    : "No pending approvals");
+  const mobilePendingBadge = document.getElementById("mobilePendingBadge");
+  mobilePendingBadge.textContent = `${pending.length} pending`;
+  mobilePendingBadge.disabled = !pending.length;
 
   // Drop edit-buffers for requests that are no longer pending (decided elsewhere).
   const stillPending = new Set(pending.map(r => r.id));

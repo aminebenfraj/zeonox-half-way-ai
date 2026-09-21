@@ -67,8 +67,20 @@ def _parse_counter(value: object) -> int | None:
 
 
 def _parse_xkuss_ins(text: str) -> int | None:
-    match = re.search(r"\bINs?\b\s*:\s*(\d[\d\s.,]*)", text or "", re.I)
-    return _parse_counter(match.group(1)) if match else None
+    """Return Xkuss's INS counter from the navbar in/out link.
+
+    Older markup exposed a literal ``INs: 97`` label.  The current navbar uses
+    icon-font spans with no textual label, so Playwright sees ``: 97 : 161``.
+    INS is the first number in that link; the second counter is not part of the
+    Check-in All calculation.
+    """
+    text = (text or "").replace("\xa0", " ")
+    labelled = re.search(r"\bINs?\b\s*:\s*(\d[\d\s.,]*)", text, re.I)
+    if labelled:
+        return _parse_counter(labelled.group(1))
+
+    first_counter = re.search(r"(?<!\d)(\d{1,3}(?:[\s.,]\d{3})*|\d+)(?!\d)", text)
+    return _parse_counter(first_counter.group(1)) if first_counter else None
 
 
 def _load_state() -> dict | None:
@@ -222,7 +234,9 @@ def _build_note(rows: list[dict]) -> str:
 
 
 async def _xkuss_ins(page) -> int | None:
-    link = page.locator("a.admein[href*='oldview_inout.php']")
+    # The live Xkuss navbar link does not consistently carry the old
+    # ``admein`` class.  Its href is the stable identifier.
+    link = page.locator("a[href*='oldview_inout.php']")
     if await link.count() == 0:
         return None
     text = await link.first.inner_text()
