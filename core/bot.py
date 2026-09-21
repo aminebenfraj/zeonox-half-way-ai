@@ -520,6 +520,7 @@ class ChatBot:
         if not flag.exists():
             return
         self.log("[PAUSE] Paused — waiting for 'resume'...")
+        await report_status(self.cfg.platform, "paused", "Paused from the dashboard", checkpoint="paused")
         while flag.exists():
             await asyncio.sleep(1)
         self.log("[PAUSE] Resumed — continuing.")

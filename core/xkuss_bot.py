@@ -47,6 +47,7 @@ from core.bot import (
     log_sent_message,
     contains_banned_language,
     _wait_for_scrape_layout,
+    pause_flag_path,
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
@@ -146,6 +147,16 @@ class XkussBot:
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}][{self.cfg.platform}] {msg}", flush=True)
+
+    async def _wait_while_paused(self):
+        flag = pause_flag_path(self.cfg.platform)
+        if not flag.exists():
+            return
+        self.log("[PAUSE] Paused — waiting for resume...")
+        await report_status(self.cfg.platform, "paused", "Paused from the dashboard", checkpoint="paused")
+        while flag.exists():
+            await asyncio.sleep(1)
+        self.log("[PAUSE] Resumed — continuing.")
 
     async def _detect_phase(self, tab1, *, force_log: bool = False) -> str:
         """Classify tab1's phase and log it whenever it changes.
@@ -553,6 +564,7 @@ class XkussBot:
         last_rehome  = t_start
         last_reload  = t_start
         while True:
+            await self._wait_while_paused()
             state = await self._detect_phase(tab1)
             if state == PAGE_CHAT:
                 self.log(f"Dialog received! (waited {asyncio.get_event_loop().time() - t_start:.0f}s)")
@@ -665,6 +677,8 @@ class XkussBot:
         wait = random.randint(15, 20)
         self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
         await asyncio.sleep(wait)
+        # A pause toggled during the human-like delay must prevent the send.
+        await self._wait_while_paused()
 
         try:
             send_btn = tab1.locator(self.cfg.sel_send_btn)
@@ -782,6 +796,7 @@ class XkussBot:
 
             while True:
                 try:
+                    await self._wait_while_paused()
                     cycle += 1
                     t_cycle = asyncio.get_event_loop().time()
                     self.log(f"──── Cycle {cycle} ────")

@@ -36,6 +36,7 @@ from importlib import import_module
 
 from flask import Flask, jsonify, request
 from playwright.async_api import async_playwright
+from core.bot import pause_flag_path
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp, ensure_approval_server, CONTROL_SERVER_PORT
 from core.login import login_mod_site, login_chameleon, check_chameleon, force_extractor_tab, check_stats
 
@@ -96,6 +97,8 @@ _HELP = (
     "  status                    — show all bot statuses\n"
     "  stop  [platform|all]      — stop one or all bots\n"
     "  restart [platform|all]    — restart one or all bots\n"
+    "  pause [platform|all]      — pause one or all bots at a safe checkpoint\n"
+    "  resume [platform|all]     — resume one or all paused bots\n"
     "  chameleon [platform|all]  — check if Chameleon tab is on the right page\n"
     "  extractor [platform|all]  — force-activate the Chat Extractor tab\n"
     "  fix [platform|all]        — full Chameleon re-setup: navigate + login + select chat + extractor tab\n"
@@ -256,6 +259,10 @@ def _launch_bot(platform: str) -> subprocess.Popen:
 
 def run_bots():
     """Launch all bots as subprocesses with smart restart on crash."""
+    # A fresh launch must never inherit pause flags from an earlier session.
+    for name in PLATFORMS:
+        pause_flag_path(name).unlink(missing_ok=True)
+
     procs:        dict[str, subprocess.Popen] = {name: _launch_bot(name) for name in PLATFORMS}
     start_times:  dict[str, float]            = {name: time.time()        for name in PLATFORMS}
     crash_counts: dict[str, int]              = {name: 0                  for name in PLATFORMS}
@@ -283,7 +290,7 @@ def run_bots():
         React platform at all (launched or not — checkins just connects over
         CDP directly) for checkins. Returns (valid_names, options_list) —
         options_list is what to show in an 'unknown platform' message."""
-        if cmd in ("stop", "restart"):
+        if cmd in ("stop", "restart", "pause", "resume"):
             targets = PLATFORMS if target == "all" else [target]
             return [n for n in targets if n in procs], PLATFORMS
         if cmd in ("chameleon", "extractor", "fix"):
@@ -302,6 +309,8 @@ def run_bots():
             elif procs[name].poll() is None:
                 uptime = int(time.time() - start_times[name])
                 st = f"RUNNING   uptime={uptime}s   crashes={crash_counts[name]}"
+                if pause_flag_path(name).exists():
+                    st += "   [PAUSED]"
             else:
                 st = f"DEAD (exit code {procs[name].poll()})"
             color = _COLORS.get(name, "")
@@ -326,6 +335,16 @@ def run_bots():
             procs[name]        = _launch_bot(name)
             start_times[name]  = time.time()
             print(f"[Launcher] {name.upper()} restarted.", flush=True)
+
+    def _cmd_pause(valid):
+        for name in valid:
+            pause_flag_path(name).touch()
+            print(f"[Launcher] {name.upper()} paused.", flush=True)
+
+    def _cmd_resume(valid):
+        for name in valid:
+            pause_flag_path(name).unlink(missing_ok=True)
+            print(f"[Launcher] {name.upper()} resumed.", flush=True)
 
     def _cmd_chameleon(valid):
         async def _check_all(names):
@@ -466,6 +485,7 @@ def run_bots():
     # command and a dashboard button click run through the exact same code.
     _PER_TARGET_CMDS = {
         "stop": _cmd_stop, "restart": _cmd_restart, "chameleon": _cmd_chameleon,
+        "pause": _cmd_pause, "resume": _cmd_resume,
         "extractor": _cmd_extractor, "fix": _cmd_fix,
         "checkins": _cmd_checkins, "checkin": _cmd_checkins, "ins": _cmd_checkins,
     }
@@ -532,6 +552,7 @@ def run_bots():
                     "state": "running",
                     "uptime": int(time.time() - start_times[name]),
                     "crashes": crash_counts[name],
+                    "paused": pause_flag_path(name).exists(),
                 }
             else:
                 platforms[name] = {"state": "dead", "exit_code": proc.poll()}

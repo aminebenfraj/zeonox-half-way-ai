@@ -59,6 +59,7 @@ from core.bot import (
     log_sent_message,
     contains_banned_language,
     _wait_for_scrape_layout,
+    pause_flag_path,
 )
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
@@ -215,6 +216,16 @@ class JustloBot:
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}][{self.cfg.platform}] {msg}", flush=True)
+
+    async def _wait_while_paused(self):
+        flag = pause_flag_path(self.cfg.platform)
+        if not flag.exists():
+            return
+        self.log("[PAUSE] Paused — waiting for resume...")
+        await report_status(self.cfg.platform, "paused", "Paused from the dashboard", checkpoint="paused")
+        while flag.exists():
+            await asyncio.sleep(1)
+        self.log("[PAUSE] Resumed — continuing.")
 
     async def _detect_phase(self, tab1, *, force_log: bool = False) -> str:
         """Classify tab1's phase and log it whenever it changes."""
@@ -660,6 +671,7 @@ class JustloBot:
         last_recover = t_start
         last_replay = t_start
         while True:
+            await self._wait_while_paused()
             state = await self._detect_phase(tab1)
             if state == PAGE_CHAT:
                 sig = await self._conversation_sig(tab1)
@@ -777,6 +789,7 @@ class JustloBot:
 
     async def _click_anstupsen(self, tab1):
         """Press 'Anstupsen' to nudge the client (used for ASA 2 / ASA 3)."""
+        await self._wait_while_paused()
         self.log("[ASA] ASA 2/3 reminder — clicking 'Anstupsen' (no reply generated).")
         btn = tab1.locator(self.cfg.sel_anstupsen_btn)
         await btn.scroll_into_view_if_needed()
@@ -808,6 +821,7 @@ class JustloBot:
         when nobody else is available and Überspringen succeeds, or ``None``
         if the platform action fails.
         """
+        await self._wait_while_paused()
         self.log("[FC] Clicking 'Übergeben' to hand the dialog to another moderator...")
         try:
             await tab1.bring_to_front()
@@ -898,6 +912,8 @@ class JustloBot:
         wait = random.randint(15, 20)
         self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
         await asyncio.sleep(wait)
+        # A pause toggled during the human-like delay must prevent the send.
+        await self._wait_while_paused()
 
         try:
             send_btn = tab1.locator(self.cfg.sel_send_btn)
@@ -1013,6 +1029,7 @@ class JustloBot:
 
             while True:
                 try:
+                    await self._wait_while_paused()
                     cycle += 1
                     t_cycle = asyncio.get_event_loop().time()
                     self.log(f"──── Cycle {cycle} ────")

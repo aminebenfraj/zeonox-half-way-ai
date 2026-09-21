@@ -2030,6 +2030,9 @@ _PAGE = """<!doctype html>
   .system-ctrl-sub { color: var(--muted-foreground); font-size: 12px; }
   .system-ctrl-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
   .btn-money { background: var(--warning); color: #1c1500; }
+  .btn-pause { background: var(--primary); color: #fff; }
+  .btn-pause.paused { background: var(--success); color: #052e16; }
+  .btn-pause:disabled { opacity: .55; cursor: default; }
   .system-ctrl-status { color: var(--muted-foreground); font-size: 12.5px; }
   .ctrl-unavailable {
     color: var(--muted-foreground); font-size: 12px; background: var(--muted);
@@ -2128,7 +2131,7 @@ _PAGE = """<!doctype html>
 
     .api-health-head { align-items: stretch; }
     .api-health-head > div { min-width: 0; }
-    .btn-api-check, .btn-money { min-height: 44px; }
+    .btn-api-check, .btn-money, .btn-pause { min-height: 44px; }
     .system-ctrl-actions { align-items: stretch; flex-direction: column; }
     .system-ctrl-status { overflow-wrap: anywhere; }
 
@@ -2385,6 +2388,8 @@ _PAGE = """<!doctype html>
       <span class="test-box-sub">Restart/fix individual bots below, or fill the earnings calculator automatically from every live account.</span>
     </div>
     <div class="system-ctrl-actions">
+      <button class="btn-pause" id="globalPauseBtn" onclick="toggleGlobalPause()" disabled>⏸ Pause all bots</button>
+      <span class="system-ctrl-status" id="globalPauseStatus"></span>
       <button class="btn-money" id="checkinAllBtn" onclick="runCheckinAll()">Check-in All Calculator</button>
       <span class="system-ctrl-status" id="checkinAllStatus"></span>
     </div>
@@ -2909,6 +2914,7 @@ const STATE_META = {
   extracting:         { label: "Extracting…",          color: "var(--info)" },
   generating:         { label: "Generating reply…",    color: "var(--violet)" },
   retrying:           { label: "Retrying…",            color: "var(--warning)" },
+  paused:             { label: "Paused",               color: "var(--warning)" },
   approval:           { label: "Awaiting approval",    color: "var(--warning)" },
   awaiting_approval:  { label: "Awaiting approval",    color: "var(--warning)" },
   sending:            { label: "Sending…",              color: "var(--success)" },
@@ -2941,6 +2947,13 @@ function detectorFor(name) {
     const label = process.state === "dead" ? "Process stopped" : "Stopped";
     return { live: false, label, color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "" };
   }
+  if (processRunning && process.paused) {
+    return {
+      live: true, label: "Paused", color: "var(--warning)",
+      detail: "Paused from the dashboard", state: "paused",
+      retryCount: 0, warning: "", checkpoint: "paused",
+    };
+  }
   if (processRunning && !telemetryFresh) {
     return {
       live: true, label: "Running", color: "var(--success)",
@@ -2960,7 +2973,7 @@ function detectorFor(name) {
 
 const WORKFLOW_STEPS = ["Waiting", "Extracting", "Generating", "Retrying", "Approval", "Sending", "Sent"];
 const WORKFLOW_INDEX = {
-  starting: 0, waiting: 0, waiting_for_chat: 0, idle: 0, chat_detected: 1,
+  starting: 0, waiting: 0, waiting_for_chat: 0, idle: 0, paused: 0, chat_detected: 1,
   extracting: 1, generating: 2, retrying: 3, recovering: 3, restarting: 3, error: 3,
   approval: 4, awaiting_approval: 4, sending: 5, sent: 6,
 };
@@ -2999,12 +3012,66 @@ function colorFor(name) {
 // separate name-mapping table is needed here.
 let controlsAvailable = false;
 let checkinAllRunning = false;
+let globalPauseRunning = false;
 let controlPlatformState = {}; // slug -> {state, uptime, crashes, exit_code}
 let botProcessState = {}; // dashboard-managed bot Popen/CDP state from /api/bots/status
 // Last command output per platform, kept here (not just in the DOM) because
 // renderSections() fully rebuilds #sections on every poll — without this the
 // panel would vanish again 1.5s after a command finished.
 let controlOutputs = new Map(); // slug -> output text
+
+function updateGlobalPauseControl() {
+  const btn = document.getElementById("globalPauseBtn");
+  const status = document.getElementById("globalPauseStatus");
+  if (!btn || !status) return;
+  const active = Object.values(controlPlatformState).filter(st => st && st.state === "running");
+  const pausedCount = active.filter(st => st.paused).length;
+  const allPaused = active.length > 0 && pausedCount === active.length;
+  btn.dataset.action = allPaused ? "resume" : "pause";
+  btn.textContent = allPaused ? "▶ Resume all bots" : "⏸ Pause all bots";
+  btn.classList.toggle("paused", allPaused);
+  btn.disabled = globalPauseRunning || !controlsAvailable || !active.length;
+  status.textContent = !controlsAvailable
+    ? "Launcher controls unavailable"
+    : allPaused
+      ? `All ${active.length} bots paused`
+      : pausedCount
+        ? `${pausedCount}/${active.length} bots paused`
+        : `${active.length} bots running`;
+}
+
+async function toggleGlobalPause() {
+  const btn = document.getElementById("globalPauseBtn");
+  if (!btn || btn.disabled) return;
+  const cmd = btn.dataset.action === "resume" ? "resume" : "pause";
+  globalPauseRunning = true;
+  updateGlobalPauseControl();
+  const dismiss = toast(cmd === "pause" ? "Pausing all bots…" : "Resuming all bots…", { type: "info", duration: 0 });
+  try {
+    const res = await fetch("/api/control/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd, target: "all" }),
+    });
+    const data = await res.json().catch(() => ({}));
+    dismiss();
+    if (!res.ok || !data.ok) {
+      toast(`Could not ${cmd} all bots`, { type: "error", detail: data.error || `HTTP ${res.status}` });
+      return;
+    }
+    for (const state of Object.values(controlPlatformState)) {
+      if (state && state.state === "running") state.paused = cmd === "pause";
+    }
+    toast(cmd === "pause" ? "All bots paused" : "All bots resumed", { type: "success", duration: 2800 });
+  } catch (e) {
+    dismiss();
+    toast(`Could not ${cmd} all bots`, { type: "error", detail: "Request failed — check your connection." });
+  } finally {
+    globalPauseRunning = false;
+    updateGlobalPauseControl();
+    refresh();
+  }
+}
 
 const CTRL_BUTTONS = [
   { cmd: "restart",   label: "Restart" },
@@ -3093,7 +3160,7 @@ function ctrlBarHtml(name) {
   let pillHtml = "";
   if (st) {
     const label = st.state === "running"
-      ? `RUNNING ${fmtUptime(st.uptime)}${st.crashes ? ` · ${st.crashes} crash${st.crashes === 1 ? "" : "es"}` : ""}`
+      ? `${st.paused ? "PAUSED" : "RUNNING"} ${fmtUptime(st.uptime)}${st.crashes ? ` · ${st.crashes} crash${st.crashes === 1 ? "" : "es"}` : ""}`
       : st.state === "dead" ? `DEAD (exit ${st.exit_code})` : "STOPPED";
     pillHtml = `<span class="ctrl-status-pill ${escapeHtml(st.state)}">${escapeHtml(label)}</span>`;
   }
@@ -3480,6 +3547,7 @@ function applySnapshot(data) {
     controlPlatformState = data.control.platforms || {};
   }
   if (data.bots) botProcessState = data.bots;
+  updateGlobalPauseControl();
   const checkinBtn = document.getElementById("checkinAllBtn");
   if (checkinBtn) checkinBtn.disabled = checkinAllRunning;
   const unavailNote = document.getElementById("ctrlUnavailableNote");
