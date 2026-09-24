@@ -23,6 +23,22 @@ The launcher starts the approval dashboard automatically. On this PC, open:
 http://127.0.0.1:8799/
 ```
 
+Open `/bots` to start or stop any supported platform individually. Gold,
+Gold2, Gold3, Diamond, Platin, S69, ML, Xkuss, Justlo, Linduu, and Gnoxx all
+use the same lifecycle controls. If only the dashboard is running, starting
+any platform also starts the central launcher automatically.
+
+The dashboard is the control center: Pause/Resume All and the Chameleon Fix,
+Check, and Extractor actions keep working even if the launcher's local control
+port is temporarily unavailable. Bots started from `/bots` use the central
+supervisor so Restart and the full control set remain available afterward.
+
+Open `/api-keys` (or choose **API Keys** in the sidebar) to replace provider
+keys without restarting the dashboard. Saved keys are written to the ignored
+`.env` file and take effect immediately; the page returns only masked key
+suffixes to the browser. **Check all** performs a small live request against
+each configured provider.
+
 To run only the dashboard, double-click `launch_dashboard.bat`.
 
 ## Private phone access with Tailscale
@@ -69,6 +85,10 @@ One-time iPhone setup:
 6. Tap **Allow** on the iPhone permission dialog.
 7. Wait for the `Zenox notifications enabled` test notification.
 
+Turning **Sound** on plays the approval chime immediately. Turning
+**Notifications** on automatically sends a test push to the newly subscribed
+device, so separate test buttons are not needed.
+
 The subscription is saved only on this PC in `.push_subscriptions.json`. The
 VAPID signing key is saved in the ignored `secrets` folder. Do not delete or
 regenerate that key while the phone is subscribed; changing it requires
@@ -101,6 +121,10 @@ by Git. `.env.example` documents every required variable without secrets.
 | `VAPID_PUBLIC_KEY` | Public application-server key used by the phone | generated locally |
 | `VAPID_SUBJECT` | Contact identity included in push signatures | `mailto:` address |
 | `PUSH_SUBSCRIPTIONS_FILE` | Local saved phone subscriptions | `.push_subscriptions.json` |
+| `OPENROUTER_API_KEY` | Judge primary provider | blank |
+| `NVIDIA_API_KEY` | Judge fallback 1 | blank |
+| `GEMINI_API_KEY` | Judge fallback 2 | blank |
+| `BAI_API_KEY` | Judge fallback 3 | blank |
 
 Keep `HOST`, `APPROVAL_SERVER_URL`, and `LAUNCHER_CONTROL_URL` local. The phone
 uses only `TAILSCALE_DASHBOARD_URL`.
@@ -113,9 +137,21 @@ edited before approval.
 
 - **Approve & Send** sends the text currently in the card.
 - **Reject & Regenerate** asks Chameleon to generate another response.
-- **Stop All Bots** stops every managed bot from the dashboard.
+- The Approval Queue shows only platforms whose bot process is currently
+  running. Start stopped platforms from the **Bots** page.
+- **Stop** cancels approvals that the stopped bot can no longer complete, so
+  orphaned cards do not remain in the queue.
 
 If the dashboard is unavailable, bots wait instead of sending without review.
+
+The Judge tries OpenRouter, NVIDIA, Gemini, then B.AI. Network, authentication,
+rate-limit, malformed-response, and model errors move to the next provider.
+If all four fail, the reply stays available for manual review instead of being
+sent automatically.
+
+Dashboard state is delivered over WebSocket while the connection is healthy.
+HTTP polling runs only as a fallback, and slow launcher-status checks run in
+the background so they do not block queue rendering.
 
 ## Useful checks
 

@@ -48,10 +48,29 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-import httpx
-from flask import Flask, jsonify, request, Response
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
+import httpx
+from flask import Flask, jsonify, render_template, request, Response
+from dotenv import set_key
+
+from core.ai_providers import gemini_generate, openai_chat_completion
 from core.launcher import is_cdp_ready
+from core.bot_lifecycle import LauncherClient
+from core.bot import pause_flag_path
+from core.platform_operations import run_browser_operation
+from core.platforms import (
+    KNOWN_PLATFORM_LABELS,
+    PLATFORM_BY_SLUG,
+    PLATFORM_COLORS,
+    PLATFORMS,
+    SELF_MANAGED_PLATFORM_SLUGS,
+    platform_label,
+)
 from prompts import JUDGE_SYSTEM_PROMPT, MEETING_ALERT_SYSTEM_PROMPT
 from core import push_notifications
 
@@ -63,12 +82,6 @@ except ImportError:  # live-push is a nice-to-have — dashboard falls back to H
     Sock = None
     WebSocketClient = None
     ConnectionClosed = Exception
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 try:
     from groq import Groq
@@ -95,27 +108,11 @@ MAX_HISTORY = 300  # decided/sent/failed requests kept for the dashboard's histo
 # standalone without pulling in Playwright configs. A platform name that shows
 # up in a request but isn't in this list still gets its own section — it's
 # just appended after the known ones instead of being dropped.
-KNOWN_PLATFORMS = [
-    "Gold", "Gold2", "Gold3", "Diamond", "Platin", "S69", "ML",
-    "Xkuss", "Justlo", "Linduu", "Gnoxx",
-]
+KNOWN_PLATFORMS = list(KNOWN_PLATFORM_LABELS)
 
 # One accent color per platform (mirrors the ANSI colors launch_all.py/start_all.py
 # already use for terminal output) so a platform is visually identifiable at a
 # glance across the sidebar, badges and section headers.
-PLATFORM_COLORS = {
-    "Gold":    "#f59e0b",  # amber
-    "Gold2":   "#eab308",  # yellow
-    "Gold3":   "#d946ef",  # fuchsia
-    "Diamond": "#22d3ee",  # cyan
-    "Platin":  "#94a3b8",  # slate
-    "S69":     "#ec4899",  # pink
-    "ML":      "#22c55e",  # green
-    "Xkuss":   "#ef4444",  # red
-    "Justlo":  "#3b82f6",  # blue
-    "Linduu":  "#10b981",  # emerald
-    "Gnoxx":   "#0ea5e9",  # sky
-}
 _FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"]
 
 # launch_all.py's control API (restart/stop/fix/checkinall/... as HTTP instead
@@ -125,6 +122,8 @@ _FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"]
 # control panel degrades to "unavailable" rather than erroring (see
 # _control_get()/_control_post() below).
 LAUNCHER_CONTROL_URL = os.environ.get("LAUNCHER_CONTROL_URL", "http://127.0.0.1:8800")
+_BASE_DIR = Path(__file__).resolve().parent
+_launcher_client = LauncherClient(LAUNCHER_CONTROL_URL, _BASE_DIR)
 
 app = Flask(__name__)
 sock = Sock(app) if Sock else None
@@ -197,7 +196,7 @@ _mode = "manual"
 # restart needed, same as the global toggle always worked.
 _mode_overrides: dict[str, str] = {}
 
-SELF_MANAGED_PLATFORMS = ("xkuss", "justlo", "linduu", "gnoxx")
+SELF_MANAGED_PLATFORMS = SELF_MANAGED_PLATFORM_SLUGS
 SKIPPABLE_APPROVAL_PLATFORMS = frozenset(SELF_MANAGED_PLATFORMS)
 
 # ── Bot process management (see /bots) ──────────────────────────────────────
@@ -207,7 +206,6 @@ SKIPPABLE_APPROVAL_PLATFORMS = frozenset(SELF_MANAGED_PLATFORMS)
 # launch_all.py, kept deliberately out of this process; see KNOWN_PLATFORMS
 # above for the same reasoning). React platforms (Gold/Diamond/...) still
 # only start via launch_all.py / Bot Controls, unchanged.
-_BASE_DIR = Path(__file__).resolve().parent
 _SELF_MANAGED_CDP_PORTS = {"xkuss": 9227, "justlo": 9229, "linduu": 9230, "gnoxx": 9231}
 _bot_procs: dict[str, subprocess.Popen] = {}
 
@@ -350,7 +348,7 @@ def _close_platform_chrome(port: int) -> bool:
     return _terminate_process_tree(browser_pid) if browser_pid else False
 
 
-def _bot_status(platform: str) -> dict:
+def _standalone_bot_status(platform: str) -> dict:
     """Best-effort status for one self-managed platform. Distinguishes a bot
     this dashboard started (has a tracked Popen) from one that's merely
     occupying that platform's CDP port some other way (started via
@@ -358,55 +356,107 @@ def _bot_status(platform: str) -> dict:
     launch either way, with an honest reason."""
     proc = _bot_procs.get(platform)
     if proc is not None and proc.poll() is None:
-        return {"running": True, "pid": proc.pid, "managed_by": "dashboard"}
+        return {
+            "running": True,
+            "pid": proc.pid,
+            "managed_by": "dashboard",
+            "paused": pause_flag_path(platform).exists(),
+        }
     if proc is not None:
         _bot_procs.pop(platform, None)  # exited -- stop tracking it as running
     reported_pid = _reported_bot_pid(platform)
     if reported_pid:
-        return {"running": True, "pid": reported_pid, "managed_by": "external"}
+        return {
+            "running": True,
+            "pid": reported_pid,
+            "managed_by": "external",
+            "paused": pause_flag_path(platform).exists(),
+        }
     return {
         "running": False,
         "pid": None,
         "managed_by": None,
+        "paused": False,
         "browser_open": is_cdp_ready(_SELF_MANAGED_CDP_PORTS[platform]),
     }
 
 
 @app.get("/api/bots/status")
 def bots_status():
-    return jsonify({p: _bot_status(p) for p in SELF_MANAGED_PLATFORMS})
+    return jsonify(_all_bot_statuses())
+
+
+def _all_bot_statuses() -> dict[str, dict]:
+    """Return one lifecycle shape for every platform, regardless of owner."""
+    control = _control_status_cached()
+    launcher_states = (control.get("platforms") or {}) if control.get("available") else {}
+    result = {}
+    for platform in PLATFORMS:
+        launcher_state = launcher_states.get(platform.slug)
+        standalone_state = _standalone_bot_status(platform.slug) if platform.self_managed else None
+        if launcher_state is not None and launcher_state.get("state") == "running":
+            result[platform.slug] = {
+                **launcher_state,
+                "running": True,
+                "managed_by": "launcher",
+            }
+        elif standalone_state and standalone_state.get("running"):
+            result[platform.slug] = standalone_state
+        elif launcher_state is not None:
+            result[platform.slug] = {
+                **launcher_state,
+                "running": False,
+                "managed_by": "launcher",
+            }
+        elif platform.self_managed:
+            result[platform.slug] = standalone_state
+        else:
+            result[platform.slug] = {
+                "state": "stopped",
+                "running": False,
+                "pid": None,
+                "managed_by": None,
+            }
+    return result
 
 
 @app.post("/api/bots/<platform>/start")
 def bots_start(platform):
     platform = platform.strip().lower()
-    if platform not in SELF_MANAGED_PLATFORMS:
-        return jsonify({"ok": False, "error": f"platform must be one of {SELF_MANAGED_PLATFORMS}"}), 400
-    status = _bot_status(platform)
+    if platform not in PLATFORM_BY_SLUG:
+        return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
+    status = _all_bot_statuses()[platform]
     if status["running"]:
         return jsonify({"ok": False, "error": f"{platform} is already running ({status['managed_by']})"}), 409
-    # Give it its own visible console instead of swallowing stdout/stderr --
-    # every bot already logs its every step verbosely (self.log(...) calls
-    # throughout core/xkuss_bot.py / core/justlo_bot.py), so this is how you
-    # actually see what it's doing / why it's stuck, same as running
-    # `python run_bot.py <platform>` in a terminal yourself.
-    popen_kwargs = {}
-    if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-    proc = subprocess.Popen(
-        [sys.executable, "-u", str(_BASE_DIR / "run_bot.py"), platform],
-        cwd=str(_BASE_DIR),
-        **popen_kwargs,
-    )
-    _bot_procs[platform] = proc
-    return jsonify({"ok": True, "pid": proc.pid})
+    control = _control_status_cached()
+    if control.get("available"):
+        data, status_code = _launcher_client.command("start", platform)
+        return jsonify(data), status_code
+
+    try:
+        proc = _launcher_client.spawn(platform)
+    except RuntimeError as error:
+        return jsonify({"ok": False, "error": str(error)}), 409
+    return jsonify({"ok": True, "starting": True, "pid": proc.pid}), 202
 
 
 @app.post("/api/bots/<platform>/stop")
 def bots_stop(platform):
     platform = platform.strip().lower()
+    if platform not in PLATFORM_BY_SLUG:
+        return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
+
+    status = _all_bot_statuses()[platform]
+    control = _control_status_cached()
+    if control.get("available") and status.get("managed_by") == "launcher":
+        data, status_code = _launcher_client.command("stop", platform)
+        if not data.get("ok"):
+            return jsonify(data), status_code
+        _cancel_pending_for_platform(platform, "Bot stopped")
+        return jsonify(data), status_code
+
     if platform not in SELF_MANAGED_PLATFORMS:
-        return jsonify({"ok": False, "error": f"platform must be one of {SELF_MANAGED_PLATFORMS}"}), 400
+        return jsonify({"ok": True, "already_stopped": True})
 
     port = _SELF_MANAGED_CDP_PORTS[platform]
     proc = _bot_procs.get(platform)
@@ -427,28 +477,7 @@ def bots_stop(platform):
     _bot_procs.pop(platform, None)
     browser_stopped = _close_platform_chrome(port)
 
-    label = next(p for p in SELF_MANAGED_PLATFORMS if p == platform).capitalize()
-    now = _now()
-    with _lock:
-        # A stopped bot cannot complete an approval. Remove its cards from the
-        # actionable queue instead of leaving permanent orphan approvals.
-        for item in _requests.values():
-            if (
-                (item.get("platform") or "").strip().lower() == platform
-                and item.get("status") in ("pending", "skip_requested")
-            ):
-                item["status"] = "cancelled"
-                item["decided_at"] = now
-        _status[label] = {
-            "state": "stopped",
-            "detail": "Bot and browser stopped",
-            "retry_count": 0,
-            "warning": "",
-            "checkpoint": "stopped",
-            "pid": None,
-            "updated_at": now,
-        }
-    _bump_state()
+    _cancel_pending_for_platform(platform, "Bot and browser stopped")
 
     if not worker_stopped or not browser_stopped:
         failed = []
@@ -469,13 +498,53 @@ def bots_stop(platform):
     })
 
 
+def _cancel_pending_for_platform(platform: str, detail: str) -> None:
+    """Remove approvals that a stopped worker can no longer complete."""
+    label = platform_label(platform)
+    now = _now()
+    with _lock:
+        for item in _requests.values():
+            if (
+                (item.get("platform") or "").strip().lower() == platform
+                and item.get("status") in ("pending", "skip_requested")
+            ):
+                item["status"] = "cancelled"
+                item["decided_at"] = now
+        _status[label] = {
+            "state": "stopped",
+            "detail": detail,
+            "retry_count": 0,
+            "warning": "",
+            "checkpoint": "stopped",
+            "pid": None,
+            "updated_at": now,
+        }
+    _bump_state()
+
+
 # Translation calls use the configured Groq account first and OpenRouter as a
 # provider-level fallback. Keep them on a bounded worker thread so an upstream
 # outage never stalls a bot cycle indefinitely.
 _translate_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="translate")
+_judge_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="judge")
 
 GROQ_TRANSLATION_MODEL = os.environ.get("GROQ_TRANSLATION_MODEL", "openai/gpt-oss-120b")
 OPENROUTER_TRANSLATION_MODEL = os.environ.get("OPENROUTER_TRANSLATION_MODEL", "openai/gpt-4o")
+OPENROUTER_JUDGE_MODEL = os.environ.get(
+    "OPENROUTER_MODEL", "cognitivecomputations/dolphin-mistral-24b-venice-edition"
+)
+NVIDIA_JUDGE_MODEL = os.environ.get("NVIDIA_MODEL", "deepseek-ai/deepseek-v4.1-flash")
+GEMINI_JUDGE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+BAI_JUDGE_MODEL = os.environ.get("BAI_MODEL", "gpt-6-luna")
+
+API_PROVIDER_SPECS = (
+    ("groq", "Groq", "GROQ_API_KEY", GROQ_TRANSLATION_MODEL, "Translation and meeting checks"),
+    ("openrouter", "OpenRouter", "OPENROUTER_API_KEY", OPENROUTER_JUDGE_MODEL, "Judge primary"),
+    ("nvidia", "NVIDIA", "NVIDIA_API_KEY", NVIDIA_JUDGE_MODEL, "Judge fallback 1"),
+    ("gemini", "Gemini", "GEMINI_API_KEY", GEMINI_JUDGE_MODEL, "Judge fallback 2"),
+    ("bai", "B.AI", "BAI_API_KEY", BAI_JUDGE_MODEL, "Judge fallback 3"),
+)
+API_PROVIDER_BY_NAME = {item[0]: item for item in API_PROVIDER_SPECS}
 _TRANSLATION_SYSTEM_PROMPT = (
     "Translate the user's German text into natural English. Preserve meaning, "
     "tone, names, emojis, paragraph breaks, and punctuation. Return only the "
@@ -489,6 +558,9 @@ _api_health_lock = threading.Lock()
 _api_health: dict[str, dict] = {
     "groq": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
     "openrouter": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
+    "nvidia": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
+    "gemini": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
+    "bai": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
 }
 
 
@@ -537,7 +609,23 @@ def _record_api_failure(provider: str, error: Exception) -> None:
         cooldown_until = time.time() + _retry_after_seconds(error)
         detail = "Rate limit reached"
     else:
-        detail = f"HTTP {status_code}" if status_code else str(error).strip()[:160]
+        provider_message = ""
+        if response is not None:
+            try:
+                payload = response.json()
+                raw_error = payload.get("error") if isinstance(payload, dict) else None
+                if isinstance(raw_error, dict):
+                    provider_message = str(raw_error.get("message") or raw_error.get("detail") or "")
+                elif raw_error:
+                    provider_message = str(raw_error)
+                if not provider_message and isinstance(payload, dict):
+                    provider_message = str(payload.get("detail") or payload.get("message") or "")
+            except (TypeError, ValueError):
+                pass
+        prefix = f"HTTP {status_code}: " if status_code else ""
+        detail = (prefix + provider_message).strip(": ")[:220] if provider_message else (
+            f"HTTP {status_code}" if status_code else str(error).strip()[:220]
+        )
         detail = detail or "Provider check failed"
     with _api_health_lock:
         _api_health[provider] = {
@@ -550,15 +638,11 @@ def _record_api_failure(provider: str, error: Exception) -> None:
 
 
 def _api_health_snapshot() -> list[dict]:
-    providers = (
-        ("groq", "Groq", "GROQ_API_KEY", GROQ_TRANSLATION_MODEL),
-        ("openrouter", "OpenRouter", "OPENROUTER_API_KEY", OPENROUTER_TRANSLATION_MODEL),
-    )
     now = time.time()
     with _api_health_lock:
         stored = {name: dict(value) for name, value in _api_health.items()}
     result = []
-    for name, label, env_name, model in providers:
+    for name, label, env_name, model, purpose in API_PROVIDER_SPECS:
         configured = bool((os.environ.get(env_name) or "").strip())
         item = stored[name]
         state = item["state"] if configured else "not_configured"
@@ -573,6 +657,7 @@ def _api_health_snapshot() -> list[dict]:
             "configured": configured,
             "key_hint": _masked_api_key(env_name),
             "model": model,
+            "purpose": purpose,
             "state": state,
             "detail": item.get("detail") or "",
             "checked_at": item.get("checked_at"),
@@ -856,27 +941,79 @@ def _probe_openrouter_key() -> None:
     if not api_key:
         return
     try:
-        response = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
+        openai_chat_completion(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            api_key=api_key,
+            model=OPENROUTER_JUDGE_MODEL,
+            messages=[{"role": "user", "content": "Reply only with OK."}],
+            max_tokens=8,
+            timeout=12.0,
+            extra_headers={
                 "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
                 "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
             },
-            json={
-                "model": OPENROUTER_TRANSLATION_MODEL,
-                "messages": [{"role": "user", "content": "Reply only with OK."}],
-                "temperature": 0,
-                "max_tokens": 4,
-            },
-            timeout=12.0,
         )
-        response.raise_for_status()
     except Exception as error:
         _record_api_failure("openrouter", error)
         return
     _record_api_success("openrouter", "Key check succeeded")
+
+
+def _probe_nvidia_key() -> None:
+    api_key = (os.environ.get("NVIDIA_API_KEY") or "").strip()
+    if not api_key:
+        return
+    try:
+        openai_chat_completion(
+            url="https://integrate.api.nvidia.com/v1/chat/completions",
+            api_key=api_key,
+            model=NVIDIA_JUDGE_MODEL,
+            messages=[{"role": "user", "content": "Reply only with OK."}],
+            max_tokens=8,
+            timeout=15.0,
+        )
+    except Exception as error:
+        _record_api_failure("nvidia", error)
+        return
+    _record_api_success("nvidia", "Key check succeeded")
+
+
+def _probe_gemini_key() -> None:
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return
+    try:
+        gemini_generate(
+            api_key=api_key,
+            model=GEMINI_JUDGE_MODEL,
+            system_prompt="Return a small JSON object.",
+            user_prompt='Return exactly {"status":"OK"}.',
+            max_tokens=20,
+            timeout=15.0,
+        )
+    except Exception as error:
+        _record_api_failure("gemini", error)
+        return
+    _record_api_success("gemini", "Key check succeeded")
+
+
+def _probe_bai_key() -> None:
+    api_key = (os.environ.get("BAI_API_KEY") or "").strip()
+    if not api_key:
+        return
+    try:
+        openai_chat_completion(
+            url="https://api.b.ai/v1/chat/completions",
+            api_key=api_key,
+            model=BAI_JUDGE_MODEL,
+            messages=[{"role": "user", "content": "Reply only with OK."}],
+            max_tokens=8,
+            timeout=15.0,
+        )
+    except Exception as error:
+        _record_api_failure("bai", error)
+        return
+    _record_api_success("bai", "Key check succeeded")
 
 
 @app.get("/api/ai-keys/status")
@@ -884,12 +1021,50 @@ def ai_key_status():
     return jsonify(_api_health_snapshot())
 
 
+@app.post("/api/ai-keys/<provider>")
+def update_ai_key(provider):
+    provider = provider.strip().lower()
+    spec = API_PROVIDER_BY_NAME.get(provider)
+    if spec is None:
+        return jsonify({"ok": False, "error": f"unknown provider '{provider}'"}), 404
+    body = request.get_json(force=True, silent=True) or {}
+    value = str(body.get("key") or "").strip()
+    if "\n" in value or "\r" in value or len(value) > 2048:
+        return jsonify({"ok": False, "error": "invalid API key format"}), 400
+
+    env_name = spec[2]
+    try:
+        set_key(str(_BASE_DIR / ".env"), env_name, value, quote_mode="always")
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not update .env: {error}"}), 500
+    if value:
+        os.environ[env_name] = value
+    else:
+        os.environ.pop(env_name, None)
+    with _api_health_lock:
+        _api_health[provider] = {
+            "state": "unchecked",
+            "checked_at": None,
+            "cooldown_until": None,
+            "detail": "Key updated; run a check",
+        }
+    _bump_state()
+    item = next(item for item in _api_health_snapshot() if item["provider"] == provider)
+    return jsonify({"ok": True, "provider": item})
+
+
 @app.post("/api/ai-keys/check")
 def check_ai_keys():
     # Run both small probes concurrently so one slow provider cannot hold up the
     # other's result. This is only triggered by the dashboard button.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(_probe_groq_key), pool.submit(_probe_openrouter_key)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [
+            pool.submit(_probe_groq_key),
+            pool.submit(_probe_openrouter_key),
+            pool.submit(_probe_nvidia_key),
+            pool.submit(_probe_gemini_key),
+            pool.submit(_probe_bai_key),
+        ]
         for future in futures:
             try:
                 future.result(timeout=15)
@@ -898,24 +1073,103 @@ def check_ai_keys():
     return jsonify({"ok": True, "providers": _api_health_snapshot()})
 
 
-# ── Judge (OpenRouter) ───────────────────────────────────────────────────────
-# A second, independent AI opinion on every reply that reaches the approval
-# queue. Lazily reads the API key per-call (same reasoning as the meeting
-# guard above). Fails safe: any error here is treated by create_request() as
-# "not a 10", i.e. falls back to manual review exactly like a failed meeting
-# guard check does.
-JUDGE_MODEL = os.environ.get("OPENROUTER_MODEL", "cognitivecomputations/dolphin-mistral-24b-venice-edition")
+# ── Judge provider chain ─────────────────────────────────────────────────────
+# The Judge fails over in order: OpenRouter -> NVIDIA -> Gemini -> B.AI. A provider is
+# considered failed on network/auth/rate errors or malformed Judge JSON. Only
+# when every provider fails does Auto mode fall back to manual review.
+
+
+def _judge_provider_response(provider: str, payload: dict) -> str:
+    user_prompt = json.dumps(payload, ensure_ascii=False)
+    if provider == "openrouter":
+        api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
+        return openai_chat_completion(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            api_key=api_key,
+            model=OPENROUTER_JUDGE_MODEL,
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=500,
+            timeout=20.0,
+            extra_headers={
+                "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
+                "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
+            },
+        )
+    if provider == "nvidia":
+        api_key = (os.environ.get("NVIDIA_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("NVIDIA_API_KEY is not set")
+        return openai_chat_completion(
+            url="https://integrate.api.nvidia.com/v1/chat/completions",
+            api_key=api_key,
+            model=NVIDIA_JUDGE_MODEL,
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=500,
+            timeout=20.0,
+        )
+    if provider == "gemini":
+        api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set")
+        return gemini_generate(
+            api_key=api_key,
+            model=GEMINI_JUDGE_MODEL,
+            system_prompt=JUDGE_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            max_tokens=500,
+            timeout=20.0,
+        )
+    if provider == "bai":
+        api_key = (os.environ.get("BAI_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("BAI_API_KEY is not set")
+        return openai_chat_completion(
+            url="https://api.b.ai/v1/chat/completions",
+            api_key=api_key,
+            model=BAI_JUDGE_MODEL,
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=500,
+            timeout=20.0,
+        )
+    raise ValueError(f"Unknown Judge provider: {provider}")
+
+
+def _parse_judge_response(raw: str, provider: str) -> dict:
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as error:
+        raise ValueError("model returned invalid JSON") from error
+    try:
+        score = max(0, min(10, int(data.get("score"))))
+    except (TypeError, ValueError) as error:
+        raise ValueError("model returned invalid score") from error
+    return {
+        "ok": True,
+        "provider": provider,
+        "score": score,
+        "verdict": str(data.get("verdict") or "").strip(),
+        "reasoning": str(data.get("reasoning") or "").strip(),
+        "analysis": str(data.get("analysis") or data.get("reasoning") or "").strip(),
+    }
 
 
 def _judge_reply(platform: str, last_message: str, customer_message: str,
                   client_profile: dict, fake_profile: dict, reply: str) -> dict:
-    """Runs the judge prompt on a reply. Returns
-    {"ok": True, "score", "verdict", "reasoning", "analysis"} or
-    {"ok": False, "error"}."""
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        return {"ok": False, "error": "OPENROUTER_API_KEY is not set"}
-
     payload = {
         "platform": platform,
         "conversation": {
@@ -926,57 +1180,73 @@ def _judge_reply(platform: str, last_message: str, customer_message: str,
         "fake_profile": fake_profile,
         "proposed_reply": reply,
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
-        "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
-    }
-
-    try:
-        response = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": JUDGE_MODEL,
-                "messages": [
-                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                "temperature": 0,
-                "max_tokens": 500,
-            },
-            timeout=20.0,
-        )
-        response.raise_for_status()
-        raw = response.json()["choices"][0]["message"]["content"] or "{}"
-    except Exception as e:
-        _record_api_failure("openrouter", e)
-        return {"ok": False, "error": str(e)}
-    _record_api_success("openrouter", "Judge request succeeded")
-
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:]
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "model returned invalid JSON", "raw": raw}
-
-    try:
-        score = max(0, min(10, int(data.get("score"))))
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "model returned invalid score"}
-
+    errors = []
+    for provider in ("openrouter", "nvidia", "gemini", "bai"):
+        try:
+            result = _parse_judge_response(
+                _judge_provider_response(provider, payload), provider
+            )
+        except Exception as error:
+            _record_api_failure(provider, error)
+            errors.append(f"{API_PROVIDER_BY_NAME[provider][1]}: {error}")
+            continue
+        _record_api_success(provider, "Judge request succeeded")
+        result["fallback_errors"] = errors
+        return result
     return {
-        "ok": True,
-        "score": score,
-        "verdict": str(data.get("verdict") or "").strip(),
-        "reasoning": str(data.get("reasoning") or "").strip(),
-        "analysis": str(data.get("analysis") or data.get("reasoning") or "").strip(),
+        "ok": False,
+        "error": "All Judge providers failed: " + "; ".join(errors),
+        "fallback_errors": errors,
     }
+
+
+def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: bool,
+                             auto_final_reply: str) -> None:
+    """Evaluate a queued reply without blocking the bot's approval POST.
+
+    The request is inserted before this worker starts, so the bot always gets
+    its request id quickly and waits on exactly one card. Auto-pilot requests
+    remain pending until a perfect Judge result promotes that same request to
+    approved; a failed/non-perfect result simply leaves it for manual review.
+    """
+    judge_result = _judge_reply(**judge_payload)
+    judge_score = judge_result.get("score") if judge_result["ok"] else None
+    should_notify = False
+    created_request = None
+    pending_count = 0
+    with _lock:
+        item = _requests.get(req_id)
+        if item is None:
+            return
+        item.update({
+            "judge_score": judge_score,
+            "judge_verdict": judge_result.get("verdict") if judge_result["ok"] else None,
+            "judge_reasoning": judge_result.get("reasoning") if judge_result["ok"] else None,
+            "judge_analysis": judge_result.get("analysis") if judge_result["ok"] else None,
+            "judge_provider": judge_result.get("provider") if judge_result["ok"] else None,
+            "judge_error": None if judge_result["ok"] else judge_result.get("error"),
+            "judge_pending": False,
+        })
+        if auto_candidate and item["status"] == "pending":
+            if judge_result["ok"] and judge_score == 10:
+                item["status"] = "approved"
+                item["auto"] = True
+                item["final_reply"] = auto_final_reply
+                item["decided_at"] = _now()
+            else:
+                should_notify = True
+                created_request = dict(item)
+                pending_count = sum(1 for queued in _requests.values() if queued["status"] == "pending")
+    if auto_candidate:
+        if judge_result["ok"] and judge_score == 10:
+            print(f"[Judge] {judge_payload['platform']} reply scored 10/10 — auto-approved")
+        elif judge_result["ok"]:
+            print(f"[Judge] {judge_payload['platform']} reply scored {judge_score}/10 — holding for manual review")
+        else:
+            print(f"[Judge] All providers failed for {judge_payload['platform']} — holding for manual review: {judge_result.get('error')}")
+    _bump_state()
+    if should_notify and created_request is not None:
+        push_notifications.queue_approval(created_request, pending_count)
 
 
 def _prune_history_locked():
@@ -1060,13 +1330,13 @@ def create_request():
             if result["contains_meeting"] and result["reply"]:
                 final_reply = result["reply"]
 
-    # Judge AI: a second opinion, scored against the conversation and both
-    # profiles, on every reply reaching the queue (auto or manual) so the
-    # dashboard can always show a score pill. In auto mode, only a perfect
-    # 10 is allowed through -- anything else (including a failed judge call)
-    # falls back to manual review, same fail-safe pattern as the meeting
-    # guard above.
-    judge_result = _judge_reply(
+    # Judge AI is intentionally asynchronous. Provider fallbacks can take
+    # longer than the bot client's request timeout; blocking this POST would
+    # leave a valid card behind while the bot assumes submission failed and
+    # generates another reply. Auto mode remains fail-safe: this request stays
+    # pending until the background Judge gives it a perfect 10.
+    auto_candidate = auto
+    judge_payload = dict(
         platform=platform,
         last_message=last_message,
         customer_message=customer_message,
@@ -1074,17 +1344,6 @@ def create_request():
         fake_profile=fake_profile,
         reply=final_reply,
     )
-    judge_score = judge_result.get("score") if judge_result["ok"] else None
-    judge_verdict = judge_result.get("verdict") if judge_result["ok"] else None
-    judge_reasoning = judge_result.get("reasoning") if judge_result["ok"] else None
-    judge_analysis = judge_result.get("analysis") if judge_result["ok"] else None
-    judge_error = None if judge_result["ok"] else judge_result.get("error")
-    if auto and judge_score != 10:
-        if judge_result["ok"]:
-            print(f"[Judge] {platform} reply scored {judge_score}/10 — holding for manual review")
-        else:
-            print(f"[Judge] OpenRouter check failed for {platform} — holding for manual review: {judge_result.get('error')}")
-        auto = False
 
     req_id = str(uuid.uuid4())
     with _lock:
@@ -1102,20 +1361,22 @@ def create_request():
             "reply_type": reply_type,
             "reply": reply,
             "reply_en": reply_en,
-            "final_reply": final_reply if auto else None,
-            "status": "approved" if auto else "pending",
+            "final_reply": None,
+            "status": "pending",
             "created_at": body.get("created_at") or now,
-            "decided_at": now if auto else None,
+            "decided_at": None,
             "sent_at": None,
             "error": None,
-            "auto": auto,
+            "auto": False,
             "meeting_guard": meeting_guard,
             "contains_meeting": contains_meeting,
-            "judge_score": judge_score,
-            "judge_verdict": judge_verdict,
-            "judge_reasoning": judge_reasoning,
-            "judge_analysis": judge_analysis,
-            "judge_error": judge_error,
+            "judge_score": None,
+            "judge_verdict": None,
+            "judge_reasoning": None,
+            "judge_analysis": None,
+            "judge_provider": None,
+            "judge_error": None,
+            "judge_pending": True,
             "meeting_alert_requested": meeting_alert_requested,
             "meeting_alert_reason": meeting_alert_reason,
             "conversation_tone": conversation_tone,
@@ -1127,9 +1388,16 @@ def create_request():
         created_request = dict(_requests[req_id])
         pending_count = sum(1 for item in _requests.values() if item["status"] == "pending")
     _bump_state()
-    if not auto:
+    if not auto_candidate:
         push_notifications.queue_approval(created_request, pending_count)
-    return jsonify({"id": req_id, "auto": auto, "meeting_guard": meeting_guard}), 201
+    _judge_pool.submit(
+        _complete_judge_analysis,
+        req_id,
+        judge_payload,
+        auto_candidate,
+        final_reply,
+    )
+    return jsonify({"id": req_id, "auto": False, "meeting_guard": meeting_guard}), 201
 
 
 @app.get("/api/push/config")
@@ -1139,6 +1407,33 @@ def push_config():
         "public_key": push_notifications.PUBLIC_KEY,
         "subscriptions": push_notifications.subscription_count(),
     })
+
+
+@app.post("/api/push/test")
+def push_test():
+    if not push_notifications.is_available():
+        return jsonify({"ok": False, "error": "Web Push is not configured"}), 503
+    if push_notifications.subscription_count() == 0:
+        return jsonify({"ok": False, "error": "No phone is subscribed"}), 409
+    try:
+        result = push_notifications.queue_payload({
+            "title": "Zenox system check",
+            "body": "Live phone notifications are working correctly.",
+            "icon": "/static/icons/zenox-192.png",
+            "badge": "/static/icons/zenox-192.png",
+            "tag": "zenox-system-check",
+            "url": "/",
+            "pendingCount": 0,
+        }).result(timeout=20)
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Notification test failed: {error}"}), 502
+    if not result.get("sent"):
+        return jsonify({
+            "ok": False,
+            "error": result.get("error") or "The push service did not accept the notification",
+            **result,
+        }), 502
+    return jsonify({"ok": True, **result})
 
 
 @app.post("/api/push/subscribe")
@@ -1189,8 +1484,8 @@ def set_mode():
 @app.get("/api/mode/override")
 def get_mode_override():
     platform = (request.args.get("platform") or "").strip().lower()
-    if platform not in SELF_MANAGED_PLATFORMS:
-        return jsonify({"error": f"platform must be one of {SELF_MANAGED_PLATFORMS}"}), 400
+    if platform not in PLATFORM_BY_SLUG:
+        return jsonify({"error": f"unknown platform '{platform}'"}), 404
     with _lock:
         override = _mode_overrides.get(platform)
         effective = override or _mode
@@ -1201,8 +1496,8 @@ def get_mode_override():
 def set_mode_override():
     body = request.get_json(force=True, silent=True) or {}
     platform = (body.get("platform") or "").strip().lower()
-    if platform not in SELF_MANAGED_PLATFORMS:
-        return jsonify({"error": f"platform must be one of {SELF_MANAGED_PLATFORMS}"}), 400
+    if platform not in PLATFORM_BY_SLUG:
+        return jsonify({"error": f"unknown platform '{platform}'"}), 404
     mode = body.get("mode")
     if mode not in ("manual", "auto", "default"):
         return jsonify({"error": "mode must be 'manual', 'auto', or 'default'"}), 400
@@ -1221,8 +1516,13 @@ def set_mode_override():
 @app.get("/api/platforms")
 def list_platforms():
     return jsonify([
-        {"name": name, "color": PLATFORM_COLORS.get(name, _FALLBACK_PALETTE[i % len(_FALLBACK_PALETTE)])}
-        for i, name in enumerate(KNOWN_PLATFORMS)
+        {
+            "slug": platform.slug,
+            "name": platform.label,
+            "color": platform.color,
+            "self_managed": platform.self_managed,
+        }
+        for platform in PLATFORMS
     ])
 
 
@@ -1513,9 +1813,8 @@ def _full_snapshot() -> dict:
         "history": _requests_snapshot(pending=False, limit=300),
         "status": status,
         "mode": mode,
-        "ai_keys": _api_health_snapshot(),
         "control": _control_status_cached(),
-        "bots": {p: _bot_status(p) for p in SELF_MANAGED_PLATFORMS},
+        "bots": _all_bot_statuses(),
     }
 
 
@@ -1544,10 +1843,36 @@ if sock:
 @app.post("/api/control/command")
 def control_command():
     body = request.get_json(force=True, silent=True) or {}
-    cmd = (body.get("cmd") or "").strip()
+    cmd = (body.get("cmd") or "").strip().lower()
+    target = (body.get("target") or "all").strip().lower()
     if not cmd:
         return jsonify({"ok": False, "error": "cmd is required"}), 400
-    if cmd.lower() in ("checkinall", "checkinsall", "ca"):
+    if target != "all" and target not in PLATFORM_BY_SLUG:
+        return jsonify({"ok": False, "error": f"unknown platform '{target}'"}), 404
+
+    # Pause flags are deliberately file-based inside every worker, so the web
+    # app can control them even when the optional launcher API is offline.
+    if cmd in ("pause", "resume"):
+        statuses = _all_bot_statuses()
+        targets = (
+            [slug for slug, status in statuses.items() if status.get("running")]
+            if target == "all"
+            else [target]
+        )
+        for slug in targets:
+            flag = pause_flag_path(slug)
+            if cmd == "pause":
+                flag.touch()
+            else:
+                flag.unlink(missing_ok=True)
+        _bump_state()
+        verb = "Paused" if cmd == "pause" else "Resumed"
+        return jsonify({
+            "ok": True,
+            "output": f"{verb} {len(targets)} running bot(s) from the web dashboard.",
+        })
+
+    if cmd in ("checkinall", "checkinsall", "ca"):
         # Run this here instead of proxying it to launch_all.py. That keeps the
         # dashboard calculator on the current extraction code even when the
         # long-running launcher was started before an update.
@@ -1563,10 +1888,28 @@ def control_command():
             return jsonify({"ok": False, "error": f"Check-in All failed: {error}"}), 500
         finally:
             _checkinall_lock.release()
+
+    control_available = bool(_control_status_cached().get("available"))
+    if not control_available and cmd in ("fix", "chameleon", "extractor"):
+        statuses = _all_bot_statuses()
+        targets = (
+            [slug for slug, status in statuses.items() if status.get("running")]
+            if target == "all"
+            else [target]
+        )
+        try:
+            output = asyncio.run(run_browser_operation(cmd, targets))
+            return jsonify({"ok": True, "output": output})
+        except Exception as error:
+            return jsonify({"ok": False, "error": f"{cmd.title()} failed: {error}"}), 500
+
+    if not control_available and cmd == "stop" and target != "all":
+        return bots_stop(target)
+
     try:
         r = httpx.post(
             f"{LAUNCHER_CONTROL_URL}/control/command",
-            json={"cmd": cmd, "target": body.get("target") or "all"},
+            json={"cmd": cmd, "target": target},
             # fix/checkins/checkinall drive real Chrome tabs and can take a while
             timeout=120,
         )
@@ -1773,33 +2116,6 @@ _PAGE = """<!doctype html>
     background: var(--muted); border: 1px solid var(--border); border-radius: 8px;
     padding: 9px 11px; white-space: pre-wrap; font-size: 13.5px; margin-top: 2px;
   }
-  .api-health-box {
-    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px 18px; margin-bottom: 26px;
-  }
-  .api-health-head { display: flex; align-items: center; gap: 14px; justify-content: space-between; flex-wrap: wrap; }
-  .api-health-head h2 { font-size: 14.5px; margin: 0 0 3px; font-weight: 650; }
-  .api-health-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
-  .api-key-card {
-    position: relative; overflow: hidden; padding: 13px 14px; border: 1px solid var(--border);
-    border-radius: 10px; background: color-mix(in srgb, var(--muted) 72%, transparent);
-  }
-  .api-key-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 2px; background: var(--muted-foreground); }
-  .api-key-card.ready::before { background: var(--success); box-shadow: 0 0 16px var(--success); }
-  .api-key-card.cooldown::before { background: var(--warning); box-shadow: 0 0 16px var(--warning); }
-  .api-key-card.error::before, .api-key-card.not_configured::before { background: var(--destructive); }
-  .api-key-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .api-key-name { font-size: 13px; font-weight: 750; }
-  .api-key-state { font-size: 10px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border); }
-  .api-key-card.ready .api-key-state { color: var(--success); border-color: color-mix(in srgb, var(--success) 42%, var(--border)); }
-  .api-key-card.cooldown .api-key-state { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 42%, var(--border)); }
-  .api-key-card.error .api-key-state, .api-key-card.not_configured .api-key-state { color: var(--destructive); }
-  .api-key-meta { margin-top: 8px; color: var(--muted-foreground); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
-  .api-key-meta code { color: var(--foreground); font-size: 11px; }
-  .btn-api-check { background: var(--primary); color: #fff; white-space: nowrap; }
-  .btn-api-check:disabled { opacity: .6; }
-  @media (max-width: 720px) { .api-health-grid { grid-template-columns: 1fr; } }
-
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 30px; }
   .stat-card {
     background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
@@ -2129,9 +2445,7 @@ _PAGE = """<!doctype html>
 
     .platform-head h2 { font-size: 14.5px; }
 
-    .api-health-head { align-items: stretch; }
-    .api-health-head > div { min-width: 0; }
-    .btn-api-check, .btn-money, .btn-pause { min-height: 44px; }
+    .btn-money, .btn-pause { min-height: 44px; }
     .system-ctrl-actions { align-items: stretch; flex-direction: column; }
     .system-ctrl-status { overflow-wrap: anywhere; }
 
@@ -2283,7 +2597,7 @@ _PAGE = """<!doctype html>
     background: rgba(9,11,18,.88); backdrop-filter: blur(18px) saturate(125%);
     box-shadow: 18px 0 50px rgba(0,0,0,.18);
   }
-  .card, .stat-card, .test-box, .api-health-box, .system-ctrl-box, .workflow-status, .history-card {
+  .card, .stat-card, .test-box, .system-ctrl-box, .workflow-status, .history-card {
     background: linear-gradient(145deg, rgba(24,24,30,.92), rgba(12,15,24,.9));
     box-shadow: 0 14px 36px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.025);
     backdrop-filter: blur(12px);
@@ -2324,9 +2638,155 @@ _PAGE = """<!doctype html>
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
   }
+
+  /* ── shadcn-inspired application shell ───────────────────────────────
+     The dashboard is server-rendered, so these native component classes use
+     the same neutral tokens, inset layout, menu groups, cards and switches
+     without adding a React runtime to the bot control process. */
+  :root {
+    --background: #09090b; --foreground: #fafafa; --card: #18181b;
+    --muted: #18181b; --muted-foreground: #a1a1aa; --accent: #27272a;
+    --border: #27272a; --input: #27272a; --primary: #6366f1;
+    --primary-foreground: #fafafa; --ring: #6366f1; --radius: 9px;
+    --sidebar-w: 272px;
+  }
+  body {
+    background:
+      radial-gradient(circle at 18% -12%, rgba(56,189,248,.12), transparent 34%),
+      radial-gradient(circle at 88% 8%, rgba(99,102,241,.14), transparent 30%),
+      linear-gradient(145deg, #05070c 0%, #090b12 52%, #070910 100%);
+    padding: 8px; gap: 8px;
+    color: var(--foreground);
+  }
+  #sidebar {
+    height: calc(100vh - 16px); height: calc(100dvh - 16px); top: 8px;
+    background: rgba(9,11,18,.9); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 18px 0 50px rgba(0,0,0,.18); backdrop-filter: blur(18px) saturate(125%); overflow: hidden;
+  }
+  .sidebar-header { min-height: 68px; padding: 14px; border-bottom: 1px solid var(--border); }
+  .brand-mark {
+    display: grid; place-items: center; width: 34px; height: 34px; flex: none;
+    border-radius: 9px; background: var(--primary); color: var(--primary-foreground);
+    font-size: 15px; font-weight: 800; letter-spacing: -.04em;
+  }
+  .brand-text { display: block; font-size: 14px; line-height: 1.2; font-weight: 700; }
+  .brand-caption { display: block; margin-top: 2px; color: var(--muted-foreground); font-size: 11px; }
+  .brand-sub {
+    margin-left: auto; padding: 2px 7px; border: 1px solid rgba(34,197,94,.25);
+    border-radius: 999px; color: var(--success); background: rgba(34,197,94,.08);
+    font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+  }
+  .workspace-nav, .platform-nav { padding: 8px; flex: none; }
+  .platform-nav { flex: 1; min-height: 0; overflow-y: auto; border-top: 1px solid var(--border); }
+  .nav-label { padding: 7px 8px 5px; font-size: 10px; letter-spacing: .08em; font-weight: 700; }
+  .sidebar-link, .nav-item {
+    display: flex; align-items: center; gap: 9px; width: 100%; min-height: 36px;
+    padding: 7px 9px; border-radius: 7px; border: 0; background: transparent;
+    color: var(--muted-foreground); text-decoration: none; font-size: 12.5px; font-weight: 520;
+  }
+  .sidebar-link:hover, .nav-item:hover { background: var(--accent); color: var(--foreground); }
+  .sidebar-link.active { background: rgba(99,102,241,.16); color: #c7d2fe; }
+  .sidebar-icon { display: grid; place-items: center; width: 18px; height: 18px; color: currentColor; font-size: 16px; }
+  .sidebar-badge {
+    margin-left: auto; min-width: 20px; padding: 0 6px; border-radius: 999px;
+    background: var(--primary); color: #fff; text-align: center; font-size: 10px; font-weight: 700;
+  }
+  .sidebar-group { padding: 8px; border-top: 1px solid var(--border); border-bottom: 0; }
+  .mode-toggle, .preference-row {
+    width: 100%; min-height: 46px; display: flex; align-items: center; gap: 10px;
+    padding: 7px 9px; border: 0; border-radius: 7px; background: transparent;
+    color: var(--foreground); text-align: left; font: inherit; cursor: pointer;
+  }
+  .mode-toggle:hover, .preference-row:hover { background: var(--accent); filter: none; }
+  .mode-copy, .preference-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .mode-toggle-label, .preference-copy strong { color: var(--foreground); font-size: 12.5px; font-weight: 600; }
+  .mode-toggle-hint, .preference-copy small { margin: 1px 0 0; color: var(--muted-foreground); font-size: 10.5px; line-height: 1.25; }
+  .mode-toggle.auto .mode-toggle-label { color: var(--foreground); }
+  .mode-switch, .ui-switch {
+    position: relative; flex: none; width: 32px; height: 18px; border-radius: 999px;
+    background: #3f3f46; border: 1px solid transparent; transition: background .16s;
+  }
+  .mode-switch::after, .ui-switch::after {
+    content: ""; position: absolute; width: 14px; height: 14px; top: 1px; left: 1px;
+    border-radius: 999px; background: #fafafa; transition: transform .16s;
+  }
+  .mode-toggle.auto .mode-switch, .preference-row.checked .ui-switch { background: var(--primary); }
+  .mode-toggle.auto .mode-switch::after, .preference-row.checked .ui-switch::after {
+    transform: translateX(14px); background: #fff;
+  }
+  .preference-icon {
+    display: grid; place-items: center; width: 28px; height: 28px; flex: none;
+    border: 1px solid var(--border); border-radius: 7px; background: var(--muted);
+    color: var(--muted-foreground); font-size: 13px; font-weight: 700;
+  }
+  .preference-row:disabled { opacity: .5; cursor: not-allowed; }
+  .sidebar-foot { padding: 9px 12px; background: rgba(9,11,18,.72); }
+  .live-badge { margin: 0; border: 0; background: transparent; padding: 3px; }
+
+  #main {
+    max-width: none; min-height: calc(100vh - 16px); min-height: calc(100dvh - 16px);
+    padding: 30px clamp(20px, 3vw, 44px) 64px; border: 1px solid var(--border);
+    border-radius: 12px; background: rgba(9,11,18,.82);
+  }
+  .page-head { margin-bottom: 18px; }
+  .page-head h1 { font-size: 24px; font-weight: 700; letter-spacing: -.035em; }
+  .page-head p { max-width: 760px; margin-top: 4px; color: var(--muted-foreground); }
+  .system-status { margin-bottom: 22px; }
+  .system-status .chip { background: transparent; padding: 5px 9px; }
+  .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .stat-card, .system-ctrl-box, .card, .history-card, .workflow-status, .test-box {
+    background: var(--card); border: 1px solid var(--border); box-shadow: none; backdrop-filter: none;
+  }
+  .stat-card { padding: 15px; border-radius: var(--radius); }
+  .stat-card .label { margin: 0; font-size: 11px; font-weight: 500; }
+  .stat-card .value { margin-top: 7px; font-size: 24px; font-weight: 700; }
+  .stat-card.actionable:hover:not(:disabled) { transform: none; border-color: #52525b; box-shadow: none; }
+  .system-ctrl-box { padding: 16px; margin-bottom: 28px; }
+  .system-ctrl-head { justify-content: space-between; }
+  .system-ctrl-head h2 { font-size: 14px; }
+  .system-ctrl-actions button, .ctrl-btn, .actions button {
+    border: 1px solid var(--border); border-radius: 7px; min-height: 34px;
+    box-shadow: none; font-weight: 600;
+  }
+  .btn-pause { background: var(--primary); color: #fff; }
+  .btn-pause.paused { background: var(--success); color: #052e16; }
+  .btn-money { background: var(--warning); color: #1c1500; }
+  button:hover:not(:disabled) { transform: none; box-shadow: none; filter: brightness(1.08); }
+  .platform-section { margin-bottom: 32px; }
+  .platform-head { margin-bottom: 10px; }
+  .platform-head h2 { color: var(--foreground); font-size: 14px; }
+  .pc-dot { width: 8px; height: 8px; box-shadow: none; }
+  .card { border-radius: var(--radius); }
+  .card::after { display: none; }
+  .card:hover { transform: none; border-color: #3f3f46; box-shadow: none; }
+  .history-card { border-left-width: 1px; border-radius: var(--radius); }
+  .toast { border-left-width: 1px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+  .queue-skeleton { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 8px 0 30px; }
+  .queue-skeleton span, .skeleton-card, .app-loading .stat-card .value {
+    position: relative; overflow: hidden; background: #18181b;
+  }
+  .queue-skeleton span { display: block; min-height: 190px; border: 1px solid var(--border); border-radius: var(--radius); }
+  .skeleton-card { min-height: 58px; }
+  .skeleton-card.short { width: 72%; }
+  .queue-skeleton span::after, .skeleton-card::after, .app-loading .stat-card .value::after {
+    content: ""; position: absolute; inset: 0; transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,.055), transparent);
+    animation: skeleton-wave 1.25s ease-in-out infinite;
+  }
+  .app-loading .stat-card .value { width: 42px; height: 27px; border-radius: 6px; color: transparent !important; }
+  @keyframes skeleton-wave { to { transform: translateX(100%); } }
+
+  @media (max-width: 1000px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 860px) {
+    body { padding: 0; }
+    #sidebar { top: 0; height: 100vh; height: 100dvh; border-radius: 0 12px 12px 0; }
+    #main { min-height: calc(100vh - 60px); border: 0; border-radius: 0; padding-top: 22px; }
+    #mobileBar { background: rgba(9,9,11,.94); }
+    .queue-skeleton { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
-<body>
+<body class="app-loading">
 <div id="toastRoot" aria-live="polite"></div>
 <div id="modalRoot"></div>
 <header id="mobileBar">
@@ -2338,27 +2798,40 @@ _PAGE = """<!doctype html>
 <div id="backdrop" onclick="closeDrawer()" aria-hidden="true"></div>
 
 <aside id="sidebar">
-  <div class="brand">
-    <span class="brand-dot"></span>
-    <span class="brand-text">Chat Approval</span>
-    <span class="brand-sub">live</span>
+  <div class="brand sidebar-header">
+    <span class="brand-mark">Z</span>
+    <span><span class="brand-text">Zenox</span><span class="brand-caption">Operations</span></span>
+    <span class="brand-sub">Live</span>
   </div>
-  <div class="mode-box">
+  <nav class="workspace-nav">
+    <div class="nav-label">Workspace</div>
+    <a href="/" class="sidebar-link active" aria-current="page">
+      <span class="sidebar-icon">⌁</span><span>Approval Queue</span><span class="sidebar-badge" id="sidebarPendingBadge">0</span>
+    </a>
+    <a href="/bots" class="sidebar-link"><span class="sidebar-icon">◫</span><span>Bots</span></a>
+    <a href="/api-keys" class="sidebar-link"><span class="sidebar-icon">⌘</span><span>API Keys</span></a>
+  </nav>
+  <div class="mode-box sidebar-group">
+    <div class="nav-label">Review mode</div>
     <button id="modeToggle" class="mode-toggle" onclick="toggleMode()">
-      <span class="mode-switch"></span>
-      <span class="mode-toggle-label" id="modeToggleLabel">Manual Review</span>
+      <span class="mode-copy"><span class="mode-toggle-label" id="modeToggleLabel">Manual Review</span><span class="mode-toggle-hint" id="modeToggleHint">Replies wait for approval</span></span>
+      <span class="mode-switch" aria-hidden="true"></span>
     </button>
-    <p class="mode-toggle-hint" id="modeToggleHint">Every reply waits here for Approve, Reject or Cancel.</p>
-    <button id="soundToggle" class="sound-toggle" onclick="toggleSound()">🔔 Sound on</button>
-    <button id="pushToggle" class="sound-toggle" onclick="togglePushNotifications()">📲 Enable phone notifications</button>
-    <a href="/bots" class="sound-toggle" style="margin-top:8px;text-decoration:none;">🤖 Bots</a>
-    <span class="live-badge" id="liveBadge" title="How this dashboard is getting updates"><span class="dot"></span><span id="liveBadgeLabel">Connecting…</span></span>
   </div>
-  <nav>
+  <div class="sidebar-group preferences">
+    <div class="nav-label">Preferences</div>
+    <button id="soundToggle" class="preference-row" onclick="toggleSound()" aria-pressed="true">
+      <span class="preference-icon">♪</span><span class="preference-copy"><strong>Sound</strong><small id="soundToggleStatus">On</small></span><span class="ui-switch" aria-hidden="true"></span>
+    </button>
+    <button id="pushToggle" class="preference-row" onclick="togglePushNotifications()" aria-pressed="false">
+      <span class="preference-icon">◉</span><span class="preference-copy"><strong>Notifications</strong><small id="pushToggleStatus">Off</small></span><span class="ui-switch" aria-hidden="true"></span>
+    </button>
+  </div>
+  <nav class="platform-nav">
     <div class="nav-label">Platforms</div>
     <div id="navList"></div>
   </nav>
-  <div class="sidebar-foot">Replies wait here until approved.</div>
+  <div class="sidebar-foot"><span class="live-badge" id="liveBadge" title="Dashboard connection"><span class="dot"></span><span id="liveBadgeLabel">Connecting…</span></span></div>
 </aside>
 
 <main id="main">
@@ -2369,17 +2842,11 @@ _PAGE = """<!doctype html>
 
   <div class="system-status" id="systemStatus"></div>
 
-  <div class="api-health-box">
-    <div class="api-health-head">
-      <div>
-        <h2>AI API Key Health</h2>
-        <span class="test-box-sub">See which configured key is ready, rate-limited, or unavailable. Keys are always masked.</span>
-      </div>
-      <button class="btn-api-check" id="apiKeyCheckBtn" onclick="checkApiKeys()">Check now</button>
-    </div>
-    <div class="api-health-grid" id="apiKeyHealth">
-      <div class="api-key-card unchecked"><div class="api-key-name">Loading provider status…</div></div>
-    </div>
+  <div class="stats">
+    <button type="button" class="stat-card warn actionable" id="pendingReviewCard" onclick="goToPendingReview()" disabled aria-label="Open the next pending approval"><div class="label">Pending review</div><div class="value" id="statPending">0</div></button>
+    <div class="stat-card ok"><div class="label">Sent today</div><div class="value" id="statSent">0</div></div>
+    <div class="stat-card bad"><div class="label">Rejected today</div><div class="value" id="statRejected">0</div></div>
+    <div class="stat-card"><div class="label">Platforms active</div><div class="value" id="statPlatforms">0</div></div>
   </div>
 
   <div class="system-ctrl-box">
@@ -2398,22 +2865,17 @@ _PAGE = """<!doctype html>
       <div class="ctrl-output-body" id="checkinAllOutputBody"></div>
     </div>
     <div class="ctrl-unavailable" id="ctrlUnavailableNote" style="display:none">
-      Launcher bot controls are offline, so Restart/Fix are unavailable. Check-in All still reads any browser tabs that are currently open.
+      Advanced launcher controls are offline. Pause, Resume, Fix, Chameleon, Extractor, Stop, and Check-in All still work from the web app; Restart and per-platform money checks require the launcher.
     </div>
   </div>
 
-  <div class="stats">
-    <button type="button" class="stat-card warn actionable" id="pendingReviewCard" onclick="goToPendingReview()" disabled aria-label="Open the next pending approval"><div class="label">Pending review</div><div class="value" id="statPending">0</div></button>
-    <div class="stat-card ok"><div class="label">Sent today</div><div class="value" id="statSent">0</div></div>
-    <div class="stat-card bad"><div class="label">Rejected today</div><div class="value" id="statRejected">0</div></div>
-    <div class="stat-card"><div class="label">Platforms active</div><div class="value" id="statPlatforms">0</div></div>
+  <div id="sections" aria-live="polite" aria-busy="true">
+    <div class="queue-skeleton"><span></span><span></span><span></span></div>
   </div>
-
-  <div id="sections"></div>
 
   <div class="platform-section">
     <div class="platform-head"><h2>Recent activity</h2><hr /></div>
-    <div id="history" class="history-list"><div class="empty-state">Nothing yet.</div></div>
+    <div id="history" class="history-list"><div class="history-card skeleton-card"></div><div class="history-card skeleton-card short"></div></div>
   </div>
 </main>
 
@@ -2536,10 +2998,10 @@ document.addEventListener("toggle", (event) => {
 }, true);
 let knownPlatforms = [];
 let currentMode = "manual";
-let apiKeyHealthState = [];
 let serviceWorkerRegistration = null;
 let currentPushSubscription = null;
 let pushConfigured = false;
+let pushSubscriptionCount = 0;
 let nextPendingReviewId = null;
 
 // --- Notification sound: chimes whenever a new chat starts waiting for approval. ---
@@ -2588,8 +3050,10 @@ function playNotifySound() {
 function renderSoundToggle() {
   const btn = document.getElementById("soundToggle");
   if (!btn) return;
-  btn.classList.toggle("muted", !soundEnabled);
-  btn.textContent = soundEnabled ? "🔔 Sound on" : "🔕 Sound off";
+  btn.classList.toggle("checked", soundEnabled);
+  btn.setAttribute("aria-pressed", soundEnabled ? "true" : "false");
+  const status = document.getElementById("soundToggleStatus");
+  if (status) status.textContent = soundEnabled ? "On · plays a test when enabled" : "Off";
 }
 
 function toggleSound() {
@@ -2598,6 +3062,7 @@ function toggleSound() {
   unlockAudio();
   if (soundEnabled) playNotifySound();
   renderSoundToggle();
+  if (soundEnabled) toast("Sound enabled", { type: "success", detail: "The test chime just played.", duration: 2200 });
 }
 
 // ── Installable app + background Web Push notifications ────────────────
@@ -2619,21 +3084,35 @@ function renderPushToggle(state, detail) {
   const btn = document.getElementById("pushToggle");
   if (!btn) return;
   btn.disabled = state === "unsupported" || state === "unconfigured";
-  btn.classList.toggle("push-active", state === "enabled");
-  btn.classList.toggle("push-warn", state === "needs-install" || state === "denied");
+  btn.classList.toggle("checked", state === "enabled");
+  btn.setAttribute("aria-pressed", state === "enabled" ? "true" : "false");
   const labels = {
-    enabled: "✅ Phone notifications on",
-    disabled: "📲 Enable phone notifications",
-    "needs-install": "➕ Add app to Home Screen first",
-    denied: "🚫 Notifications blocked in Settings",
-    unconfigured: "⚠️ Push server not configured",
-    unsupported: "Notifications unavailable",
+    enabled: "On · test sent when enabled",
+    disabled: "Off",
+    "needs-install": "Add app to Home Screen first",
+    denied: "Blocked in device settings",
+    unconfigured: "Push server not configured",
+    unsupported: "Unavailable in this browser",
   };
-  btn.textContent = labels[state] || "📲 Enable phone notifications";
+  const status = document.getElementById("pushToggleStatus");
+  if (status) status.textContent = labels[state] || "Off";
   btn.title = detail || "";
 }
 
 async function initPushNotifications() {
+  try {
+    const configRes = await fetch("/api/push/config");
+    const config = await configRes.json();
+    pushConfigured = !!config.enabled && !!config.public_key;
+    pushSubscriptionCount = Number(config.subscriptions || 0);
+    if (!pushConfigured) {
+      renderPushToggle("unconfigured", "Restart the dashboard after installing requirements and configuring VAPID.");
+      return;
+    }
+  } catch (error) {
+    renderPushToggle("unconfigured", String(error));
+    return;
+  }
   if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
     renderPushToggle("unsupported", "This browser does not support Web Push.");
     return;
@@ -2643,13 +3122,6 @@ async function initPushNotifications() {
     return;
   }
   try {
-    const configRes = await fetch("/api/push/config");
-    const config = await configRes.json();
-    pushConfigured = !!config.enabled && !!config.public_key;
-    if (!pushConfigured) {
-      renderPushToggle("unconfigured", "Restart the dashboard after installing requirements and configuring VAPID.");
-      return;
-    }
     serviceWorkerRegistration = await navigator.serviceWorker.register("/service-worker.js", { scope: "/" });
     serviceWorkerRegistration = await navigator.serviceWorker.ready;
     currentPushSubscription = await serviceWorkerRegistration.pushManager.getSubscription();
@@ -2677,13 +3149,16 @@ async function togglePushNotifications() {
     currentPushSubscription = await serviceWorkerRegistration.pushManager.getSubscription();
     if (currentPushSubscription) {
       const endpoint = currentPushSubscription.endpoint;
-      await fetch("/api/push/subscribe", {
+      const response = await fetch("/api/push/subscribe", {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ endpoint })
       });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
       await currentPushSubscription.unsubscribe();
       currentPushSubscription = null;
+      pushSubscriptionCount = Number(result.subscriptions || 0);
       renderPushToggle("disabled");
       toast("Phone notifications disabled", { type: "info" });
       return;
@@ -2710,6 +3185,7 @@ async function togglePushNotifications() {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    pushSubscriptionCount = Number(result.subscriptions || pushSubscriptionCount || 1);
     renderPushToggle("enabled");
     toast("Phone notifications enabled", {
       type: "success",
@@ -2729,8 +3205,8 @@ function renderModeToggle() {
   btn.classList.toggle("auto", auto);
   label.textContent = auto ? "Auto-pilot" : "Manual Review";
   hint.textContent = auto
-    ? "AI replies are sent immediately — nothing waits for review."
-    : "Every reply waits here for Approve, Reject or Cancel.";
+    ? "Replies send immediately"
+    : "Replies wait for approval";
 }
 
 async function toggleMode() {
@@ -2770,53 +3246,6 @@ const ACTION_LABELS = {
   reschedule: "Reschedule",
   decline: "Decline",
 };
-
-function renderApiKeyHealth(items) {
-  if (Array.isArray(items)) apiKeyHealthState = items;
-  const root = document.getElementById("apiKeyHealth");
-  if (!root) return;
-  const labels = {
-    ready: "Ready",
-    cooldown: "Cooldown",
-    error: "Error",
-    not_configured: "Not configured",
-    unchecked: "Not checked",
-  };
-  root.innerHTML = apiKeyHealthState.map(item => {
-    const cooldown = item.state === "cooldown"
-      ? ` · retry in ${Math.max(0, Number(item.cooldown_seconds || 0))}s`
-      : "";
-    const checked = item.checked_at ? `Last checked ${timeAgo(item.checked_at)}` : "No live check yet";
-    const key = item.key_hint ? `<code>${escapeHtml(item.key_hint)}</code>` : "No key in .env";
-    return `
-      <div class="api-key-card ${escapeHtml(item.state)}">
-        <div class="api-key-top">
-          <span class="api-key-name">${escapeHtml(item.label)}</span>
-          <span class="api-key-state">${escapeHtml(labels[item.state] || item.state)}</span>
-        </div>
-        <div class="api-key-meta">
-          ${key} · ${escapeHtml(item.model || "No model")}<br>
-          ${escapeHtml(item.detail || checked)}${escapeHtml(cooldown)}${item.detail ? `<br>${escapeHtml(checked)}` : ""}
-        </div>
-      </div>`;
-  }).join("") || '<div class="api-key-card unchecked"><div class="api-key-name">No providers found</div></div>';
-}
-
-async function checkApiKeys() {
-  const btn = document.getElementById("apiKeyCheckBtn");
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Checking…'; }
-  try {
-    const res = await fetch("/api/ai-keys/check", { method: "POST" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-    renderApiKeyHealth(data.providers || []);
-    toast("AI key status updated", { type: "success" });
-  } catch (error) {
-    toast("Could not check AI keys", { type: "error", detail: String(error) });
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "Check now"; }
-  }
-}
 
 function timeAgo(iso) {
   if (!iso) return "";
@@ -2948,9 +3377,11 @@ function detectorFor(name) {
     return { live: false, label, color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "" };
   }
   if (processRunning && process.paused) {
+    const pauseConfirmed = telemetryFresh && s.state === "paused";
     return {
-      live: true, label: "Paused", color: "var(--warning)",
-      detail: "Paused from the dashboard", state: "paused",
+      live: true, label: pauseConfirmed ? "Paused" : "Pause requested", color: "var(--warning)",
+      detail: pauseConfirmed ? "Paused at a safe checkpoint" : "Will pause at the next safe checkpoint",
+      state: "paused",
       retryCount: 0, warning: "", checkpoint: "paused",
     };
   }
@@ -3024,19 +3455,19 @@ function updateGlobalPauseControl() {
   const btn = document.getElementById("globalPauseBtn");
   const status = document.getElementById("globalPauseStatus");
   if (!btn || !status) return;
-  const active = Object.values(controlPlatformState).filter(st => st && st.state === "running");
+  const active = Object.values(botProcessState).filter(st => st && (st.state === "running" || st.running === true));
   const pausedCount = active.filter(st => st.paused).length;
   const allPaused = active.length > 0 && pausedCount === active.length;
   btn.dataset.action = allPaused ? "resume" : "pause";
   btn.textContent = allPaused ? "▶ Resume all bots" : "⏸ Pause all bots";
   btn.classList.toggle("paused", allPaused);
-  btn.disabled = globalPauseRunning || !controlsAvailable || !active.length;
-  status.textContent = !controlsAvailable
-    ? "Launcher controls unavailable"
+  btn.disabled = globalPauseRunning || !active.length;
+  status.textContent = !active.length
+    ? "No bots running"
     : allPaused
-      ? `All ${active.length} bots paused`
+      ? `Pause requested for all ${active.length} bots`
       : pausedCount
-        ? `${pausedCount}/${active.length} bots paused`
+        ? `Pause requested for ${pausedCount}/${active.length} bots`
         : `${active.length} bots running`;
 }
 
@@ -3059,10 +3490,14 @@ async function toggleGlobalPause() {
       toast(`Could not ${cmd} all bots`, { type: "error", detail: data.error || `HTTP ${res.status}` });
       return;
     }
-    for (const state of Object.values(controlPlatformState)) {
-      if (state && state.state === "running") state.paused = cmd === "pause";
+    for (const state of Object.values(botProcessState)) {
+      if (state && (state.state === "running" || state.running === true)) state.paused = cmd === "pause";
     }
-    toast(cmd === "pause" ? "All bots paused" : "All bots resumed", { type: "success", duration: 2800 });
+    toast(cmd === "pause" ? "Pause requested for all bots" : "All bots resumed", {
+      type: "success",
+      detail: cmd === "pause" ? "Each bot will stop at its next safe checkpoint." : "",
+      duration: 3200,
+    });
   } catch (e) {
     dismiss();
     toast(`Could not ${cmd} all bots`, { type: "error", detail: "Request failed — check your connection." });
@@ -3092,6 +3527,10 @@ async function refreshControlStatus() {
     controlsAvailable = false;
     controlPlatformState = {};
   }
+  updateGlobalPauseControl();
+  const note = document.getElementById("ctrlUnavailableNote");
+  if (note) note.style.display = controlsAvailable ? "none" : "block";
+  renderSystemStatus();
 }
 
 function fmtUptime(seconds) {
@@ -3154,9 +3593,8 @@ function closeControlOutput(slug) {
 }
 
 function ctrlBarHtml(name) {
-  if (!controlsAvailable) return "";
   const slug = name.toLowerCase();
-  const st = controlPlatformState[slug];
+  const st = controlPlatformState[slug] || botProcessState[slug];
   let pillHtml = "";
   if (st) {
     const label = st.state === "running"
@@ -3164,7 +3602,10 @@ function ctrlBarHtml(name) {
       : st.state === "dead" ? `DEAD (exit ${st.exit_code})` : "STOPPED";
     pillHtml = `<span class="ctrl-status-pill ${escapeHtml(st.state)}">${escapeHtml(label)}</span>`;
   }
-  const buttons = CTRL_BUTTONS.map(b =>
+  const availableButtons = controlsAvailable
+    ? CTRL_BUTTONS
+    : CTRL_BUTTONS.filter(b => ["fix", "chameleon", "extractor", "stop"].includes(b.cmd));
+  const buttons = availableButtons.map(b =>
     `<button class="ctrl-btn ${b.cls || ""}" onclick="runControl(this, '${slug}', '${b.cmd}')">${escapeHtml(b.label)}</button>`
   ).join("");
   const savedOutput = controlOutputs.get(slug);
@@ -3256,6 +3697,7 @@ function judgePanelHtml(r) {
         <div>
           <div class="judge-eyebrow">AI Judge</div>
           <div class="judge-verdict">${escapeHtml(verdict)}</div>
+          ${r.judge_provider ? `<div class="api-key-meta">via ${escapeHtml(r.judge_provider)}</div>` : ""}
         </div>
       </div>
       <p class="judge-reason"><strong>Why:</strong> ${escapeHtml(reason)}</p>
@@ -3418,8 +3860,9 @@ function renderSections(pending, autoByPlatform) {
   const order = [...knownPlatforms];
   for (const name of byPlatform.keys()) if (!order.includes(name)) order.push(name);
   if (showAuto) for (const name of autoByPlatform.keys()) if (!order.includes(name)) order.push(name);
+  const runningOrder = order.filter(name => detectorFor(name).live);
 
-  document.getElementById("sections").innerHTML = order.map(name => {
+  document.getElementById("sections").innerHTML = runningOrder.length ? runningOrder.map(name => {
     const items = byPlatform.get(name) || [];
     const autoItems = showAuto ? (autoByPlatform.get(name) || []) : [];
     const id = slug(name);
@@ -3459,10 +3902,10 @@ function renderSections(pending, autoByPlatform) {
         ${body}
       </section>
     `;
-  }).join("");
+  }).join("") : '<div class="empty-state">No bots are running. Start one from the Bots page.</div>';
 
   // Sidebar nav, same order.
-  document.getElementById("navList").innerHTML = order.map(name => {
+  document.getElementById("navList").innerHTML = runningOrder.map(name => {
     const count = (byPlatform.get(name) || []).length;
     const pc = colorFor(name);
     const det = detectorFor(name);
@@ -3479,7 +3922,7 @@ function renderSections(pending, autoByPlatform) {
   }).join("");
 
   document.getElementById("statPending").textContent = pending.length;
-  document.getElementById("statPlatforms").textContent = byPlatform.size;
+  document.getElementById("statPlatforms").textContent = runningOrder.length;
   const pendingReviewCard = document.getElementById("pendingReviewCard");
   pendingReviewCard.disabled = !pending.length;
   pendingReviewCard.setAttribute("aria-label", pending.length
@@ -3539,7 +3982,6 @@ function renderHistory(items) {
 function applySnapshot(data) {
   if (data.status) liveStatus = data.status;
   if (typeof data.mode === "string") currentMode = data.mode;
-  if (data.ai_keys) renderApiKeyHealth(data.ai_keys);
   renderModeToggle();
 
   if (data.control) {
@@ -3564,7 +4006,7 @@ function applySnapshot(data) {
   }
   renderHistory(history.slice(0, 30));
 
-  const pendingList = data.pending || [];
+  const pendingList = (data.pending || []).filter(r => detectorFor(r.platform).live);
   const currentPendingIds = new Set(pendingList.map(r => r.id));
   if (knownPendingIds !== null) {
     for (const id of currentPendingIds) {
@@ -3573,6 +4015,11 @@ function applySnapshot(data) {
   }
   knownPendingIds = currentPendingIds;
   renderSections(pendingList, autoByPlatform);
+  const sidebarPending = document.getElementById("sidebarPendingBadge");
+  if (sidebarPending) sidebarPending.textContent = String(pendingList.length);
+  const sections = document.getElementById("sections");
+  if (sections) sections.setAttribute("aria-busy", "false");
+  document.body.classList.remove("app-loading");
   if (navigator.setAppBadge) {
     if (pendingList.length) navigator.setAppBadge(pendingList.length).catch(() => {});
     else if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
@@ -3591,24 +4038,28 @@ function applySnapshot(data) {
 async function refresh() {
   // Never yank the textarea out from under someone mid-keystroke.
   if (document.activeElement && document.activeElement.classList.contains("reply-input")) return;
+  refreshControlStatus();
   try {
-    const [pendingRes, historyRes, statusRes, modeRes, botsRes, apiKeysRes] = await Promise.all([
-      fetch("/api/requests?status=pending"),
-      fetch("/api/requests?status=approved,rejected,cancelled,skip_requested,skipped,transferred,sent,failed&limit=300"),
-      fetch("/api/status"),
-      fetch("/api/mode"),
-      fetch("/api/bots/status"),
-      fetch("/api/ai-keys/status"),
+    const readJson = async url => {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    };
+    const results = await Promise.allSettled([
+      readJson("/api/requests?status=pending"),
+      readJson("/api/requests?status=approved,rejected,cancelled,skip_requested,skipped,transferred,sent,failed&limit=300"),
+      readJson("/api/status"),
+      readJson("/api/mode"),
+      readJson("/api/bots/status"),
     ]);
-    await refreshControlStatus();
+    if (results[0].status !== "fulfilled" || results[1].status !== "fulfilled") return;
     applySnapshot({
-      status: await statusRes.json(),
-      mode: ((await modeRes.json()).mode) || "manual",
-      ai_keys: await apiKeysRes.json(),
+      status: results[2].status === "fulfilled" ? results[2].value : liveStatus,
+      mode: results[3].status === "fulfilled" ? (results[3].value.mode || currentMode) : currentMode,
       control: { available: controlsAvailable, platforms: controlPlatformState },
-      bots: await botsRes.json(),
-      history: await historyRes.json(),
-      pending: await pendingRes.json(),
+      bots: results[4].status === "fulfilled" ? results[4].value : botProcessState,
+      history: results[1].value,
+      pending: results[0].value,
     });
   } catch (e) {
     // transient network hiccup — next poll will retry
@@ -3624,6 +4075,7 @@ async function refresh() {
 let liveSocket = null;
 let liveConnected = false;
 let wsReconnectDelay = 1000;
+let deferredSnapshot = null;
 
 function setLiveIndicator(connected) {
   const badge = document.getElementById("liveBadge");
@@ -3647,12 +4099,25 @@ function connectLive() {
   liveSocket = socket;
   socket.onopen = () => { liveConnected = true; wsReconnectDelay = 1000; setLiveIndicator(true); };
   socket.onmessage = (ev) => {
-    if (document.activeElement && document.activeElement.classList.contains("reply-input")) return;
-    try { applySnapshot(JSON.parse(ev.data)); } catch (e) {}
+    try {
+      const snapshot = JSON.parse(ev.data);
+      if (document.activeElement && document.activeElement.classList.contains("reply-input")) {
+        deferredSnapshot = snapshot;
+        return;
+      }
+      applySnapshot(snapshot);
+    } catch (e) {}
   };
   socket.onclose = () => { liveConnected = false; setLiveIndicator(false); scheduleReconnect(); };
   socket.onerror = () => { try { socket.close(); } catch (e) {} };
 }
+
+document.addEventListener("focusout", event => {
+  if (!event.target.classList || !event.target.classList.contains("reply-input") || !deferredSnapshot) return;
+  const snapshot = deferredSnapshot;
+  deferredSnapshot = null;
+  requestAnimationFrame(() => applySnapshot(snapshot));
+});
 
 function scheduleReconnect() {
   setTimeout(connectLive, wsReconnectDelay);
@@ -3693,10 +4158,10 @@ async function init() {
   }
   renderSoundToggle();
   initPushNotifications();
-  refresh();
   connectLive();
+  refresh();
   // Only polls while the live socket is down — see setLiveIndicator() above.
-  setInterval(() => { if (!liveConnected) refresh(); }, 1500);
+  setInterval(() => { if (!liveConnected) refresh(); }, 3000);
 }
 
 init();
@@ -3709,7 +4174,7 @@ init();
 
 
 # ── Bots launcher page ───────────────────────────────────────────────────────
-# The single place to start/stop Xkuss, Justlo, Linduu and Gnoxx and configure
+# The single place to start/stop every supported platform and configure
 # Approval (human review vs fully automatic) independently — no terminal
 # commands needed. Each card is self-contained: changing one never touches
 # another platform's process or Approval setting.
@@ -3927,6 +4392,40 @@ _BOTS_PAGE = r"""<!doctype html>
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
   }
+  /* shadcn-style page composition shared with the Approval Queue. */
+  body {
+    max-width: 1440px; margin: 0 auto; padding: 32px clamp(18px,4vw,54px) 64px;
+    background:
+      radial-gradient(circle at 18% -12%, rgba(56,189,248,.12), transparent 34%),
+      radial-gradient(circle at 88% 8%, rgba(99,102,241,.14), transparent 30%),
+      linear-gradient(145deg, #05070c 0%, #090b12 52%, #070910 100%);
+    color: #fafafa;
+  }
+  .topbar, .bots-grid { z-index: auto; }
+  .topbar { align-items: flex-start; margin-bottom: 26px; }
+  .topbar h1 { font-size: 24px; font-weight: 700; letter-spacing: -.035em; }
+  .back-link { border-radius: 7px; background: #18181b; color: #fafafa; }
+  .bots-grid { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .bot-card {
+    padding: 17px; border-radius: 10px;
+    background: linear-gradient(145deg, rgba(24,24,30,.92), rgba(12,15,24,.9)); border-color: #27272a;
+    box-shadow: 0 14px 36px rgba(0,0,0,.2); backdrop-filter: blur(12px);
+  }
+  .bot-card::after { display: none; }
+  .bot-card:hover { transform: none; border-color: #3f3f46; box-shadow: none; }
+  .status-pill { border-radius: 999px; background: #18181b; }
+  .start-stop-row button { min-height: 36px; border-radius: 7px; }
+  .btn-start { background: var(--success); color: #052e16; }
+  .btn-stop { background: transparent; }
+  .toggle-switch-btn { min-height: 34px; border-radius: 7px; background: #18181b; padding: 5px 10px; }
+  details.steps-block { border-radius: 8px; background: #09090b; }
+  button:hover:not(:disabled) { transform: none; box-shadow: none; }
+  .spinner {
+    display:inline-block; width:12px; height:12px; margin-right:6px; vertical-align:-2px;
+    border:2px solid currentColor; border-right-color:transparent; border-radius:999px;
+    animation:spin .65s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -3936,7 +4435,7 @@ _BOTS_PAGE = r"""<!doctype html>
   <a class="back-link" href="/">&larr; Approval Dashboard</a>
   <div>
     <h1>Bots</h1>
-    <p>Start, stop, and configure Xkuss, Justlo, Linduu and Gnoxx. Every bot uses the real Chameleon-AI AgentWorkspace.</p>
+    <p>Start, stop, and configure every platform from one place. Each card controls only its own bot.</p>
   </div>
 </div>
 
@@ -4000,18 +4499,13 @@ function showConfirm(title, body, opts) {
   });
 }
 
-const PLATFORMS = [
-  { slug: "xkuss",  label: "Xkuss" },
-  { slug: "justlo", label: "Justlo" },
-  { slug: "linduu", label: "Linduu" },
-  { slug: "gnoxx",  label: "Gnoxx" },
-];
+const PLATFORMS = __PLATFORM_DATA__;
 
 // Per-platform client-side state, kept separate per card by construction --
 // every fetch/render/action below is always scoped to one `slug`, never "all".
 const state = {};
 for (const p of PLATFORMS) {
-  state[p.slug] = { approvalEffective: "manual", running: false, managedBy: null, liveDetail: "", stopping: false, stepsOpen: false };
+  state[p.slug] = { approvalEffective: "manual", running: false, managedBy: null, liveDetail: "", error: "", starting: false, startingAt: 0, stopping: false, stepsOpen: false, loaded: false };
 }
 
 function stepsFor(slug, approval) {
@@ -4031,6 +4525,16 @@ function stepsFor(slug, approval) {
       "Click Home again, reset Chameleon, and wait for a different conversation",
     ];
   }
+  if (!PLATFORMS.find(p => p.slug === slug)?.selfManaged) {
+    return [
+      "Open the platform and Chameleon browser sessions",
+      "Log in when needed and wait for an incoming conversation",
+      "Capture the conversation and inject it into Chameleon-AI AgentWorkspace",
+      "Extract the customer data and generate a policy-compliant reply",
+      approvalStep,
+      "Paste the approved reply, send it, reset Chameleon, and wait for the next chat",
+    ];
+  }
   return [
     "Log in, open Mod, start Play, and keep the moderation queue scanner active",
     "Detect a newly loaded conversation and verify the customer/message grid is ready",
@@ -4048,8 +4552,9 @@ function stepsFor(slug, approval) {
 function renderCard(slug, label) {
   const s = state[slug];
   const running = s.running;
-  const statusClass = s.stopping ? "external" : (running ? (s.managedBy === "external" ? "external" : "running") : "");
-  const statusText = s.stopping ? "Stopping…" : (running ? (s.managedBy === "external" ? "Running (external)" : "Running") : "Stopped");
+  const busy = s.starting || s.stopping;
+  const statusClass = !s.loaded ? "external" : (busy ? "external" : (running ? (s.managedBy === "external" ? "external" : "running") : ""));
+  const statusText = !s.loaded ? "Loading…" : (s.starting ? "Starting…" : (s.stopping ? "Stopping…" : (running ? (s.managedBy === "external" ? "Running (external)" : "Running") : "Stopped")));
   const steps = stepsFor(slug, s.approvalEffective);
 
   return `
@@ -4061,8 +4566,8 @@ function renderCard(slug, label) {
       <div class="live-line">${escapeHtml(s.liveDetail || "")}</div>
 
       <div class="start-stop-row">
-        <button class="btn-start" ${(running || s.stopping) ? "disabled" : ""} onclick="startBot('${slug}')">Start</button>
-        <button class="btn-stop" ${(!running || s.stopping) ? "disabled" : ""} onclick="stopBot('${slug}')">${s.stopping ? "Stopping…" : "Stop"}</button>
+        <button class="btn-start" ${(running || busy || !s.loaded) ? "disabled" : ""} onclick="startBot('${slug}')">${s.starting ? '<span class="spinner"></span>Starting' : "Start"}</button>
+        <button class="btn-stop" ${(!running || busy || !s.loaded) ? "disabled" : ""} onclick="stopBot('${slug}')">${s.stopping ? '<span class="spinner"></span>Stopping' : "Stop"}</button>
       </div>
 
       <div class="toggle-row">
@@ -4078,7 +4583,7 @@ function renderCard(slug, label) {
         <ol class="steps-list">${steps.map(st => `<li>${escapeHtml(st)}</li>`).join("")}</ol>
       </details>
 
-      <div class="error-note" id="err-${slug}"></div>
+      <div class="error-note" id="err-${slug}">${escapeHtml(s.error || "")}</div>
     </div>
   `;
 }
@@ -4088,17 +4593,26 @@ function render() {
 }
 
 function showError(slug, msg) {
+  state[slug].error = msg;
   const el = document.getElementById(`err-${slug}`);
   if (el) el.textContent = msg;
 }
 
 async function startBot(slug) {
   showError(slug, "");
+  state[slug].starting = true;
+  state[slug].startingAt = Date.now();
+  state[slug].liveDetail = "Starting bot and preparing its browser session…";
+  render();
   try {
     const res = await fetch(`/api/bots/${slug}/start`, { method: "POST" });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) showError(slug, data.error || `HTTP ${res.status}`);
+    if (!res.ok || !data.ok) {
+      state[slug].starting = false;
+      showError(slug, data.error || `HTTP ${res.status}`);
+    }
   } catch (e) {
+    state[slug].starting = false;
     showError(slug, "Request failed: " + e);
   }
   await refreshStatus();
@@ -4152,6 +4666,10 @@ async function refreshStatus() {
       const s = data[p.slug] || {};
       state[p.slug].running = !!s.running;
       state[p.slug].managedBy = s.managed_by || null;
+      state[p.slug].loaded = true;
+      if (s.running || Date.now() - state[p.slug].startingAt > 180_000) {
+        state[p.slug].starting = false;
+      }
     }
   } catch (e) { /* transient — next poll retries */ }
 
@@ -4167,16 +4685,56 @@ async function refreshStatus() {
   render();
 }
 
-async function loadInitial() {
+let botsLiveSocket = null;
+let botsLiveConnected = false;
+let botsReconnectDelay = 1000;
+
+function applyBotSnapshot(snapshot) {
+  const bots = snapshot.bots || {};
+  const statuses = snapshot.status || {};
   for (const p of PLATFORMS) {
+    const bot = bots[p.slug] || {};
+    state[p.slug].running = !!bot.running;
+    state[p.slug].managedBy = bot.managed_by || null;
+    state[p.slug].loaded = true;
+    if (bot.running || Date.now() - state[p.slug].startingAt > 180_000) state[p.slug].starting = false;
+    const entry = statuses[p.label] || statuses[p.label.toLowerCase()];
+    if (entry) state[p.slug].liveDetail = `${entry.state}${entry.detail ? " — " + entry.detail : ""}`;
+  }
+  render();
+}
+
+function connectBotsLive() {
+  if (!("WebSocket" in window)) return;
+  try {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    botsLiveSocket = new WebSocket(`${proto}//${location.host}/ws/live`);
+  } catch (error) {
+    setTimeout(connectBotsLive, botsReconnectDelay);
+    botsReconnectDelay = Math.min(botsReconnectDelay * 1.6, 15000);
+    return;
+  }
+  botsLiveSocket.onopen = () => { botsLiveConnected = true; botsReconnectDelay = 1000; };
+  botsLiveSocket.onmessage = event => { try { applyBotSnapshot(JSON.parse(event.data)); } catch (error) {} };
+  botsLiveSocket.onclose = () => {
+    botsLiveConnected = false;
+    setTimeout(connectBotsLive, botsReconnectDelay);
+    botsReconnectDelay = Math.min(botsReconnectDelay * 1.6, 15000);
+  };
+  botsLiveSocket.onerror = () => { try { botsLiveSocket.close(); } catch (error) {} };
+}
+
+async function loadInitial() {
+  await Promise.allSettled(PLATFORMS.map(async p => {
     try {
       const res = await fetch(`/api/mode/override?platform=${p.slug}`);
       const data = await res.json();
       if (data.effective) state[p.slug].approvalEffective = data.effective;
     } catch (e) { /* keep default */ }
-  }
+  }));
   await refreshStatus();
-  setInterval(refreshStatus, 2500);
+  connectBotsLive();
+  setInterval(() => { if (!botsLiveConnected) refreshStatus(); }, 3000);
 }
 
 render();
@@ -4202,7 +4760,23 @@ def service_worker():
 
 @app.get("/bots")
 def bots_page():
-    return Response(_BOTS_PAGE, mimetype="text/html")
+    platform_data = [
+        {
+            "slug": platform.slug,
+            "label": platform.label,
+            "selfManaged": platform.self_managed,
+        }
+        for platform in PLATFORMS
+    ]
+    return Response(
+        _BOTS_PAGE.replace("__PLATFORM_DATA__", json.dumps(platform_data)),
+        mimetype="text/html",
+    )
+
+
+@app.get("/api-keys")
+def api_keys_page():
+    return render_template("api_keys.html")
 
 
 def main():

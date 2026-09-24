@@ -39,17 +39,23 @@ from playwright.async_api import async_playwright
 from core.bot import pause_flag_path
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp, ensure_approval_server, CONTROL_SERVER_PORT
 from core.login import login_mod_site, login_chameleon, check_chameleon, force_extractor_tab, check_stats
+from core.platforms import (
+    DEFAULT_PLATFORM_SLUGS,
+    KNOWN_PLATFORM_SLUGS,
+    REACT_PLATFORM_SLUGS,
+    SELF_MANAGED_PLATFORM_SLUGS,
+)
 
 BASE_DIR = Path(__file__).parent
 
 # React platforms need Chrome started + mod-site/chameleon login done for them
 # (Phases 1–2 below). The self-managed ones bring up their own Chrome and log
 # themselves in inside their run() (xkuss_bot / justlo_bot), so they skip Phase 2.
-REACT_PLATFORMS   = ["gold", "gold2", "gold3", "diamond", "platin", "s69", "ml"]
-SELF_MANAGED      = ["xkuss", "justlo", "linduu", "gnoxx"]
-KNOWN_PLATFORMS   = REACT_PLATFORMS + SELF_MANAGED
+REACT_PLATFORMS   = list(REACT_PLATFORM_SLUGS)
+SELF_MANAGED      = list(SELF_MANAGED_PLATFORM_SLUGS)
+KNOWN_PLATFORMS   = list(KNOWN_PLATFORM_SLUGS)
 # `python launch_all.py` with no args starts exactly these platforms.
-DEFAULT_PLATFORMS = ["gold", "ml", "platin", "s69", "diamond", "xkuss", "justlo", "linduu", "gnoxx"]
+DEFAULT_PLATFORMS = list(DEFAULT_PLATFORM_SLUGS)
 # ``checkins`` reads the React mod-site dialog. ``checkinall`` additionally
 # reads Xkuss's INs link and the monthly counters on Justlo/Linduu/Gnoxx.
 ALL_PLATFORMS     = REACT_PLATFORMS
@@ -95,6 +101,7 @@ _BOLD  = "\033[1m"
 _HELP = (
     f"{_BOLD}Available commands:{_RESET}\n"
     "  status                    — show all bot statuses\n"
+    "  start [platform|all]      — start one or all stopped bots\n"
     "  stop  [platform|all]      — stop one or all bots\n"
     "  restart [platform|all]    — restart one or all bots\n"
     "  pause [platform|all]      — pause one or all bots at a safe checkpoint\n"
@@ -263,10 +270,13 @@ def run_bots():
     for name in PLATFORMS:
         pause_flag_path(name).unlink(missing_ok=True)
 
-    procs:        dict[str, subprocess.Popen] = {name: _launch_bot(name) for name in PLATFORMS}
-    start_times:  dict[str, float]            = {name: time.time()        for name in PLATFORMS}
-    crash_counts: dict[str, int]              = {name: 0                  for name in PLATFORMS}
-    stopped:      set[str]                    = set()
+    procs: dict[str, subprocess.Popen | None] = {name: None for name in KNOWN_PLATFORMS}
+    start_times: dict[str, float] = {name: 0.0 for name in KNOWN_PLATFORMS}
+    crash_counts: dict[str, int] = {name: 0 for name in KNOWN_PLATFORMS}
+    for name in PLATFORMS:
+        procs[name] = _launch_bot(name)
+        start_times[name] = time.time()
+    stopped: set[str] = set(KNOWN_PLATFORMS) - set(PLATFORMS)
     stop_all      = threading.Event()
     cmd_q         = queue.Queue()
 
@@ -290,12 +300,19 @@ def run_bots():
         React platform at all (launched or not — checkins just connects over
         CDP directly) for checkins. Returns (valid_names, options_list) —
         options_list is what to show in an 'unknown platform' message."""
-        if cmd in ("stop", "restart", "pause", "resume"):
-            targets = PLATFORMS if target == "all" else [target]
-            return [n for n in targets if n in procs], PLATFORMS
+        if cmd in ("start", "stop", "restart"):
+            targets = KNOWN_PLATFORMS if target == "all" else [target]
+            return [n for n in targets if n in procs], KNOWN_PLATFORMS
+        if cmd in ("pause", "resume"):
+            targets = (
+                [n for n in KNOWN_PLATFORMS if n not in stopped]
+                if target == "all"
+                else [target]
+            )
+            return [n for n in targets if n in procs], KNOWN_PLATFORMS
         if cmd in ("chameleon", "extractor", "fix"):
-            targets = PLATFORMS if target == "all" else [target]
-            return [n for n in targets if n in PLATFORMS], PLATFORMS
+            targets = [n for n in KNOWN_PLATFORMS if n not in stopped] if target == "all" else [target]
+            return [n for n in targets if n in KNOWN_PLATFORMS], KNOWN_PLATFORMS
         if cmd in ("checkins", "checkin", "ins"):
             targets = ALL_PLATFORMS if target == "all" else [target]
             return [n for n in targets if n in ALL_PLATFORMS], ALL_PLATFORMS
@@ -303,37 +320,78 @@ def run_bots():
 
     def _cmd_status():
         print(f"{_BOLD}[Status]{_RESET}")
-        for name in PLATFORMS:
+        for name in KNOWN_PLATFORMS:
+            proc = procs[name]
             if name in stopped:
                 st = "STOPPED (clean exit — needs manual restart)"
-            elif procs[name].poll() is None:
+            elif proc is not None and proc.poll() is None:
                 uptime = int(time.time() - start_times[name])
                 st = f"RUNNING   uptime={uptime}s   crashes={crash_counts[name]}"
                 if pause_flag_path(name).exists():
                     st += "   [PAUSED]"
             else:
-                st = f"DEAD (exit code {procs[name].poll()})"
+                st = f"DEAD (exit code {proc.poll() if proc is not None else 'unknown'})"
             color = _COLORS.get(name, "")
             print(f"  {color}{name.upper()}{_RESET:<20s}  {st}")
 
     def _cmd_stop(valid):
         for name in valid:
-            if procs[name].poll() is None:
-                procs[name].terminate()
-                print(f"[Launcher] {name.upper()} stopped.", flush=True)
+            proc = procs[name]
+            # Mark intent before terminating so the crash monitor cannot race
+            # this explicit stop and relaunch the worker.
             stopped.add(name)
-        if set(PLATFORMS).issubset(stopped):
-            stop_all.set()
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                print(f"[Launcher] {name.upper()} stopped.", flush=True)
+
+    def _prepare_platform(name):
+        """Bring up Chrome/login for a platform that was not in the initial set."""
+        cfg = import_module(f"configs.{name}").config
+        port = _port(cfg)
+        if not is_cdp_ready(port):
+            profile = str(BASE_DIR / "profiles" / name)
+            print(f"[Launcher] {name.upper()}: starting Chrome on port {port}...", flush=True)
+            start_chrome(profile, port)
+            if not wait_for_cdp(port, timeout=30):
+                raise RuntimeError(f"Chrome did not respond on port {port} after 30 s")
+        if name in REACT_PLATFORMS:
+            async def _login():
+                async with async_playwright() as playwright:
+                    await _setup_platform(playwright, name, cfg)
+            asyncio.run(_login())
+
+    def _cmd_start(valid):
+        for name in valid:
+            proc = procs[name]
+            if proc is not None and proc.poll() is None and name not in stopped:
+                print(f"[Launcher] {name.upper()} is already running.", flush=True)
+                continue
+            try:
+                _prepare_platform(name)
+            except Exception as exc:
+                print(f"[Launcher] {name.upper()} could not start: {exc}", flush=True)
+                continue
+            pause_flag_path(name).unlink(missing_ok=True)
+            crash_counts[name] = 0
+            procs[name] = _launch_bot(name)
+            start_times[name] = time.time()
+            stopped.discard(name)
+            print(f"[Launcher] {name.upper()} started.", flush=True)
 
     def _cmd_restart(valid):
         for name in valid:
-            if procs[name].poll() is None:
-                procs[name].terminate()
+            proc = procs[name]
+            if name in stopped or proc is None:
+                _cmd_start([name])
+                continue
+            stopped.add(name)
+            if proc.poll() is None:
+                proc.terminate()
                 time.sleep(1)
-            stopped.discard(name)
             crash_counts[name] = 0
             procs[name]        = _launch_bot(name)
             start_times[name]  = time.time()
+            stopped.discard(name)
             print(f"[Launcher] {name.upper()} restarted.", flush=True)
 
     def _cmd_pause(valid):
@@ -484,7 +542,7 @@ def run_bots():
     # Shared by the terminal parser and the HTTP control API below so a typed
     # command and a dashboard button click run through the exact same code.
     _PER_TARGET_CMDS = {
-        "stop": _cmd_stop, "restart": _cmd_restart, "chameleon": _cmd_chameleon,
+        "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart, "chameleon": _cmd_chameleon,
         "pause": _cmd_pause, "resume": _cmd_resume,
         "extractor": _cmd_extractor, "fix": _cmd_fix,
         "checkins": _cmd_checkins, "checkin": _cmd_checkins, "ins": _cmd_checkins,
@@ -543,11 +601,11 @@ def run_bots():
         # Individual dict/set assignments are atomic here, and a restart race
         # is harmless because the next two-second snapshot corrects it.
         platforms = {}
-        for name in PLATFORMS:
+        for name in KNOWN_PLATFORMS:
             proc = procs[name]
             if name in stopped:
                 platforms[name] = {"state": "stopped"}
-            elif proc.poll() is None:
+            elif proc is not None and proc.poll() is None:
                 platforms[name] = {
                     "state": "running",
                     "uptime": int(time.time() - start_times[name]),
@@ -555,8 +613,8 @@ def run_bots():
                     "paused": pause_flag_path(name).exists(),
                 }
             else:
-                platforms[name] = {"state": "dead", "exit_code": proc.poll()}
-        return jsonify({"ok": True, "platforms": platforms, "all_platforms": ALL_PLATFORMS})
+                platforms[name] = {"state": "dead", "exit_code": proc.poll() if proc is not None else None}
+        return jsonify({"ok": True, "platforms": platforms, "all_platforms": KNOWN_PLATFORMS})
 
     @control_app.post("/control/command")
     def _control_command():
@@ -598,6 +656,8 @@ def run_bots():
                 if name in stopped:
                     continue
                 proc = procs[name]
+                if proc is None:
+                    continue
                 ret  = proc.poll()
                 if ret is None:
                     continue
@@ -629,6 +689,8 @@ def run_bots():
                 _interruptible_sleep(delay)
                 if stop_all.is_set():
                     break
+                if name in stopped:
+                    continue
                 procs[name]       = _launch_bot(name)
                 start_times[name] = time.time()
                 print(f"[Launcher] {name.upper()} restarted.", flush=True)
@@ -638,10 +700,11 @@ def run_bots():
     finally:
         stop_all.set()
         for proc in procs.values():
-            proc.terminate()
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
         time.sleep(2)
         for proc in procs.values():
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 proc.kill()
         print("[Launcher] All bots stopped.")
 
