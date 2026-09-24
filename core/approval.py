@@ -50,13 +50,13 @@ _AUTH_PASS = os.environ.get("APPROVAL_PASS")
 _AUTH = (_AUTH_USER, _AUTH_PASS) if _AUTH_USER and _AUTH_PASS else None
 
 
-def _approval_ws_url() -> str:
+def _approval_ws_url(request_id: str) -> str:
     base = APPROVAL_SERVER_URL.rstrip("/")
     if base.startswith("https://"):
         base = "wss://" + base[len("https://"):]
     elif base.startswith("http://"):
         base = "ws://" + base[len("http://"):]
-    return f"{base}/ws/live"
+    return f"{base}/ws/approval/{request_id}"
 
 
 def _approval_ws_headers() -> dict[str, str]:
@@ -67,8 +67,11 @@ def _approval_ws_headers() -> dict[str, str]:
 
 
 def _request_from_snapshot(payload: str | bytes, request_id: str) -> dict | None:
-    """Find one approval request in a /ws/live full snapshot."""
+    """Read a dedicated approval frame, with old full snapshots as fallback."""
     data = json.loads(payload)
+    if data.get("type") == "approval":
+        item = data.get("request")
+        return item if isinstance(item, dict) and item.get("id") == request_id else None
     if data.get("type") != "snapshot":
         return None
     for bucket in (data.get("pending") or [], data.get("history") or []):
@@ -181,15 +184,15 @@ async def request_approval(
             while True:
                 now = loop.time()
 
-                # WebSocket is the primary decision channel. /ws/live sends an
-                # immediate full snapshot on connect and another one for every
-                # Approve/Reject/Cancel/Skip mutation, so dashboard actions are
-                # consumed without waiting for the old two-second HTTP poll.
+                # WebSocket is the primary decision channel. The request-specific
+                # stream sends only this approval and its decision, so a bot does
+                # not download dashboard history while it waits. HTTP remains the
+                # fail-safe when a socket cannot connect.
                 if ws is None and WebSocketClient is not None and now >= next_ws_retry:
                     try:
                         ws = await asyncio.to_thread(
                             WebSocketClient,
-                            _approval_ws_url(),
+                            _approval_ws_url(req_id),
                             headers=_approval_ws_headers(),
                             ping_interval=20,
                         )

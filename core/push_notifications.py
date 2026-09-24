@@ -160,8 +160,8 @@ def queue_approval(request_data: dict, pending_count: int):
         {
             "title": f"{request_data.get('platform', 'Chat')} needs approval",
             "body": message,
-            "icon": "/static/icons/zenox-192.png",
-            "badge": "/static/icons/zenox-192.png",
+            "icon": "/static/icons/zenox-192-v2.png",
+            "badge": "/static/icons/zenox-192-v2.png",
             "tag": f"approval-{request_id}",
             "url": f"/?approval={request_id}",
             "requestId": request_id,
@@ -175,8 +175,8 @@ def queue_test(endpoint: str):
         {
             "title": "Zenox notifications enabled",
             "body": "Your phone will alert you when a reply needs approval.",
-            "icon": "/static/icons/zenox-192.png",
-            "badge": "/static/icons/zenox-192.png",
+            "icon": "/static/icons/zenox-192-v2.png",
+            "badge": "/static/icons/zenox-192-v2.png",
             "tag": "zenox-notification-test",
             "url": "/",
             "pendingCount": 0,

@@ -1419,8 +1419,8 @@ def push_test():
         result = push_notifications.queue_payload({
             "title": "Zenox system check",
             "body": "Live phone notifications are working correctly.",
-            "icon": "/static/icons/zenox-192.png",
-            "badge": "/static/icons/zenox-192.png",
+            "icon": "/static/icons/zenox-192-v2.png",
+            "badge": "/static/icons/zenox-192-v2.png",
             "tag": "zenox-system-check",
             "url": "/",
             "pendingCount": 0,
@@ -1687,7 +1687,8 @@ def update_status():
     if pid is not None and pid <= 0:
         pid = None
     with _lock:
-        _status[platform] = {
+        previous = _status.get(platform)
+        current = {
             "pid": pid,
             "state": body.get("state") or "unknown",
             "detail": body.get("detail") or "",
@@ -1696,7 +1697,17 @@ def update_status():
             "checkpoint": body.get("checkpoint") or "",
             "updated_at": _now(),
         }
-    _bump_state()
+        _status[platform] = current
+        # Periodic status posts are heartbeats as well as state reports. Keep
+        # their timestamp current, but rebuild every dashboard only when the
+        # meaningful workflow state changed.
+        changed = previous is None or any(
+            previous.get(key) != current.get(key)
+            for key in current
+            if key != "updated_at"
+        )
+    if changed:
+        _bump_state()
     return jsonify({"ok": True})
 
 
@@ -1762,10 +1773,19 @@ def _control_status_poller():
     while True:
         result = _fetch_control_status_live()
         previous = _control_status_cached()
-        # Uptime changes while the launcher CMD and child bot processes are
-        # alive, so this also acts as a process heartbeat. Bumping the shared
-        # version pushes the new liveness snapshot over /ws/live immediately.
-        changed = result != previous
+        # Uptime is display-only and changes every second. Ignoring it here
+        # prevents a full WebSocket snapshot and DOM rebuild every poll while
+        # still pushing every meaningful lifecycle change immediately.
+        def semantic(value):
+            if not isinstance(value, dict):
+                return value
+            return {
+                key: semantic(item)
+                for key, item in value.items()
+                if key != "uptime"
+            }
+
+        changed = semantic(result) != semantic(previous)
         with _control_cache_lock:
             _control_cache = result
         if changed:
@@ -1824,16 +1844,57 @@ if sock:
         last_version = None
         try:
             while True:
+                send_snapshot = False
                 with _state_cond:
-                    changed = last_version is None or _state_version != last_version
-                    if not changed:
-                        # A periodic snapshot is the process-liveness heartbeat
-                        # for bots launched from /bots. Their Popen state can
-                        # change without an HTTP status mutation to wake us.
-                        _state_cond.wait(timeout=5.0)
-                        changed = _state_version != last_version
+                    if last_version is None or _state_version != last_version:
+                        send_snapshot = True
+                    else:
+                        _state_cond.wait(timeout=15.0)
+                        send_snapshot = _state_version != last_version
                     last_version = _state_version
-                ws.send(json.dumps(_full_snapshot()))
+                if send_snapshot:
+                    ws.send(json.dumps(_full_snapshot()))
+                else:
+                    with _lock:
+                        status = dict(_status)
+                    ws.send(json.dumps({
+                        "type": "heartbeat",
+                        "version": last_version,
+                        "status": status,
+                    }))
+        except ConnectionClosed:
+            pass
+        except Exception:
+            pass
+
+    @sock.route("/ws/approval/<request_id>")
+    def ws_approval(ws, request_id):
+        """Small decision stream for one bot; never sends dashboard history."""
+        last_payload = None
+        try:
+            while True:
+                with _lock:
+                    item = _requests.get(request_id)
+                    current = (
+                        {key: value for key, value in item.items() if key != "_seq"}
+                        if item else None
+                    )
+                payload = json.dumps(
+                    {"type": "approval", "request": current},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if payload != last_payload:
+                    ws.send(payload)
+                    last_payload = payload
+                else:
+                    ws.send(json.dumps({"type": "heartbeat"}))
+                if current and current.get("status") in {
+                    "approved", "rejected", "cancelled", "skip_requested",
+                }:
+                    return
+                with _state_cond:
+                    _state_cond.wait(timeout=15.0)
         except ConnectionClosed:
             pass
         except Exception:
@@ -1930,7 +1991,8 @@ _PAGE = """<!doctype html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="Zenox" />
 <link rel="manifest" href="/static/manifest.webmanifest" />
-<link rel="apple-touch-icon" href="/static/icons/zenox-180.png" />
+<link rel="icon" type="image/png" href="/static/icons/zenox-192-v2.png" />
+<link rel="apple-touch-icon" href="/static/icons/zenox-180-v2.png" />
 <title>Chat Approval Dashboard</title>
 <style>
   :root {
@@ -3370,8 +3432,10 @@ function detectorFor(name) {
   const telemetryFresh = s && Number.isFinite(updatedMs) && Date.now() - updatedMs <= STATUS_STALE_MS;
 
   // launch_all.py owns the bot subprocesses, so its live process state is the
-  // authority for online/offline. Workflow pings only provide the richer
-  // Waiting/Generating/etc. label while they are fresh.
+  // authority for online/offline. Workflow telemetry provides the richer
+  // Waiting/Generating/etc. label. If a long browser operation outlives the
+  // freshness window, retain that last known stage instead of collapsing to
+  // a vague "Running" state while the launcher still confirms the process.
   if (processStopped) {
     const label = process.state === "dead" ? "Process stopped" : "Stopped";
     return { live: false, label, color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "" };
@@ -3385,10 +3449,19 @@ function detectorFor(name) {
       retryCount: 0, warning: "", checkpoint: "paused",
     };
   }
-  if (processRunning && !telemetryFresh) {
+  if (processRunning && s && !telemetryFresh) {
+    const meta = STATE_META[s.state] || { label: s.state, color: "var(--info)" };
+    const age = Number.isFinite(updatedMs) ? timeAgo(s.updated_at) : "an unknown time ago";
+    return {
+      live: true, label: meta.label, color: meta.color,
+      detail: `${s.detail || meta.label} · last update ${age}; process is online`, state: s.state,
+      retryCount: Number(s.retry_count || 0), warning: s.warning || "", checkpoint: s.checkpoint || "",
+    };
+  }
+  if (processRunning && !s) {
     return {
       live: true, label: "Running", color: "var(--success)",
-      detail: "Bot process is online; waiting for a workflow update", state: "waiting",
+      detail: "Bot process is online; waiting for its first workflow update", state: "starting",
       retryCount: 0, warning: "", checkpoint: "",
     };
   }
@@ -4101,6 +4174,11 @@ function connectLive() {
   socket.onmessage = (ev) => {
     try {
       const snapshot = JSON.parse(ev.data);
+      if (snapshot.type === "heartbeat") {
+        if (snapshot.status) liveStatus = snapshot.status;
+        renderSystemStatus();
+        return;
+      }
       if (document.activeElement && document.activeElement.classList.contains("reply-input")) {
         deferredSnapshot = snapshot;
         return;
@@ -4184,6 +4262,7 @@ _BOTS_PAGE = r"""<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Bots — Launcher</title>
+<link rel="icon" type="image/png" href="/static/icons/zenox-192-v2.png" />
 <style>
   :root {
     --background: #09090b; --foreground: #fafafa;
@@ -4715,7 +4794,12 @@ function connectBotsLive() {
     return;
   }
   botsLiveSocket.onopen = () => { botsLiveConnected = true; botsReconnectDelay = 1000; };
-  botsLiveSocket.onmessage = event => { try { applyBotSnapshot(JSON.parse(event.data)); } catch (error) {} };
+  botsLiveSocket.onmessage = event => {
+    try {
+      const snapshot = JSON.parse(event.data);
+      if (snapshot.type !== "heartbeat") applyBotSnapshot(snapshot);
+    } catch (error) {}
+  };
   botsLiveSocket.onclose = () => {
     botsLiveConnected = false;
     setTimeout(connectBotsLive, botsReconnectDelay);

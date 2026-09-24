@@ -1,9 +1,9 @@
-const CACHE_NAME = "zenox-pwa-v1";
+const CACHE_NAME = "zenox-pwa-v2";
 const APP_ASSETS = [
   "/",
   "/static/manifest.webmanifest",
-  "/static/icons/zenox-192.png",
-  "/static/icons/zenox-512.png"
+  "/static/icons/zenox-192-v2.png",
+  "/static/icons/zenox-512-v2.png"
 ];
 
 self.addEventListener("install", event => {
@@ -34,8 +34,8 @@ self.addEventListener("push", event => {
   const pendingCount = Number(data.pendingCount || 0);
   const notify = self.registration.showNotification(data.title || "Zenox approval", {
     body: data.body || "A generated reply is waiting for your decision.",
-    icon: data.icon || "/static/icons/zenox-192.png",
-    badge: data.badge || "/static/icons/zenox-192.png",
+    icon: data.icon || "/static/icons/zenox-192-v2.png",
+    badge: data.badge || "/static/icons/zenox-192-v2.png",
     tag: data.tag || "zenox-approval",
     renotify: true,
     data: { url: data.url || "/", requestId: data.requestId || null }
