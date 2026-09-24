@@ -3697,11 +3697,15 @@ async function runControl(btn, slug, cmd) {
       detail: data.ok ? "" : (data.error || `HTTP ${res.status}`),
       duration: data.ok ? 3000 : 6000,
     });
-    showControlOutput(slug, data.ok ? (data.output || "(no output)") : `Error: ${data.error || res.status}`);
+    if (cmd === "pools") {
+      closeControlOutput(slug);
+    } else {
+      showControlOutput(slug, data.ok ? (data.output || "(no output)") : `Error: ${data.error || res.status}`);
+    }
   } catch (e) {
     dismiss();
     toast(`${slug}: ${cmd} failed`, { type: "error", detail: "Request failed — check your connection." });
-    showControlOutput(slug, `Request failed: ${e}`);
+    if (cmd !== "pools") showControlOutput(slug, `Request failed: ${e}`);
   } finally {
     btn.disabled = false;
     btn.textContent = original;
