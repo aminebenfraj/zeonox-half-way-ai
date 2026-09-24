@@ -68,6 +68,7 @@ from core.approval import (
     ApprovalCancelled, ApprovalSkipped,
 )
 from core.chameleon_data import read_extracted_data
+from core.runtime_settings import get_runtime_settings
 from core.justlo_login import (
     login_justlo,
     go_console,
@@ -1106,7 +1107,8 @@ class JustloBot:
                     is_fc = await self._is_first_contact(tab2)
                     extracted = await read_extracted_data(tab2)
 
-                    if is_fc:
+                    fc_policy = get_runtime_settings()["fc_contact_policy"]
+                    if is_fc and fc_policy == "skip":
                         # Chameleon is the sole authority on First Contact — hand over
                         # only when it says so, never based on the local DOM grid.
                         self.log("[FC] Chameleon flagged First Contact — "
@@ -1114,6 +1116,9 @@ class JustloBot:
                         await self._run_fc_exit_workflow(tab1, tab2, sig)
                         cycle -= 1
                         continue
+                    if is_fc:
+                        self.log("[FC] Chameleon flagged First Contact — Settings says "
+                                 "to answer it as a normal conversation.")
 
                     try:
                         reply_type = await self._queue_task_type(tab1)

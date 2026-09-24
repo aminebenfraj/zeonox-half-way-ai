@@ -35,6 +35,8 @@ coverage.xml
 
 # Environment variables
 .env
+.runtime_settings.json
+.pause_*.flag
 .env.*
 !.env.example
 

@@ -39,6 +39,16 @@ keys without restarting the dashboard. Saved keys are written to the ignored
 suffixes to the browser. **Check all** performs a small live request against
 each configured provider.
 
+Open `/settings` (or choose **Settings** in the sidebar) for policies shared
+by every platform. Manual mode can show or skip Judge analysis while still
+requiring human approval. Automatic mode can use the current 10/10 + manual
+fallback, reject lower Judge scores so the bot regenerates, or send directly
+without Judge. Justlo, Linduu, and Gnoxx can either transfer/skip Chameleon
+First Contact conversations or answer them through the normal workflow.
+Choices are saved locally in the ignored `.runtime_settings.json` file and
+are read for each new conversation. When the file does not exist, the current
+production behavior remains unchanged.
+
 To run only the dashboard, double-click `launch_dashboard.bat`.
 
 ## Private phone access with Tailscale

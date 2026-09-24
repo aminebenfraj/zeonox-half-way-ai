@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#09090b" />
+  <title>Settings — Zenox</title>
+  <link rel="icon" type="image/png" href="/static/icons/zenox-192-v2.png" />
+  <style>
+    :root{color-scheme:dark;--bg:#09090b;--card:#18181b;--border:#27272a;--text:#fafafa;--muted:#a1a1aa;--primary:#6366f1;--success:#22c55e;--warning:#f59e0b}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,sans-serif;padding:8px}
+    main{width:min(920px,100%);min-height:calc(100vh - 16px);margin:auto;padding:32px clamp(18px,4vw,46px) 60px;border:1px solid var(--border);border-radius:12px;background:var(--bg)}
+    .top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:28px}.eyebrow{margin:0;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}h1{margin:5px 0 4px;font-size:26px;letter-spacing:-.035em}p{margin:0;color:var(--muted)}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}a{min-height:42px;padding:10px 14px;border:1px solid var(--border);border-radius:7px;background:var(--card);color:var(--text);text-decoration:none;font-weight:650}a:hover{filter:brightness(1.1)}
+    .section{margin-top:16px;padding:20px;border:1px solid var(--border);border-radius:10px;background:var(--card)}.section-head{margin-bottom:15px}.section h2{margin:0 0 4px;font-size:17px}.scope{display:inline-flex;margin-top:8px;padding:3px 8px;border:1px solid rgba(99,102,241,.35);border-radius:999px;background:rgba(99,102,241,.1);color:#c7d2fe;font-size:11px;font-weight:750}
+    .options{display:grid;gap:9px}.option{display:grid;grid-template-columns:20px 1fr;gap:11px;padding:14px;border:1px solid var(--border);border-radius:9px;background:#101014;cursor:pointer;transition:border-color .15s,background .15s}.option:hover{border-color:#3f3f46}.option:has(input:checked){border-color:var(--primary);background:rgba(99,102,241,.09)}input{margin:3px 0 0;accent-color:var(--primary)}.option strong{display:block;margin-bottom:2px}.option small{display:block;color:var(--muted);line-height:1.45}.option .warning{color:#fbbf24}
+    .save-state{min-height:22px;margin-top:16px;color:var(--muted);font-size:12px}.save-state.ok{color:var(--success)}.save-state.bad{color:#f87171}.default-note{margin-top:18px;padding:12px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:#101014}
+    @media(max-width:680px){body{padding:0}main{min-height:100vh;border:0;border-radius:0;padding-top:20px}.top{flex-direction:column}.actions{width:100%}.actions a{flex:1;text-align:center}}
+  </style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div><p class="eyebrow">Zenox settings</p><h1>Automation Settings</h1><p>Choose how automatic chats and First Contact conversations are handled.</p></div>
+    <nav class="actions"><a href="/">Approval Queue</a><a href="/bots">Bots</a><a href="/api-keys">API Keys</a></nav>
+  </header>
+
+  <section class="section">
+    <div class="section-head"><h2>Automatic-mode decision policy</h2><p>This affects every platform that is currently set to Automatic mode.</p><span class="scope">All platform chats</span></div>
+    <div class="options" id="autoOptions">
+      <label class="option"><input type="radio" name="auto_mode_policy" value="judge_manual_fallback"><span><strong>Judge + manual fallback — current behavior</strong><small>A 10/10 reply sends automatically. A lower score or unavailable Judge waits in Approval Queue.</small></span></label>
+      <label class="option"><input type="radio" name="auto_mode_policy" value="judge_regenerate"><span><strong>Judge decides and regenerates</strong><small>A 10/10 reply sends automatically. A lower score is rejected automatically so the bot generates another reply. If every Judge provider fails, it safely waits for manual approval.</small></span></label>
+      <label class="option"><input type="radio" name="auto_mode_policy" value="direct"><span><strong>Send directly without Judge</strong><small class="warning">The generated reply sends immediately after the existing meeting and banned-language safety checks. It does not wait for a Judge score or human approval.</small></span></label>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head"><h2>Judge in Manual mode</h2><p>Manual mode always waits for your approval. This controls whether the Judge also analyzes the card.</p><span class="scope">All platform chats</span></div>
+    <div class="options">
+      <label class="option"><input type="radio" name="manual_judge_policy" value="enabled"><span><strong>Use Judge — current behavior</strong><small>The card waits for you and receives a Judge score, verdict, and analysis in the background.</small></span></label>
+      <label class="option"><input type="radio" name="manual_judge_policy" value="disabled"><span><strong>Do not use Judge</strong><small>The card still waits for your approval, but no Judge provider is called and no score is added.</small></span></label>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head"><h2>First Contact handling</h2><p>Used only when Chameleon marks a conversation as First Contact.</p><span class="scope">Justlo · Linduu · Gnoxx</span></div>
+    <div class="options" id="fcOptions">
+      <label class="option"><input type="radio" name="fc_contact_policy" value="skip"><span><strong>Transfer or skip — current behavior</strong><small>Hand the FC conversation to another moderator, falling back to skip when nobody is available.</small></span></label>
+      <label class="option"><input type="radio" name="fc_contact_policy" value="answer"><span><strong>Answer as a normal conversation</strong><small>Continue with the already extracted chat, generate a reply, then follow that platform’s Manual or Automatic mode policy.</small></span></label>
+    </div>
+  </section>
+
+  <div class="save-state" id="saveState" aria-live="polite">Loading settings…</div>
+  <div class="default-note">If you never change these controls, Zenox keeps the exact current flow: Judge analysis in Manual mode, Judge with manual fallback in Automatic mode, and FC contacts transfer or skip.</div>
+</main>
+<script>
+const saveState=document.getElementById("saveState");
+let loaded=false;
+
+async function loadSettings(){
+  try{
+    const response=await fetch("/api/settings");
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    const settings=await response.json();
+    for(const [name,value] of Object.entries(settings)){
+      const input=document.querySelector(`input[name="${name}"][value="${value}"]`);
+      if(input)input.checked=true;
+    }
+    loaded=true;saveState.className="save-state";saveState.textContent="Changes save automatically.";
+  }catch(error){saveState.className="save-state bad";saveState.textContent=`Could not load settings: ${error.message}`;}
+}
+
+async function saveSetting(input){
+  if(!loaded)return;
+  const radios=[...document.querySelectorAll(`input[name="${input.name}"]`)];
+  radios.forEach(item=>item.disabled=true);
+  saveState.className="save-state";saveState.textContent="Saving…";
+  try{
+    const response=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({[input.name]:input.value})});
+    const result=await response.json().catch(()=>({}));
+    if(!response.ok||!result.ok)throw new Error(result.error||`HTTP ${response.status}`);
+    saveState.className="save-state ok";saveState.textContent="Saved. New conversations will use this setting immediately.";
+  }catch(error){saveState.className="save-state bad";saveState.textContent=`Could not save: ${error.message}`;await loadSettings();}
+  finally{radios.forEach(item=>item.disabled=false);}
+}
+
+document.querySelectorAll("input[type=radio]").forEach(input=>input.addEventListener("change",()=>saveSetting(input)));
+loadSettings();
+</script>
+</body>
+</html>

@@ -45,6 +45,7 @@ from core.platforms import (
     REACT_PLATFORM_SLUGS,
     SELF_MANAGED_PLATFORM_SLUGS,
 )
+from core.platform_operations import run_browser_operation
 
 BASE_DIR = Path(__file__).parent
 
@@ -109,6 +110,7 @@ _HELP = (
     "  chameleon [platform|all]  — check if Chameleon tab is on the right page\n"
     "  extractor [platform|all]  — force-activate the Chat Extractor tab\n"
     "  fix [platform|all]        — full Chameleon re-setup: navigate + login + select chat + extractor tab\n"
+    "  pools [justlo|linduu|gnoxx] — open the moderation Pools queue and resume the bot\n"
     "  checkins [platform|all]   — open 'Meine Statistiken' and report money made (Ins + ASA Outs)\n"
     "  checkinall                — save/update a Desktop note (checkinall.txt) with money made across all accounts\n"
     "  help                      — show this list\n"
@@ -313,6 +315,10 @@ def run_bots():
         if cmd in ("chameleon", "extractor", "fix"):
             targets = [n for n in KNOWN_PLATFORMS if n not in stopped] if target == "all" else [target]
             return [n for n in targets if n in KNOWN_PLATFORMS], KNOWN_PLATFORMS
+        if cmd == "pools":
+            options = ["justlo", "linduu", "gnoxx"]
+            targets = options if target == "all" else [target]
+            return [n for n in targets if n in options], options
         if cmd in ("checkins", "checkin", "ins"):
             targets = ALL_PLATFORMS if target == "all" else [target]
             return [n for n in targets if n in ALL_PLATFORMS], ALL_PLATFORMS
@@ -475,6 +481,13 @@ def run_bots():
                         print(f"[{name.upper()}] Fix failed: {exc}", flush=True)
         asyncio.run(_fix_chameleon(valid))
 
+    def _cmd_pools(valid):
+        output = asyncio.run(run_browser_operation("pools", valid))
+        print(output, flush=True)
+        for name in valid:
+            # The Pools control is explicitly a recovery/resume command.
+            pause_flag_path(name).unlink(missing_ok=True)
+
     def _cmd_checkins(valid):
         async def _check_ins(names):
             from core.checkinall import IN_VALUE, ASA_OUT_VALUE
@@ -544,7 +557,7 @@ def run_bots():
     _PER_TARGET_CMDS = {
         "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart, "chameleon": _cmd_chameleon,
         "pause": _cmd_pause, "resume": _cmd_resume,
-        "extractor": _cmd_extractor, "fix": _cmd_fix,
+        "extractor": _cmd_extractor, "fix": _cmd_fix, "pools": _cmd_pools,
         "checkins": _cmd_checkins, "checkin": _cmd_checkins, "ins": _cmd_checkins,
     }
 

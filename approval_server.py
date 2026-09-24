@@ -63,6 +63,7 @@ from core.launcher import is_cdp_ready
 from core.bot_lifecycle import LauncherClient
 from core.bot import pause_flag_path
 from core.platform_operations import run_browser_operation
+from core.runtime_settings import get_runtime_settings, update_runtime_settings
 from core.platforms import (
     KNOWN_PLATFORM_LABELS,
     PLATFORM_BY_SLUG,
@@ -1201,13 +1202,15 @@ def _judge_reply(platform: str, last_message: str, customer_message: str,
 
 
 def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: bool,
-                             auto_final_reply: str) -> None:
+                             auto_final_reply: str, auto_policy: str) -> None:
     """Evaluate a queued reply without blocking the bot's approval POST.
 
     The request is inserted before this worker starts, so the bot always gets
     its request id quickly and waits on exactly one card. Auto-pilot requests
     remain pending until a perfect Judge result promotes that same request to
-    approved; a failed/non-perfect result simply leaves it for manual review.
+    approved. Depending on Settings, a non-perfect result either leaves that
+    same card for manual review or rejects it so the bot regenerates. Provider
+    failure always falls back to manual review.
     """
     judge_result = _judge_reply(**judge_payload)
     judge_score = judge_result.get("score") if judge_result["ok"] else None
@@ -1233,6 +1236,12 @@ def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: b
                 item["auto"] = True
                 item["final_reply"] = auto_final_reply
                 item["decided_at"] = _now()
+            elif judge_result["ok"] and auto_policy == "judge_regenerate":
+                # All bot implementations already interpret a rejection as
+                # "discard this candidate and generate a fresh reply".
+                item["status"] = "rejected"
+                item["auto"] = True
+                item["decided_at"] = _now()
             else:
                 should_notify = True
                 created_request = dict(item)
@@ -1240,6 +1249,8 @@ def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: b
     if auto_candidate:
         if judge_result["ok"] and judge_score == 10:
             print(f"[Judge] {judge_payload['platform']} reply scored 10/10 — auto-approved")
+        elif judge_result["ok"] and auto_policy == "judge_regenerate":
+            print(f"[Judge] {judge_payload['platform']} reply scored {judge_score}/10 — regenerating")
         elif judge_result["ok"]:
             print(f"[Judge] {judge_payload['platform']} reply scored {judge_score}/10 — holding for manual review")
         else:
@@ -1301,6 +1312,8 @@ def create_request():
     conversation_direction = alert_result.get("direction", "") if alert_result["ok"] else ""
     conversation_client_expectation = alert_result.get("client_expectation", "") if alert_result["ok"] else ""
 
+    runtime_settings = get_runtime_settings()
+    auto_policy = runtime_settings["auto_mode_policy"]
     with _lock:
         # A platform's own override (set on /bots) wins over the dashboard's
         # global default — this is what makes "auto for Xkuss, manual for
@@ -1330,12 +1343,15 @@ def create_request():
             if result["contains_meeting"] and result["reply"]:
                 final_reply = result["reply"]
 
-    # Judge AI is intentionally asynchronous. Provider fallbacks can take
-    # longer than the bot client's request timeout; blocking this POST would
-    # leave a valid card behind while the bot assumes submission failed and
-    # generates another reply. Auto mode remains fail-safe: this request stays
-    # pending until the background Judge gives it a perfect 10.
-    auto_candidate = auto
+    # Judge AI is intentionally asynchronous whenever it is enabled. Provider
+    # fallbacks can outlive the bot client's POST timeout, so the card is always
+    # inserted first. Direct Auto mode skips the Judge entirely; the other Auto
+    # policies remain pending until the background decision arrives.
+    direct_auto = auto and auto_policy == "direct"
+    auto_candidate = auto and not direct_auto
+    run_judge = auto_candidate or (
+        not auto and runtime_settings["manual_judge_policy"] == "enabled"
+    )
     judge_payload = dict(
         platform=platform,
         last_message=last_message,
@@ -1361,13 +1377,14 @@ def create_request():
             "reply_type": reply_type,
             "reply": reply,
             "reply_en": reply_en,
-            "final_reply": None,
-            "status": "pending",
+            "final_reply": final_reply if direct_auto else None,
+            "status": "approved" if direct_auto else "pending",
             "created_at": body.get("created_at") or now,
-            "decided_at": None,
+            "decided_at": now if direct_auto else None,
             "sent_at": None,
             "error": None,
-            "auto": False,
+            "auto": direct_auto,
+            "auto_policy": auto_policy if auto else None,
             "meeting_guard": meeting_guard,
             "contains_meeting": contains_meeting,
             "judge_score": None,
@@ -1376,7 +1393,8 @@ def create_request():
             "judge_analysis": None,
             "judge_provider": None,
             "judge_error": None,
-            "judge_pending": True,
+            "judge_enabled": run_judge,
+            "judge_pending": run_judge,
             "meeting_alert_requested": meeting_alert_requested,
             "meeting_alert_reason": meeting_alert_reason,
             "conversation_tone": conversation_tone,
@@ -1388,16 +1406,18 @@ def create_request():
         created_request = dict(_requests[req_id])
         pending_count = sum(1 for item in _requests.values() if item["status"] == "pending")
     _bump_state()
-    if not auto_candidate:
+    if not auto_candidate and not direct_auto:
         push_notifications.queue_approval(created_request, pending_count)
-    _judge_pool.submit(
-        _complete_judge_analysis,
-        req_id,
-        judge_payload,
-        auto_candidate,
-        final_reply,
-    )
-    return jsonify({"id": req_id, "auto": False, "meeting_guard": meeting_guard}), 201
+    if run_judge:
+        _judge_pool.submit(
+            _complete_judge_analysis,
+            req_id,
+            judge_payload,
+            auto_candidate,
+            final_reply,
+            auto_policy,
+        )
+    return jsonify({"id": req_id, "auto": direct_auto, "meeting_guard": meeting_guard}), 201
 
 
 @app.get("/api/push/config")
@@ -1466,6 +1486,25 @@ def push_unsubscribe():
 def get_mode():
     with _lock:
         return jsonify({"mode": _mode})
+
+
+@app.get("/api/settings")
+def get_settings():
+    """Return operator policies shared by every platform process."""
+    return jsonify(get_runtime_settings())
+
+
+@app.post("/api/settings")
+def save_settings():
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        settings = update_runtime_settings(body)
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except OSError as error:
+        return jsonify({"ok": False, "error": f"Could not save settings: {error}"}), 500
+    _bump_state()
+    return jsonify({"ok": True, "settings": settings})
 
 
 @app.post("/api/mode")
@@ -1910,6 +1949,11 @@ def control_command():
         return jsonify({"ok": False, "error": "cmd is required"}), 400
     if target != "all" and target not in PLATFORM_BY_SLUG:
         return jsonify({"ok": False, "error": f"unknown platform '{target}'"}), 404
+    if cmd == "pools" and target not in {"justlo", "linduu", "gnoxx"}:
+        return jsonify({
+            "ok": False,
+            "error": "Pools is available only for Justlo, Linduu, and Gnoxx",
+        }), 400
 
     # Pause flags are deliberately file-based inside every worker, so the web
     # app can control them even when the optional launcher API is offline.
@@ -1951,7 +1995,12 @@ def control_command():
             _checkinall_lock.release()
 
     control_available = bool(_control_status_cached().get("available"))
-    if not control_available and cmd in ("fix", "chameleon", "extractor"):
+    # Pools is always handled by the current dashboard code so it works even
+    # when the long-running launcher predates this command. Other browser
+    # operations stay local only when launcher control is unavailable.
+    if cmd == "pools" or (
+        not control_available and cmd in ("fix", "chameleon", "extractor")
+    ):
         statuses = _all_bot_statuses()
         targets = (
             [slug for slug, status in statuses.items() if status.get("running")]
@@ -1960,6 +2009,9 @@ def control_command():
         )
         try:
             output = asyncio.run(run_browser_operation(cmd, targets))
+            if cmd == "pools":
+                pause_flag_path(target).unlink(missing_ok=True)
+                _bump_state()
             return jsonify({"ok": True, "output": output})
         except Exception as error:
             return jsonify({"ok": False, "error": f"{cmd.title()} failed: {error}"}), 500
@@ -1974,6 +2026,11 @@ def control_command():
             # fix/checkins/checkinall drive real Chrome tabs and can take a while
             timeout=120,
         )
+        if cmd == "pools" and r.is_success:
+            # Pools is a recovery/resume action. Clear a pending dashboard pause
+            # only after the real browser click succeeds.
+            pause_flag_path(target).unlink(missing_ok=True)
+            _bump_state()
         return Response(r.content, status=r.status_code, mimetype="application/json")
     except Exception as e:
         return jsonify({"ok": False, "error": f"Launcher control server unreachable at {LAUNCHER_CONTROL_URL}: {e}"}), 502
@@ -2871,6 +2928,7 @@ _PAGE = """<!doctype html>
       <span class="sidebar-icon">⌁</span><span>Approval Queue</span><span class="sidebar-badge" id="sidebarPendingBadge">0</span>
     </a>
     <a href="/bots" class="sidebar-link"><span class="sidebar-icon">◫</span><span>Bots</span></a>
+    <a href="/settings" class="sidebar-link"><span class="sidebar-icon">⚙</span><span>Settings</span></a>
     <a href="/api-keys" class="sidebar-link"><span class="sidebar-icon">⌘</span><span>API Keys</span></a>
   </nav>
   <div class="mode-box sidebar-group">
@@ -2927,7 +2985,7 @@ _PAGE = """<!doctype html>
       <div class="ctrl-output-body" id="checkinAllOutputBody"></div>
     </div>
     <div class="ctrl-unavailable" id="ctrlUnavailableNote" style="display:none">
-      Advanced launcher controls are offline. Pause, Resume, Fix, Chameleon, Extractor, Stop, and Check-in All still work from the web app; Restart and per-platform money checks require the launcher.
+      Advanced launcher controls are offline. Pause, Resume, Fix, Chameleon, Extractor, Pools, Stop, and Check-in All still work from the web app; Restart requires the launcher.
     </div>
   </div>
 
@@ -3586,9 +3644,9 @@ const CTRL_BUTTONS = [
   { cmd: "fix",       label: "Fix" },
   { cmd: "chameleon", label: "Chameleon" },
   { cmd: "extractor", label: "Extractor" },
-  { cmd: "checkins",  label: "Ins (money)" },
   { cmd: "stop",      label: "Stop", cls: "danger" },
 ];
+const POOLS_PLATFORMS = new Set(["justlo", "linduu", "gnoxx"]);
 
 async function refreshControlStatus() {
   try {
@@ -3615,7 +3673,7 @@ function fmtUptime(seconds) {
 
 const CTRL_VERBS = {
   restart: "Restarting", fix: "Running Fix on", chameleon: "Opening Chameleon tab for",
-  extractor: "Opening Extractor tab for", checkins: "Checking in", stop: "Stopping",
+  extractor: "Opening Extractor tab for", pools: "Opening Pools for", stop: "Stopping",
 };
 
 async function runControl(btn, slug, cmd) {
@@ -3675,9 +3733,13 @@ function ctrlBarHtml(name) {
       : st.state === "dead" ? `DEAD (exit ${st.exit_code})` : "STOPPED";
     pillHtml = `<span class="ctrl-status-pill ${escapeHtml(st.state)}">${escapeHtml(label)}</span>`;
   }
+  let platformButtons = [...CTRL_BUTTONS];
+  if (POOLS_PLATFORMS.has(slug)) {
+    platformButtons.splice(4, 0, { cmd: "pools", label: "Pools" });
+  }
   const availableButtons = controlsAvailable
-    ? CTRL_BUTTONS
-    : CTRL_BUTTONS.filter(b => ["fix", "chameleon", "extractor", "stop"].includes(b.cmd));
+    ? platformButtons
+    : platformButtons.filter(b => ["fix", "chameleon", "extractor", "pools", "stop"].includes(b.cmd));
   const buttons = availableButtons.map(b =>
     `<button class="ctrl-btn ${b.cls || ""}" onclick="runControl(this, '${slug}', '${b.cmd}')">${escapeHtml(b.label)}</button>`
   ).join("");
@@ -3757,6 +3819,8 @@ function extractedDataHtml(r) {
 // confused with a missing UI feature.
 function judgePanelHtml(r) {
   const hasScore = r.judge_score !== null && r.judge_score !== undefined && Number.isFinite(Number(r.judge_score));
+  const disabled = r.judge_enabled === false;
+  if (disabled) return "";
   const score = hasScore ? Number(r.judge_score) : null;
   const state = hasScore ? (score === 10 ? "excellent" : (score >= 7 ? "review" : "risk")) : (r.judge_error ? "error" : "unchecked");
   const verdict = hasScore ? (r.judge_verdict || (score === 10 ? "Ready to send" : "Human review advised")) : (r.judge_error ? "Judge unavailable" : "Not evaluated");
@@ -4512,6 +4576,7 @@ _BOTS_PAGE = r"""<!doctype html>
 <div id="modalRoot"></div>
 <div class="topbar">
   <a class="back-link" href="/">&larr; Approval Dashboard</a>
+  <a class="back-link" href="/settings">Settings</a>
   <div>
     <h1>Bots</h1>
     <p>Start, stop, and configure every platform from one place. Each card controls only its own bot.</p>
@@ -4861,6 +4926,11 @@ def bots_page():
 @app.get("/api-keys")
 def api_keys_page():
     return render_template("api_keys.html")
+
+
+@app.get("/settings")
+def settings_page():
+    return render_template("settings.html")
 
 
 def main():
