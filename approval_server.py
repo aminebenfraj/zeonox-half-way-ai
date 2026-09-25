@@ -3404,6 +3404,10 @@ async function initPushNotifications() {
   try {
     serviceWorkerRegistration = await navigator.serviceWorker.register("/service-worker.js", { scope: "/" });
     serviceWorkerRegistration = await navigator.serviceWorker.ready;
+    // iOS can keep an installed Home Screen app alive for days. Explicitly
+    // check for a newer worker whenever the UI is opened instead of waiting
+    // for Safari's next periodic update check.
+    serviceWorkerRegistration.update().catch(() => {});
     currentPushSubscription = await serviceWorkerRegistration.pushManager.getSubscription();
     if (Notification.permission === "denied") renderPushToggle("denied");
     else renderPushToggle(currentPushSubscription ? "enabled" : "disabled");
@@ -4342,7 +4346,7 @@ async function refresh() {
   refreshControlStatus();
   try {
     const readJson = async url => {
-      const response = await fetch(url);
+      const response = await fetch(url, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return response.json();
     };
@@ -4377,6 +4381,7 @@ let liveSocket = null;
 let liveConnected = false;
 let wsReconnectDelay = 1000;
 let deferredSnapshot = null;
+let liveReconnectTimer = null;
 
 function setLiveIndicator(connected) {
   const badge = document.getElementById("liveBadge");
@@ -4387,8 +4392,28 @@ function setLiveIndicator(connected) {
   label.textContent = connected ? "Live" : "Polling…";
 }
 
-function connectLive() {
+function disconnectLive() {
+  if (liveReconnectTimer) {
+    clearTimeout(liveReconnectTimer);
+    liveReconnectTimer = null;
+  }
+  const socket = liveSocket;
+  liveSocket = null;
+  liveConnected = false;
+  if (socket) {
+    // A deliberate mobile-background disconnect must not schedule another
+    // socket while iOS is suspending the page.
+    socket.onclose = null;
+    socket.onerror = null;
+    try { socket.close(); } catch (e) {}
+  }
+}
+
+function connectLive(force = false) {
   if (!("WebSocket" in window)) { setLiveIndicator(false); return; }
+  if (document.visibilityState === "hidden") return;
+  if (force) disconnectLive();
+  else if (liveSocket && (liveSocket.readyState === WebSocket.CONNECTING || liveSocket.readyState === WebSocket.OPEN)) return;
   let socket;
   try {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -4398,7 +4423,14 @@ function connectLive() {
     return;
   }
   liveSocket = socket;
-  socket.onopen = () => { liveConnected = true; wsReconnectDelay = 1000; setLiveIndicator(true); };
+  socket.onopen = () => {
+    if (liveSocket !== socket) return;
+    liveConnected = true;
+    wsReconnectDelay = 1000;
+    if (liveReconnectTimer) clearTimeout(liveReconnectTimer);
+    liveReconnectTimer = null;
+    setLiveIndicator(true);
+  };
   socket.onmessage = (ev) => {
     try {
       const snapshot = JSON.parse(ev.data);
@@ -4414,7 +4446,13 @@ function connectLive() {
       applySnapshot(snapshot);
     } catch (e) {}
   };
-  socket.onclose = () => { liveConnected = false; setLiveIndicator(false); scheduleReconnect(); };
+  socket.onclose = () => {
+    if (liveSocket !== socket) return;
+    liveSocket = null;
+    liveConnected = false;
+    setLiveIndicator(false);
+    scheduleReconnect();
+  };
   socket.onerror = () => { try { socket.close(); } catch (e) {} };
 }
 
@@ -4426,9 +4464,30 @@ document.addEventListener("focusout", event => {
 });
 
 function scheduleReconnect() {
-  setTimeout(connectLive, wsReconnectDelay);
+  if (document.visibilityState === "hidden" || liveReconnectTimer) return;
+  liveReconnectTimer = setTimeout(() => {
+    liveReconnectTimer = null;
+    connectLive();
+  }, wsReconnectDelay);
   wsReconnectDelay = Math.min(wsReconnectDelay * 1.6, 15000);
 }
+
+function resumeLiveUpdates() {
+  if (document.visibilityState === "hidden") return;
+  // Always fetch a complete fresh snapshot first. A WebSocket that survived
+  // in JavaScript may have missed messages while iOS froze the process.
+  setLiveIndicator(false);
+  refresh();
+  connectLive(true);
+  if (serviceWorkerRegistration) serviceWorkerRegistration.update().catch(() => {});
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") disconnectLive();
+  else resumeLiveUpdates();
+});
+window.addEventListener("pageshow", resumeLiveUpdates);
+window.addEventListener("online", resumeLiveUpdates);
 
 // ── System status strip ("detectors") at the top of the page ──────────────
 function renderSystemStatus() {

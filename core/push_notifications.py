@@ -120,6 +120,10 @@ def _send_payload(payload: dict, endpoint: str | None = None) -> dict:
                 data=json.dumps(payload, ensure_ascii=False),
                 vapid_private_key=str(PRIVATE_KEY_PATH),
                 vapid_claims={"sub": VAPID_SUBJECT},
+                # Approval requests are time-sensitive. Ask Apple/Google's push
+                # relay to deliver immediately instead of batching them as a
+                # normal-priority background update.
+                headers={"Urgency": "high"},
                 ttl=86400,
                 timeout=15,
             )

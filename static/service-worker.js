@@ -1,4 +1,4 @@
-const CACHE_NAME = "zenox-pwa-v2";
+const CACHE_NAME = "zenox-pwa-v3";
 const APP_ASSETS = [
   "/",
   "/static/manifest.webmanifest",
