@@ -7,6 +7,29 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout, async_playwr
 from core.login import check_chameleon, force_extractor_tab, login_chameleon
 
 
+async def _dismiss_message_box(page, *, timeout: int, required: bool) -> bool:
+    """Press the exact visible ExtJS OK button and verify its dialog closes."""
+    dialog = page.locator("div.x-message-box:visible").last
+    try:
+        await dialog.wait_for(state="visible", timeout=timeout)
+    except PlaywrightTimeout as error:
+        if not required:
+            return False
+        raise RuntimeError("Pools was clicked but its message dialog did not appear") from error
+
+    ok_inner = dialog.locator('span.x-btn-inner:text-is("OK")').last
+    try:
+        await ok_inner.wait_for(state="visible", timeout=5_000)
+        ok_button = ok_inner.locator('xpath=ancestor::a[@role="button"][1]')
+        await ok_button.click(force=True, timeout=5_000)
+        await dialog.wait_for(state="hidden", timeout=5_000)
+    except PlaywrightTimeout as error:
+        raise RuntimeError(
+            "Pools message appeared, but its OK button was not dismissed"
+        ) from error
+    return True
+
+
 async def run_browser_operation(command: str, platforms: list[str]) -> str:
     """Run a bounded Chameleon maintenance command and return UI-safe output."""
     if command not in {"fix", "chameleon", "extractor", "pools"}:
@@ -38,35 +61,14 @@ async def run_browser_operation(command: str, platforms: list[str]) -> str:
                         await tab.goto(cfg.mod_url, wait_until="domcontentloaded", timeout=30_000)
                         pools = tab.locator("#buttonPools-btnInnerEl")
                     await pools.wait_for(state="visible", timeout=15_000)
+                    # Recover from a dialog left open by an earlier attempt;
+                    # otherwise its modal overlay prevents the next Pools click.
+                    await _dismiss_message_box(tab, timeout=500, required=False)
                     await pools.click(timeout=10_000)
-                    # Pools always answers with an ExtJS message box in this
-                    # workflow. Its numeric IDs change, but the supplied HTML
-                    # has a stable structure: span.x-btn-inner (text OK) inside
-                    # the real clickable <a class=x-btn role=button>.
-                    dialog = tab.locator("div.x-message-box:visible").filter(
-                        has_text="Fehlermeldung"
-                    ).last
-                    try:
-                        await dialog.wait_for(state="visible", timeout=15_000)
-                    except PlaywrightTimeout as error:
-                        raise RuntimeError(
-                            "Pools was clicked but its Fehlermeldung dialog did not appear"
-                        ) from error
-
-                    ok_inner = dialog.locator(
-                        'span.x-btn-inner:text-is("OK")'
-                    ).last
-                    try:
-                        await ok_inner.wait_for(state="visible", timeout=5_000)
-                        ok_button = ok_inner.locator(
-                            'xpath=ancestor::a[@role="button"][1]'
-                        )
-                        await ok_button.click(force=True, timeout=5_000)
-                        await dialog.wait_for(state="hidden", timeout=5_000)
-                    except PlaywrightTimeout as error:
-                        raise RuntimeError(
-                            "Pools dialog appeared, but its OK button was not dismissed"
-                        ) from error
+                    # Linduu may title the result "Erfolg" while another
+                    # platform/response uses "Fehlermeldung". The stable part
+                    # is the visible x-message-box and its exact OK control.
+                    await _dismiss_message_box(tab, timeout=15_000, required=True)
 
                     output.append(
                         f"[{cfg.platform}] Pools opened and OK was confirmed; "

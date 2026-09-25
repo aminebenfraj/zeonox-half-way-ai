@@ -7,6 +7,7 @@ import urllib.request
 from pathlib import Path
 
 from dotenv import load_dotenv
+from core.process_visibility import background_runtime_enabled, process_window_kwargs
 
 load_dotenv()
 
@@ -47,21 +48,28 @@ def is_cdp_ready(port: int) -> bool:
 
 def start_chrome(profile_dir: str, port: int) -> subprocess.Popen:
     chrome = _find_chrome()
+    chrome_args = [
+        chrome,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        # Keep computed CSS geometry identical to a normal 100%-scale
+        # extension capture. Without an explicit factor, this Windows
+        # setup launches bot Chrome at 0.8: getComputedStyle reports a
+        # 1px border as 1.25px and viewport dimensions are inflated.
+        "--force-device-scale-factor=1",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if background_runtime_enabled():
+        # Modern headless Chrome uses the full browser engine and CDP while
+        # creating no visible browser window. A fixed viewport keeps extractor
+        # geometry deterministic across visible/background modes.
+        chrome_args.extend(["--headless=new", "--window-size=1920,1080"])
     return subprocess.Popen(
-        [
-            chrome,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile_dir}",
-            # Keep computed CSS geometry identical to a normal 100%-scale
-            # extension capture. Without an explicit factor, this Windows
-            # setup launches bot Chrome at 0.8: getComputedStyle reports a
-            # 1px border as 1.25px and viewport dimensions are inflated.
-            "--force-device-scale-factor=1",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
+        chrome_args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        **process_window_kwargs(),
     )
 
 
@@ -97,6 +105,7 @@ def start_approval_server(port: int = APPROVAL_SERVER_PORT) -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
+        **process_window_kwargs(),
     )
 
 

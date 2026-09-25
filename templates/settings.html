@@ -15,7 +15,7 @@
     .section{margin-top:16px;padding:20px;border:1px solid var(--border);border-radius:10px;background:var(--card)}.section-head{margin-bottom:15px}.section h2{margin:0 0 4px;font-size:17px}.scope{display:inline-flex;margin-top:8px;padding:3px 8px;border:1px solid rgba(99,102,241,.35);border-radius:999px;background:rgba(99,102,241,.1);color:#c7d2fe;font-size:11px;font-weight:750}
     .options{display:grid;gap:9px}.option{display:grid;grid-template-columns:20px 1fr;gap:11px;padding:14px;border:1px solid var(--border);border-radius:9px;background:#101014;cursor:pointer;transition:border-color .15s,background .15s}.option:hover{border-color:#3f3f46}.option:has(input:checked){border-color:var(--primary);background:rgba(99,102,241,.09)}input{margin:3px 0 0;accent-color:var(--primary)}.option strong{display:block;margin-bottom:2px}.option small{display:block;color:var(--muted);line-height:1.45}.option .warning{color:#fbbf24}
     .save-state{min-height:22px;margin-top:16px;color:var(--muted);font-size:12px}.save-state.ok{color:var(--success)}.save-state.bad{color:#f87171}.default-note{margin-top:18px;padding:12px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:#101014}
-    @media(max-width:680px){body{padding:0}main{min-height:100vh;border:0;border-radius:0;padding-top:20px}.top{flex-direction:column}.actions{width:100%}.actions a{flex:1;text-align:center}}
+    @media(max-width:680px){html,body{max-width:100%;overflow-x:hidden}body{padding:0}main{min-height:100vh;min-height:100dvh;border:0;border-radius:0;padding:max(20px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) calc(42px + env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left))}.top{flex-direction:column}.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.actions a{display:flex;align-items:center;justify-content:center;min-width:0;min-height:44px;padding:10px 8px;text-align:center}.section{padding:16px 14px}.option{grid-template-columns:24px minmax(0,1fr);padding:14px 12px;min-height:56px;overflow-wrap:anywhere}input{width:20px;height:20px;margin:1px 0 0}.default-note{overflow-wrap:anywhere}}
   </style>
 </head>
 <body>
@@ -50,6 +50,15 @@
     </div>
   </section>
 
+  <section class="section">
+    <div class="section-head"><h2>Runtime visibility</h2><p>Choose whether bot consoles and their dedicated Chrome instances are visible on this PC.</p><span class="scope">All platforms</span></div>
+    <div class="options">
+      <label class="option"><input type="radio" name="runtime_visibility" value="visible"><span><strong>Show bot windows</strong><small>Show the launcher CMD and normal Google Chrome instances so you can watch what the bots are doing.</small></span></label>
+      <label class="option"><input type="radio" name="runtime_visibility" value="background"><span><strong>Run completely in the background</strong><small>Hide launcher consoles and launch dedicated bot Chrome instances in headless mode. The web app remains the control center.</small></span></label>
+    </div>
+    <div class="default-note">The shared launcher CMD updates immediately when Windows allows it. A running Chrome window cannot change between visible and background mode in place: use Stop, then Start for that platform to recreate its browser with this setting.</div>
+  </section>
+
   <div class="save-state" id="saveState" aria-live="polite">Loading settings…</div>
   <div class="default-note">If you never change these controls, Zenox keeps the exact current flow: Judge analysis in Manual mode, Judge with manual fallback in Automatic mode, and FC contacts transfer or skip.</div>
 </main>
@@ -79,7 +88,19 @@ async function saveSetting(input){
     const response=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({[input.name]:input.value})});
     const result=await response.json().catch(()=>({}));
     if(!response.ok||!result.ok)throw new Error(result.error||`HTTP ${response.status}`);
-    saveState.className="save-state ok";saveState.textContent="Saved. New conversations will use this setting immediately.";
+    saveState.className="save-state ok";
+    if(input.name==="runtime_visibility"){
+      const runtime=result.runtime||{};
+      const mode=input.value==="background"?"background mode":"visible-window mode";
+      const consoleState=runtime.launcher_console_updated
+        ? "The running launcher CMD was updated."
+        : runtime.launcher_reachable
+          ? "The launcher has no switchable CMD window; it will use this mode after the next full system start."
+          : "The launcher is not running; it will use this mode when it starts.";
+      saveState.textContent=`Saved: ${mode}. ${consoleState} Stop, then Start a running platform to recreate its Chrome in this mode.`;
+    }else{
+      saveState.textContent="Saved. New conversations will use this setting immediately.";
+    }
   }catch(error){saveState.className="save-state bad";saveState.textContent=`Could not save: ${error.message}`;await loadSettings();}
   finally{radios.forEach(item=>item.disabled=false);}
 }

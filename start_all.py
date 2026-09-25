@@ -38,6 +38,7 @@ from playwright.async_api import async_playwright
 from core.login import force_extractor_tab, check_stats
 from core.bot import pause_flag_path
 from core.launcher import ensure_approval_server
+from core.process_visibility import apply_current_console_visibility, process_window_kwargs
 
 ALL_PLATFORMS = ["gold", "gold2", "gold3", "diamond", "platin", "s69", "ml"]
 
@@ -108,12 +109,14 @@ def _launch(platform: str) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        **process_window_kwargs(),
     )
     threading.Thread(target=_stream_output, args=(platform, proc), daemon=True).start()
     return proc
 
 
 def main():
+    apply_current_console_visibility()
     label = "all platforms" if len(PLATFORMS) == len(ALL_PLATFORMS) else f"selected: {', '.join(PLATFORMS)}"
     print(f"{_BOLD}[Launcher] Starting {len(PLATFORMS)} bot(s) — {label}{_RESET}\n")
 

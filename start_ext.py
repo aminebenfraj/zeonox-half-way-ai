@@ -31,6 +31,8 @@ import time
 import threading
 import queue
 
+from core.process_visibility import apply_current_console_visibility, process_window_kwargs
+
 # Force UTF-8 stdout so bot output with non-ASCII chars (German etc.) prints correctly
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -97,12 +99,14 @@ def _launch(platform):
         errors="replace",
         bufsize=1,
         env=env,
+        **process_window_kwargs(),
     )
     threading.Thread(target=_stream_output, args=(platform, proc), daemon=True).start()
     return proc
 
 
 def main():
+    apply_current_console_visibility()
     label = "all" if len(PLATFORMS) == len(ALL_PLATFORMS) else ", ".join(PLATFORMS)
     print(f"{_BOLD}[Launcher] Starting ExtJS bots — {label}{_RESET}\n")
     print(_HELP + "\n")

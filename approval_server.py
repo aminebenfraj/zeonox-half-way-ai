@@ -64,6 +64,7 @@ from core.bot_lifecycle import LauncherClient
 from core.bot import pause_flag_path
 from core.platform_operations import run_browser_operation
 from core.runtime_settings import get_runtime_settings, update_runtime_settings
+from core.process_visibility import apply_current_console_visibility
 from core.platforms import (
     KNOWN_PLATFORM_LABELS,
     PLATFORM_BY_SLUG,
@@ -1503,8 +1504,31 @@ def save_settings():
         return jsonify({"ok": False, "error": str(error)}), 400
     except OSError as error:
         return jsonify({"ok": False, "error": f"Could not save settings: {error}"}), 500
+    runtime_result = None
+    if "runtime_visibility" in body:
+        dashboard_console_updated = apply_current_console_visibility()
+        launcher_console_updated = False
+        launcher_reachable = False
+        try:
+            response = httpx.post(
+                f"{LAUNCHER_CONTROL_URL}/control/runtime-visibility",
+                timeout=2.5,
+            )
+            launcher_reachable = response.is_success
+            if response.is_success:
+                launcher_console_updated = bool(
+                    response.json().get("console_updated")
+                )
+        except Exception:
+            pass
+        runtime_result = {
+            "dashboard_console_updated": dashboard_console_updated,
+            "launcher_reachable": launcher_reachable,
+            "launcher_console_updated": launcher_console_updated,
+            "browser_restart_required": True,
+        }
     _bump_state()
-    return jsonify({"ok": True, "settings": settings})
+    return jsonify({"ok": True, "settings": settings, "runtime": runtime_result})
 
 
 @app.post("/api/mode")
@@ -2897,11 +2921,49 @@ _PAGE = """<!doctype html>
 
   @media (max-width: 1000px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   @media (max-width: 860px) {
-    body { padding: 0; }
-    #sidebar { top: 0; height: 100vh; height: 100dvh; border-radius: 0 12px 12px 0; }
-    #main { min-height: calc(100vh - 60px); border: 0; border-radius: 0; padding-top: 22px; }
+    html, body { max-width: 100%; overflow-x: hidden; }
+    body { padding: 0; gap: 0; }
+    #sidebar {
+      position: fixed; inset: 0 auto 0 0; z-index: 60;
+      width: min(82vw, 280px); height: 100vh; height: 100dvh; top: 0;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      border-radius: 0 12px 12px 0;
+      transform: translate3d(-105%, 0, 0);
+      pointer-events: none;
+      transition: transform .22s ease;
+      contain: layout paint;
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+    }
+    #sidebar.open {
+      transform: translate3d(0, 0, 0);
+      pointer-events: auto !important;
+    }
+    #sidebar.open a, #sidebar.open button, #sidebar.open .nav-item {
+      position: relative; z-index: 1; pointer-events: auto;
+      touch-action: manipulation;
+    }
+    #backdrop { visibility: hidden; pointer-events: none; }
+    #backdrop.open { visibility: visible; pointer-events: auto; z-index: 50; }
+    #main, .platform-section, .cards-grid, .card { min-width: 0; }
+    #main { width: 100%; max-width: 100%; min-height: calc(100vh - 60px); border: 0; border-radius: 0; padding-top: 22px; }
     #mobileBar { background: rgba(9,9,11,.94); }
     .queue-skeleton { grid-template-columns: 1fr; }
+    .ctrl-bar {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: stretch; gap: 8px; width: 100%; margin: 0 0 14px;
+    }
+    .ctrl-status-pill {
+      grid-column: 1 / -1; justify-self: start; max-width: 100%;
+      padding: 5px 9px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere;
+    }
+    .ctrl-btn {
+      width: 100%; min-width: 0; min-height: 44px; padding: 10px 8px;
+      font-size: 13px; touch-action: manipulation;
+    }
+    .system-ctrl-actions { align-items: stretch; }
+    .system-ctrl-actions button { min-height: 44px; }
   }
 </style>
 </head>
@@ -4573,6 +4635,34 @@ _BOTS_PAGE = r"""<!doctype html>
     animation:spin .65s linear infinite;
   }
   @keyframes spin { to { transform:rotate(360deg); } }
+  @media (max-width: 760px) {
+    html, body { max-width: 100%; overflow-x: hidden; }
+    body {
+      min-height: 100vh; min-height: 100dvh;
+      padding: max(16px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) calc(42px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+    }
+    .bots-grid { grid-template-columns: minmax(0, 1fr); }
+    .bot-card { min-width: 0; padding: 15px 14px; }
+    .topbar { align-items: flex-start; margin-bottom: 18px; }
+    .topbar > div { min-width: 0; flex: 1 1 100%; }
+    .back-link { min-height: 44px; display: inline-flex; align-items: center; }
+    .start-stop-row { gap: 10px; }
+    .start-stop-row button { flex: 1; min-width: 0; min-height: 46px; touch-action: manipulation; }
+    .toggle-row { align-items: flex-start; flex-wrap: wrap; }
+    .toggle-name { padding-top: 11px; }
+    .toggle-switch-btn { min-height: 44px; max-width: 100%; touch-action: manipulation; }
+    .toggle-switch-label, .toast { overflow-wrap: anywhere; }
+    details.steps-block summary { min-height: 44px; display: flex; align-items: center; }
+    ol.steps-list { padding-left: 22px; overflow-wrap: anywhere; }
+    .bot-card-head { align-items: flex-start; }
+    .status-pill { flex: none; max-width: 50%; text-align: center; overflow-wrap: anywhere; }
+  }
+  @media (max-width: 420px) {
+    .modal-actions { flex-direction: column-reverse; }
+    .modal-actions button { width: 100%; min-height: 44px; }
+    #modalRoot { padding: 14px; padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+    #toastRoot { right: 10px; bottom: max(10px, env(safe-area-inset-bottom)); width: calc(100vw - 20px); }
+  }
 </style>
 </head>
 <body>
@@ -4938,6 +5028,7 @@ def settings_page():
 
 
 def main():
+    apply_current_console_visibility()
     print(f"[ApprovalServer] Dashboard running at http://{HOST}:{PORT}")
     if not (AUTH_USER and AUTH_PASS):
         print("[ApprovalServer] WARNING: APPROVAL_USER/APPROVAL_PASS not set -- "

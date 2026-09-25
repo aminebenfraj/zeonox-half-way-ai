@@ -23,6 +23,8 @@ DEFAULT_SETTINGS = {
     "manual_judge_policy": "enabled",
     # Current behaviour on Justlo/Linduu/Gnoxx.
     "fc_contact_policy": "skip",
+    # Current behaviour: launcher consoles and Chrome windows are visible.
+    "runtime_visibility": "visible",
 }
 
 SETTING_OPTIONS = {
@@ -33,6 +35,7 @@ SETTING_OPTIONS = {
     },
     "manual_judge_policy": {"enabled", "disabled"},
     "fc_contact_policy": {"skip", "answer"},
+    "runtime_visibility": {"visible", "background"},
 }
 
 _write_lock = threading.Lock()

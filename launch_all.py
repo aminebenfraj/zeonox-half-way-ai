@@ -46,6 +46,11 @@ from core.platforms import (
     SELF_MANAGED_PLATFORM_SLUGS,
 )
 from core.platform_operations import run_browser_operation
+from core.process_visibility import (
+    apply_current_console_visibility,
+    background_runtime_enabled,
+    process_window_kwargs,
+)
 
 BASE_DIR = Path(__file__).parent
 
@@ -261,6 +266,7 @@ def _launch_bot(platform: str) -> subprocess.Popen:
         errors="replace",
         bufsize=1,
         env=env,
+        **process_window_kwargs(),
     )
     threading.Thread(target=_stream_output, args=(platform, proc), daemon=True).start()
     return proc
@@ -629,6 +635,23 @@ def run_bots():
                 platforms[name] = {"state": "dead", "exit_code": proc.poll() if proc is not None else None}
         return jsonify({"ok": True, "platforms": platforms, "all_platforms": KNOWN_PLATFORMS})
 
+    @control_app.post("/control/runtime-visibility")
+    def _control_runtime_visibility():
+        """Apply the saved setting to the launcher's existing CMD window.
+
+        Chrome cannot switch between headed and headless in place; each
+        platform browser picks up the saved setting the next time it is fully
+        stopped and started.
+        """
+        console_updated = apply_current_console_visibility()
+        return jsonify({
+            "ok": True,
+            "console_updated": console_updated,
+            "runtime_visibility": (
+                "background" if background_runtime_enabled() else "visible"
+            ),
+        })
+
     @control_app.post("/control/command")
     def _control_command():
         body   = request.get_json(force=True, silent=True) or {}
@@ -725,6 +748,7 @@ def run_bots():
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    apply_current_console_visibility()
     label = "all platforms" if PLATFORMS == DEFAULT_PLATFORMS else f"selected: {', '.join(PLATFORMS)}"
     print(f"{_BOLD}[Launcher] ===== Full System Launch — {label} ====={_RESET}\n")
 

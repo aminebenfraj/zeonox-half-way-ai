@@ -7,6 +7,8 @@ import threading
 
 import httpx
 
+from core.process_visibility import process_window_kwargs
+
 
 class LauncherClient:
     """Send lifecycle commands and bootstrap the supervisor when necessary."""
@@ -41,9 +43,7 @@ class LauncherClient:
                         "The launcher is still starting. Wait until its controls connect, then try again."
                     )
                 return self._process
-            popen_kwargs = {}
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+            popen_kwargs = process_window_kwargs(visible_new_console=True)
             self._process = subprocess.Popen(
                 [
                     sys.executable,

@@ -45,6 +45,10 @@ requiring human approval. Automatic mode can use the current 10/10 + manual
 fallback, reject lower Judge scores so the bot regenerates, or send directly
 without Judge. Justlo, Linduu, and Gnoxx can either transfer/skip Chameleon
 First Contact conversations or answer them through the normal workflow.
+Runtime visibility can keep the current CMD/Chrome windows or launch future
+bot processes with hidden consoles and headless Chrome. Existing Chrome
+instances keep their current visibility until that platform is stopped and
+started again (or the full system is restarted).
 Choices are saved locally in the ignored `.runtime_settings.json` file and
 are read for each new conversation. When the file does not exist, the current
 production behavior remains unchanged.
