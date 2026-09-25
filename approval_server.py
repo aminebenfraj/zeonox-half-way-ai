@@ -2866,6 +2866,92 @@ _PAGE = """<!doctype html>
   .sidebar-foot { padding: 9px 12px; background: rgba(9,11,18,.72); }
   .live-badge { margin: 0; border: 0; background: transparent; padding: 3px; }
 
+  /* ── Sidebar refinement ──────────────────────────────────────────────
+     Keep the drawer useful on a phone: one scrollable platform list,
+     compact controls, and a consistent icon language. */
+  #sidebar {
+    padding: 8px;
+    gap: 8px;
+    background: rgba(10,12,18,.96);
+    border-color: rgba(255,255,255,.08);
+  }
+  .sidebar-header {
+    min-height: 58px;
+    padding: 8px 9px;
+    border: 0;
+    border-radius: 10px;
+    background: linear-gradient(135deg, rgba(99,102,241,.12), rgba(255,255,255,.025));
+  }
+  .brand-mark {
+    width: 36px; height: 36px; border-radius: 10px;
+    background: linear-gradient(145deg, #7477ff, #5558e8);
+    box-shadow: 0 7px 20px rgba(79,70,229,.24);
+  }
+  .brand-caption { margin-top: 1px; }
+  .brand-sub { display: inline-flex; align-items: center; gap: 5px; }
+  .brand-sub::before {
+    content: ""; width: 5px; height: 5px; border-radius: 999px;
+    background: currentColor; box-shadow: 0 0 0 3px rgba(34,197,94,.12);
+  }
+  .brand-sub.polling { color: var(--warning); border-color: rgba(234,179,8,.25); background: rgba(234,179,8,.08); }
+  .brand-sub.polling::before { box-shadow: 0 0 0 3px rgba(234,179,8,.12); }
+  .sidebar-close {
+    display: none; width: 32px; height: 32px; margin-left: 2px; padding: 0;
+    place-items: center; border: 0; border-radius: 8px; background: transparent;
+    color: var(--muted-foreground); cursor: pointer;
+  }
+  .sidebar-close:hover { background: var(--accent); color: var(--foreground); }
+  .workspace-nav, .sidebar-controls, .platform-nav {
+    padding: 6px; border: 1px solid rgba(255,255,255,.065); border-radius: 10px;
+    background: rgba(255,255,255,.018);
+  }
+  .workspace-nav { flex: none; }
+  .sidebar-controls { flex: none; }
+  .platform-nav { border-top: 1px solid rgba(255,255,255,.065); }
+  .nav-label { padding: 5px 7px 6px; color: #71717a; font-size: 9.5px; letter-spacing: .12em; }
+  .sidebar-link, .nav-item {
+    min-height: 38px; gap: 10px; padding: 8px; border-radius: 8px;
+    color: #a1a1aa; font-size: 12.5px;
+  }
+  .sidebar-link + .sidebar-link { margin-top: 2px; }
+  .sidebar-link.active {
+    background: linear-gradient(90deg, rgba(99,102,241,.22), rgba(99,102,241,.11));
+    color: #eef2ff; box-shadow: inset 2px 0 #818cf8;
+  }
+  .sidebar-icon { width: 18px; height: 18px; }
+  .sidebar-icon svg { width: 17px; height: 17px; stroke-width: 1.8; }
+  .sidebar-badge, .nav-count { min-width: 22px; line-height: 18px; padding: 0 6px; }
+  .control-row {
+    width: 100%; min-height: 44px; display: flex; align-items: center; gap: 9px;
+    padding: 7px 8px; border: 0; border-radius: 8px; background: transparent;
+    color: var(--foreground); text-align: left; font: inherit; cursor: pointer;
+  }
+  .control-row + .control-row { margin-top: 2px; }
+  .control-row:hover { background: var(--accent); filter: none; }
+  .control-icon {
+    display: grid; place-items: center; width: 26px; height: 26px; flex: none;
+    border-radius: 7px; background: rgba(255,255,255,.045); color: #a1a1aa;
+  }
+  .control-icon svg { width: 15px; height: 15px; stroke-width: 1.8; }
+  .control-copy { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+  .control-copy strong { font-size: 12.5px; font-weight: 600; }
+  .control-copy small { color: #71717a; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mode-switch, .ui-switch { width: 31px; height: 18px; }
+  .platform-nav { padding-bottom: 5px; scrollbar-width: thin; scrollbar-color: #3f3f46 transparent; }
+  .nav-item { margin: 0 0 2px; }
+  .nav-platform-copy { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+  .nav-platform-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #d4d4d8; }
+  .nav-platform-state { color: #71717a; font-size: 9.5px; white-space: nowrap; }
+  .nav-platform-state.live { color: #34d399; }
+  .nav-dot { width: 7px; height: 7px; }
+  .nav-count { margin-left: 2px; background: rgba(255,255,255,.06); color: #71717a; }
+  .nav-item.has-pending .nav-count { box-shadow: 0 0 0 2px color-mix(in srgb, var(--pc) 14%, transparent); }
+  .sidebar-foot {
+    flex: none; padding: 7px 8px; border: 0; border-radius: 9px;
+    background: rgba(255,255,255,.018);
+  }
+  .live-badge { width: 100%; color: #71717a; font-size: 10.5px; }
+
   #main {
     max-width: none; min-height: calc(100vh - 16px); min-height: calc(100dvh - 16px);
     padding: 30px clamp(20px, 3vw, 44px) 64px; border: 1px solid var(--border);
@@ -2924,17 +3010,22 @@ _PAGE = """<!doctype html>
     html, body { max-width: 100%; overflow-x: hidden; }
     body { padding: 0; gap: 0; }
     #sidebar {
-      position: fixed; inset: 0 auto 0 0; z-index: 60;
-      width: min(82vw, 280px); height: 100vh; height: 100dvh; top: 0;
-      padding-top: env(safe-area-inset-top);
-      padding-bottom: env(safe-area-inset-bottom);
-      border-radius: 0 12px 12px 0;
+      position: fixed;
+      inset: env(safe-area-inset-top) auto 0 0;
+      z-index: 60;
+      width: min(82vw, 280px);
+      height: auto;
+      min-height: 0;
       transform: translate3d(-105%, 0, 0);
       pointer-events: none;
       transition: transform .22s ease;
       contain: layout paint;
       touch-action: pan-y;
       -webkit-overflow-scrolling: touch;
+      padding: 8px 8px max(8px, env(safe-area-inset-bottom));
+      border-radius: 0 16px 0 0;
+      background: #090b12;
+      box-shadow: 24px 0 70px rgba(0,0,0,.58);
     }
     #sidebar.open {
       transform: translate3d(0, 0, 0);
@@ -2944,8 +3035,15 @@ _PAGE = """<!doctype html>
       position: relative; z-index: 1; pointer-events: auto;
       touch-action: manipulation;
     }
+    .sidebar-close { display: grid; }
+    .sidebar-header { min-height: 62px; }
+    .sidebar-link, .control-row, .nav-item { min-height: 44px; }
+    .nav-item { padding: 9px 8px; font-size: 13px; }
     #backdrop { visibility: hidden; pointer-events: none; }
-    #backdrop.open { visibility: visible; pointer-events: auto; z-index: 50; }
+    #backdrop.open {
+      visibility: visible; pointer-events: auto; z-index: 50;
+      top: env(safe-area-inset-top);
+    }
     #main, .platform-section, .cards-grid, .card { min-width: 0; }
     #main { width: 100%; max-width: 100%; min-height: calc(100vh - 60px); border: 0; border-radius: 0; padding-top: 22px; }
     #mobileBar { background: rgba(9,9,11,.94); }
@@ -2982,38 +3080,38 @@ _PAGE = """<!doctype html>
   <div class="brand sidebar-header">
     <span class="brand-mark">Z</span>
     <span><span class="brand-text">Zenox</span><span class="brand-caption">Operations</span></span>
-    <span class="brand-sub">Live</span>
+    <span class="brand-sub" id="liveBadge" title="Dashboard connection"><span id="liveBadgeLabel">Connecting…</span></span>
+    <button type="button" class="sidebar-close" onclick="closeDrawer()" aria-label="Close menu">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
   </div>
   <nav class="workspace-nav">
     <div class="nav-label">Workspace</div>
     <a href="/" class="sidebar-link active" aria-current="page">
-      <span class="sidebar-icon">⌁</span><span>Approval Queue</span><span class="sidebar-badge" id="sidebarPendingBadge">0</span>
+      <span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4z"/><path d="M4 14h4l2 2h4l2-2h4"/></svg></span><span>Approval Queue</span><span class="sidebar-badge" id="sidebarPendingBadge">0</span>
     </a>
-    <a href="/bots" class="sidebar-link"><span class="sidebar-icon">◫</span><span>Bots</span></a>
-    <a href="/settings" class="sidebar-link"><span class="sidebar-icon">⚙</span><span>Settings</span></a>
-    <a href="/api-keys" class="sidebar-link"><span class="sidebar-icon">⌘</span><span>API Keys</span></a>
+    <a href="/bots" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M9 12h.01M15 12h.01M9 16h6M12 7V4"/></svg></span><span>Bots</span></a>
+    <a href="/settings" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"/></svg></span><span>Settings</span></a>
+    <a href="/api-keys" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M15 8l2 2M17 6l2 2"/></svg></span><span>API Keys</span></a>
   </nav>
-  <div class="mode-box sidebar-group">
-    <div class="nav-label">Review mode</div>
-    <button id="modeToggle" class="mode-toggle" onclick="toggleMode()">
-      <span class="mode-copy"><span class="mode-toggle-label" id="modeToggleLabel">Manual Review</span><span class="mode-toggle-hint" id="modeToggleHint">Replies wait for approval</span></span>
+  <div class="sidebar-controls">
+    <div class="nav-label">Quick controls</div>
+    <button id="modeToggle" class="control-row mode-toggle" onclick="toggleMode()">
+      <span class="control-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v5c0 4.6 2.9 8.3 7 10 4.1-1.7 7-5.4 7-10V6l-7-3z"/><path d="m9 12 2 2 4-4"/></svg></span>
+      <span class="control-copy"><strong class="mode-toggle-label" id="modeToggleLabel">Manual Review</strong><small class="mode-toggle-hint" id="modeToggleHint">Approval required</small></span>
       <span class="mode-switch" aria-hidden="true"></span>
     </button>
-  </div>
-  <div class="sidebar-group preferences">
-    <div class="nav-label">Preferences</div>
-    <button id="soundToggle" class="preference-row" onclick="toggleSound()" aria-pressed="true">
-      <span class="preference-icon">♪</span><span class="preference-copy"><strong>Sound</strong><small id="soundToggleStatus">On</small></span><span class="ui-switch" aria-hidden="true"></span>
+    <button id="soundToggle" class="control-row preference-row" onclick="toggleSound()" aria-pressed="true">
+      <span class="control-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5zM15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/></svg></span><span class="control-copy"><strong>Sound</strong><small id="soundToggleStatus">On</small></span><span class="ui-switch" aria-hidden="true"></span>
     </button>
-    <button id="pushToggle" class="preference-row" onclick="togglePushNotifications()" aria-pressed="false">
-      <span class="preference-icon">◉</span><span class="preference-copy"><strong>Notifications</strong><small id="pushToggleStatus">Off</small></span><span class="ui-switch" aria-hidden="true"></span>
+    <button id="pushToggle" class="control-row preference-row" onclick="togglePushNotifications()" aria-pressed="false">
+      <span class="control-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg></span><span class="control-copy"><strong>Notifications</strong><small id="pushToggleStatus">Off</small></span><span class="ui-switch" aria-hidden="true"></span>
     </button>
   </div>
   <nav class="platform-nav">
     <div class="nav-label">Platforms</div>
     <div id="navList"></div>
   </nav>
-  <div class="sidebar-foot"><span class="live-badge" id="liveBadge" title="Dashboard connection"><span class="dot"></span><span id="liveBadgeLabel">Connecting…</span></span></div>
 </aside>
 
 <main id="main">
@@ -4115,12 +4213,12 @@ function renderSections(pending, autoByPlatform) {
     return `
       <button class="nav-item ${count ? "has-pending" : ""}" style="--pc:${pc}" onclick="goToSection('${name}')">
         <span class="nav-dot"></span>
-        <span>${escapeHtml(name)}</span>
+        <span class="nav-platform-copy">
+          <span class="nav-platform-name">${escapeHtml(name)}</span>
+          <span class="nav-platform-state ${det.live ? "live" : ""}">${escapeHtml(det.label)}</span>
+        </span>
         <span class="nav-count">${count}</span>
       </button>
-      <div class="nav-detector ${det.live ? "live" : "offline"}" style="--det:${det.color}">
-        <span class="det-dot"></span><span>${escapeHtml(det.label)}</span>
-      </div>
     `;
   }).join("");
 
