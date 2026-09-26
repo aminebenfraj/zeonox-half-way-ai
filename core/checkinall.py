@@ -90,6 +90,11 @@ def _load_state() -> dict | None:
         return None
 
 
+def load_latest_result() -> dict | None:
+    """Return the latest structured calculator result for dashboard clients."""
+    return _load_state()
+
+
 def _row_unavailable(label: str, name: str, kind: str, reason: str) -> dict:
     return {
         "platform": label,
@@ -176,6 +181,9 @@ def _build_note(rows: list[dict]) -> str:
         )
 
     previous = _load_state()
+    daily_estimate = None
+    delta_since_previous = None
+    previous_timestamp = None
     daily_line = "  Daily estimate: n/a (new calculator baseline saved after a complete run)"
     if complete and previous and previous.get("formula_version") == FORMULA_VERSION and previous.get("complete"):
         try:
@@ -183,8 +191,11 @@ def _build_note(rows: list[dict]) -> str:
             elapsed_days = (now - previous_time).total_seconds() / 86400.0
             delta = known_total - float(previous["money"])
             if elapsed_days > 0:
+                daily_estimate = delta / elapsed_days
+                delta_since_previous = delta
+                previous_timestamp = previous_time.isoformat()
                 daily_line = (
-                    f"  Daily estimate: ~{delta / elapsed_days:,.2f} DT/day "
+                    f"  Daily estimate: ~{daily_estimate:,.2f} DT/day "
                     f"({delta:+,.2f} DT since {previous_time:%Y-%m-%d %H:%M})"
                 )
         except Exception:
@@ -216,6 +227,32 @@ def _build_note(rows: list[dict]) -> str:
         "complete": complete,
         "missing": missing,
         "known_subtotal": known_total,
+        "daily_estimate": daily_estimate,
+        "delta_since_previous": delta_since_previous,
+        "previous_timestamp": previous_timestamp,
+        "available_count": sum(1 for row in rows if row.get("available")),
+        "platform_count": len(rows),
+        "components": {
+            "gold": None if gold_rows and len(gold_missing) == len(gold_rows) else gold_money,
+            "xkuss": xkussins * XKUSS_VALUE if xkussins is not None else None,
+            "justlo": (
+                shared_values["justlo"] * SHARED_VALUE
+                if shared_values["justlo"] is not None else None
+            ),
+            "linduu": (
+                shared_values["linduu"] * SHARED_VALUE
+                if shared_values["linduu"] is not None else None
+            ),
+            "gnoxx": (
+                shared_values["gnoxx"] * SHARED_VALUE
+                if shared_values["gnoxx"] is not None else None
+            ),
+            "shared": (
+                sum(value * SHARED_VALUE for value in shared_values.values() if value is not None)
+                if any(value is not None for value in shared_values.values()) else None
+            ),
+            "fixed": FIXED_BONUS,
+        },
         "variables": {
             "goldins": gold_money if not gold_missing else None,
             "xkussins": xkussins,

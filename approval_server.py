@@ -2008,11 +2008,15 @@ def control_command():
         if not _checkinall_lock.acquire(blocking=False):
             return jsonify({"ok": False, "error": "Check-in All is already running"}), 409
         try:
-            from core.checkinall import gather_and_write
+            from core.checkinall import gather_and_write, load_latest_result
             platforms = ["gold", "gold2", "diamond", "platin", "s69", "ml",
                          "xkuss", "justlo", "linduu", "gnoxx"]
             text, path = asyncio.run(gather_and_write(platforms))
-            return jsonify({"ok": True, "output": f"{text}\n[checkinall] Note saved to {path}"})
+            return jsonify({
+                "ok": True,
+                "output": f"{text}\n[checkinall] Note saved to {path}",
+                "result": load_latest_result(),
+            })
         except Exception as error:
             return jsonify({"ok": False, "error": f"Check-in All failed: {error}"}), 500
         finally:
@@ -2488,7 +2492,7 @@ _PAGE = """<!doctype html>
   .system-ctrl-head h2 { font-size: 14.5px; margin: 0; font-weight: 650; }
   .system-ctrl-sub { color: var(--muted-foreground); font-size: 12px; }
   .system-ctrl-actions { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
-  .btn-money { background: var(--warning); color: #1c1500; }
+  .btn-money { background: var(--foreground); color: var(--background); }
   .btn-pause { background: var(--primary); color: #fff; }
   .btn-pause.paused { background: var(--success); color: #052e16; }
   .btn-pause:disabled { opacity: .55; cursor: default; }
@@ -2527,6 +2531,85 @@ _PAGE = """<!doctype html>
   .ctrl-output-body {
     font-size: 12px; white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Consolas, monospace;
   }
+
+  /* Shadcn-style earnings dialog: compact hierarchy and neutral surfaces. */
+  body.earnings-open { overflow: hidden; }
+  .earnings-dialog {
+    position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+    padding: 20px; background: rgba(0,0,0,.72); backdrop-filter: blur(5px);
+    animation: earnings-fade .14s ease-out;
+  }
+  .earnings-dialog[hidden] { display: none; }
+  .earnings-dialog-card {
+    position: relative; width: min(100%, 620px); max-height: min(760px, calc(100dvh - 40px));
+    overflow-y: auto; border: 1px solid var(--border); border-radius: 12px;
+    background: #0f0f11; box-shadow: 0 24px 80px rgba(0,0,0,.55);
+    animation: earnings-pop .16s ease-out;
+  }
+  .earnings-dialog-head { padding: 22px 54px 17px 22px; border-bottom: 1px solid var(--border); }
+  .earnings-dialog-title { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -.02em; }
+  .earnings-dialog-sub { margin: 3px 0 0; color: var(--muted-foreground); font-size: 12.5px; }
+  .earnings-close {
+    position: absolute; top: 16px; right: 16px; display: grid; place-items: center;
+    width: 32px; height: 32px; padding: 0; border: 0; border-radius: 7px;
+    background: transparent; color: var(--muted-foreground); cursor: pointer;
+  }
+  .earnings-close:hover { background: var(--accent); color: var(--foreground); }
+  .earnings-close svg { width: 16px; height: 16px; }
+  .earnings-dialog-body { padding: 18px 22px 22px; }
+  .earnings-result-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+  .earnings-health {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
+    border: 1px solid rgba(34,197,94,.25); border-radius: 999px;
+    background: rgba(34,197,94,.08); color: #4ade80; font-size: 10.5px; font-weight: 650;
+  }
+  .earnings-health::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .earnings-health.partial { border-color: rgba(245,158,11,.25); background: rgba(245,158,11,.08); color: #fbbf24; }
+  .earnings-time { color: var(--muted-foreground); font-size: 11px; }
+  .earnings-overview { display: grid; grid-template-columns: minmax(0, 1.45fr) repeat(2, minmax(0, .8fr)); gap: 10px; }
+  .earnings-total, .earnings-mini { min-width: 0; border: 1px solid var(--border); border-radius: 10px; background: #151518; }
+  .earnings-total { padding: 18px; }
+  .earnings-mini { display: flex; flex-direction: column; justify-content: center; padding: 14px; }
+  .earnings-label { color: var(--muted-foreground); font-size: 10px; font-weight: 600; letter-spacing: .055em; text-transform: uppercase; }
+  .earnings-value { margin-top: 6px; font-size: clamp(30px, 6vw, 38px); line-height: 1; font-weight: 700; letter-spacing: -.045em; color: var(--foreground); }
+  .earnings-value small { margin-left: 5px; font-size: 12px; font-weight: 600; letter-spacing: 0; color: var(--muted-foreground); }
+  .earnings-mini strong { margin-top: 6px; font-size: 18px; line-height: 1.15; font-weight: 650; letter-spacing: -.025em; }
+  .earnings-mini small { margin-top: 4px; overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .earnings-section-head { display: flex; align-items: center; justify-content: space-between; margin: 20px 0 9px; }
+  .earnings-section-head h4 { margin: 0; font-size: 12px; font-weight: 600; }
+  .earnings-section-head span { color: var(--muted-foreground); font-size: 10.5px; }
+  .earnings-breakdown { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+  .earning-part { min-width: 0; padding: 11px 12px; border: 1px solid var(--border); border-radius: 9px; background: #121214; }
+  .earning-part-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted-foreground); font-size: 11px; }
+  .earning-part-name { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+  .earning-part-name::before { content: ""; flex: none; width: 7px; height: 7px; border-radius: 2px; background: #52525b; }
+  .earning-part:nth-child(1) .earning-part-name::before { background: #818cf8; }
+  .earning-part:nth-child(2) .earning-part-name::before { background: #38bdf8; }
+  .earning-part:nth-child(3) .earning-part-name::before { background: #34d399; }
+  .earning-part:nth-child(4) .earning-part-name::before { background: #fb7185; }
+  .earning-part:nth-child(5) .earning-part-name::before { background: #22d3ee; }
+  .earning-part:nth-child(6) .earning-part-name::before { background: #a78bfa; }
+  .earning-part-head b { color: var(--foreground); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .earning-track { height: 2px; margin-top: 10px; overflow: hidden; border-radius: 999px; background: #27272a; }
+  .earning-track i { display: block; height: 100%; border-radius: inherit; background: #71717a; }
+  .earning-part:nth-child(1) .earning-track i { background: #818cf8; }
+  .earning-part:nth-child(2) .earning-track i { background: #38bdf8; }
+  .earning-part:nth-child(3) .earning-track i { background: #34d399; }
+  .earning-part:nth-child(4) .earning-track i { background: #fb7185; }
+  .earning-part:nth-child(5) .earning-track i { background: #22d3ee; }
+  .earning-part:nth-child(6) .earning-track i { background: #a78bfa; }
+  .earnings-warning {
+    display: flex; gap: 9px; margin-top: 14px; padding: 10px 12px;
+    border: 1px solid rgba(245,158,11,.22); border-radius: 9px;
+    background: rgba(245,158,11,.06); color: #fbbf24; font-size: 11.5px; line-height: 1.45;
+  }
+  .earnings-warning[hidden] { display: none; }
+  .earnings-warning svg { flex: none; width: 15px; height: 15px; margin-top: 1px; }
+  .btn-money.is-loading { cursor: wait; }
+  .btn-money.is-loading::before { content: ""; display: inline-block; width: 12px; height: 12px; margin-right: 7px; vertical-align: -2px; border: 2px solid rgba(9,9,11,.25); border-top-color: #09090b; border-radius: 50%; animation: checkin-spin .7s linear infinite; }
+  @keyframes checkin-spin { to { transform: rotate(360deg); } }
+  @keyframes earnings-fade { from { opacity: 0; } }
+  @keyframes earnings-pop { from { opacity: 0; transform: translateY(5px) scale(.985); } }
 
   /* ── Mobile / small screens ─────────────────────────────────────────
      Below 860px the sidebar becomes a slide-in drawer (opened via the
@@ -2591,6 +2674,12 @@ _PAGE = """<!doctype html>
     .btn-money, .btn-pause { min-height: 44px; }
     .system-ctrl-actions { align-items: stretch; flex-direction: column; }
     .system-ctrl-status { overflow-wrap: anywhere; }
+    .earnings-dialog { place-items: end center; padding: 10px; }
+    .earnings-dialog-card { width: 100%; max-height: calc(100dvh - 20px); border-radius: 14px; }
+    .earnings-dialog-head { padding: 19px 50px 15px 18px; }
+    .earnings-dialog-body { padding: 15px 18px calc(20px + env(safe-area-inset-bottom)); }
+    .earnings-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .earnings-total { grid-column: 1 / -1; }
 
     /* Full-width, stacked action buttons are far easier to hit accurately
        with a thumb than two small side-by-side buttons. */
@@ -2979,7 +3068,7 @@ _PAGE = """<!doctype html>
   }
   .btn-pause { background: var(--primary); color: #fff; }
   .btn-pause.paused { background: var(--success); color: #052e16; }
-  .btn-money { background: var(--warning); color: #1c1500; }
+  .btn-money { background: var(--foreground); color: var(--background); }
   button:hover:not(:disabled) { transform: none; box-shadow: none; filter: brightness(1.08); }
   .platform-section { margin-bottom: 32px; }
   .platform-head { margin-bottom: 10px; }
@@ -3132,17 +3221,55 @@ _PAGE = """<!doctype html>
   <div class="system-ctrl-box">
     <div class="system-ctrl-head">
       <h2>Bot Controls</h2>
-      <span class="test-box-sub">Restart/fix individual bots below, or fill the earnings calculator automatically from every live account.</span>
+      <span class="test-box-sub">Live controls and earnings at a glance.</span>
     </div>
     <div class="system-ctrl-actions">
       <button class="btn-pause" id="globalPauseBtn" onclick="toggleGlobalPause()" disabled>⏸ Pause all bots</button>
       <span class="system-ctrl-status" id="globalPauseStatus"></span>
-      <button class="btn-money" id="checkinAllBtn" onclick="runCheckinAll()">Check-in All Calculator</button>
+      <button class="btn-money" id="checkinAllBtn" onclick="runCheckinAll()">Calculate earnings</button>
       <span class="system-ctrl-status" id="checkinAllStatus"></span>
     </div>
-    <div class="ctrl-output" id="checkinAllOutput">
-      <div class="ctrl-output-head"><b>checkinall</b><button class="close-x" onclick="document.getElementById('checkinAllOutput').classList.remove('show')">✕</button></div>
-      <div class="ctrl-output-body" id="checkinAllOutputBody"></div>
+    <div class="earnings-dialog" id="checkinAllOutput" hidden onclick="if(event.target===this) closeEarningsDialog()">
+      <section class="earnings-dialog-card" role="dialog" aria-modal="true" aria-labelledby="earningsDialogTitle" aria-describedby="earningsDialogDescription">
+        <button type="button" class="earnings-close" id="earningsCloseBtn" onclick="closeEarningsDialog()" aria-label="Close earnings overview">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+        <header class="earnings-dialog-head">
+          <h3 class="earnings-dialog-title" id="earningsDialogTitle">Earnings overview</h3>
+          <p class="earnings-dialog-sub" id="earningsDialogDescription">A clean summary from your live accounts.</p>
+        </header>
+        <div class="earnings-dialog-body" aria-live="polite">
+          <div class="earnings-result-top">
+            <span class="earnings-health" id="earningsHealth">All accounts read</span>
+            <span class="earnings-time" id="earningsTime"></span>
+          </div>
+          <div class="earnings-overview">
+            <div class="earnings-total">
+              <div class="earnings-label" id="earningsTotalLabel">Total earnings</div>
+              <div class="earnings-value"><span id="earningsTotal">0.00</span><small>DT</small></div>
+            </div>
+            <div class="earnings-mini">
+              <span class="earnings-label">Daily pace</span>
+              <strong id="earningsDaily">—</strong>
+              <small id="earningsDailyHint">First check-in</small>
+            </div>
+            <div class="earnings-mini">
+              <span class="earnings-label">Accounts</span>
+              <strong id="earningsAccounts">0 / 0</strong>
+              <small>successfully read</small>
+            </div>
+          </div>
+          <div class="earnings-section-head">
+            <h4>Breakdown</h4>
+            <span>Contribution to earnings</span>
+          </div>
+          <div class="earnings-breakdown" id="earningsBreakdown"></div>
+          <div class="earnings-warning" id="earningsWarning" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 2.9 1.8 17a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 2.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></svg>
+            <span id="earningsWarningText"></span>
+          </div>
+        </div>
+      </section>
     </div>
     <div class="ctrl-unavailable" id="ctrlUnavailableNote" style="display:none">
       Advanced launcher controls are offline. Pause, Resume, Fix, Chameleon, Extractor, Pools, Stop, and Check-in All still work from the web app; Restart requires the launcher.
@@ -3924,15 +4051,97 @@ function ctrlBarHtml(name) {
   `;
 }
 
+const moneyFormatter = new Intl.NumberFormat(undefined, {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+function checkinMoney(value) {
+  return value == null || !Number.isFinite(Number(value)) ? "—" : moneyFormatter.format(Number(value));
+}
+
+function closeEarningsDialog() {
+  const panel = document.getElementById("checkinAllOutput");
+  panel.hidden = true;
+  document.body.classList.remove("earnings-open");
+  document.getElementById("checkinAllBtn")?.focus();
+}
+
+function renderCheckinResult(result) {
+  if (!result) throw new Error("Calculator result was not returned");
+  const complete = Boolean(result.complete);
+  const total = Number(result.known_subtotal || 0);
+  const available = Number(result.available_count || 0);
+  const count = Number(result.platform_count || 0);
+  const missing = Array.isArray(result.missing) ? result.missing : [];
+
+  const panel = document.getElementById("checkinAllOutput");
+  const health = document.getElementById("earningsHealth");
+  health.textContent = complete ? "Complete" : "Partial data";
+  health.classList.toggle("partial", !complete);
+  document.getElementById("earningsTotalLabel").textContent = complete ? "Total earnings" : "Known earnings";
+  document.getElementById("earningsTotal").textContent = checkinMoney(total);
+  document.getElementById("earningsAccounts").textContent = `${available} / ${count}`;
+
+  const daily = result.daily_estimate;
+  document.getElementById("earningsDaily").textContent = daily == null ? "—" : `${checkinMoney(daily)} DT`;
+  document.getElementById("earningsDailyHint").textContent = daily == null
+    ? (complete ? "Baseline saved" : "Needs a complete check-in")
+    : "estimated per day";
+
+  const stamp = new Date(result.timestamp);
+  document.getElementById("earningsTime").textContent = Number.isNaN(stamp.getTime())
+    ? "Just updated"
+    : `Updated ${stamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+
+  const sharedRate = 0.17 * 3.4;
+  const componentValue = (name) => {
+    if (result.components?.[name] != null) return result.components[name];
+    const counter = result.variables?.[`${name}ins`];
+    return counter == null ? null : Number(counter) * sharedRate;
+  };
+  const parts = [
+    ["Gold group", result.components?.gold],
+    ["Xkuss", result.components?.xkuss],
+    ["Justlo", componentValue("justlo")],
+    ["Linduu", componentValue("linduu")],
+    ["Gnoxx", componentValue("gnoxx")],
+    ["Bonus", result.components?.fixed],
+  ];
+  document.getElementById("earningsBreakdown").innerHTML = parts.map(([label, value]) => {
+    const width = value == null || total <= 0 ? 0 : Math.max(2, Math.min(100, Number(value) / total * 100));
+    return `<div class="earning-part">
+      <div class="earning-part-head"><span class="earning-part-name">${escapeHtml(label)}</span><b>${checkinMoney(value)}${value == null ? "" : " DT"}</b></div>
+      <div class="earning-track"><i style="width:${width.toFixed(1)}%"></i></div>
+    </div>`;
+  }).join("");
+
+  const warning = document.getElementById("earningsWarning");
+  warning.hidden = complete;
+  document.getElementById("earningsWarningText").textContent = complete
+    ? ""
+    : `${missing.length} account${missing.length === 1 ? "" : "s"} unavailable: ${missing.join(", ")}. These are not included.`;
+  panel.hidden = false;
+  document.body.classList.add("earnings-open");
+  requestAnimationFrame(() => document.getElementById("earningsCloseBtn")?.focus());
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !document.getElementById("checkinAllOutput")?.hidden) {
+    closeEarningsDialog();
+  }
+});
+
 async function runCheckinAll() {
   const btn = document.getElementById("checkinAllBtn");
   const statusEl = document.getElementById("checkinAllStatus");
   const outEl = document.getElementById("checkinAllOutput");
-  const outBody = document.getElementById("checkinAllOutputBody");
   checkinAllRunning = true;
   btn.disabled = true;
-  statusEl.textContent = "Reading Gold stats, Xkuss INs, and Justlo/Linduu/Gnoxx monthly counters…";
-  outEl.classList.remove("show");
+  btn.classList.add("is-loading");
+  btn.textContent = "Calculating…";
+  statusEl.textContent = "Reading live accounts";
+  outEl.setAttribute("aria-busy", "true");
   try {
     const res = await fetch("/api/control/command", {
       method: "POST",
@@ -3940,15 +4149,17 @@ async function runCheckinAll() {
       body: JSON.stringify({ cmd: "checkinall" }),
     });
     const data = await res.json().catch(() => ({}));
-    outBody.textContent = data.ok ? (data.output || "(no output)") : `Error: ${data.error || res.status}`;
-    outEl.classList.add("show");
+    if (!res.ok || !data.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    renderCheckinResult(data.result);
   } catch (e) {
-    outBody.textContent = `Request failed: ${e}`;
-    outEl.classList.add("show");
+    toast("Could not calculate earnings", { type: "error", detail: String(e.message || e) });
   } finally {
     checkinAllRunning = false;
     statusEl.textContent = "";
     btn.disabled = false;
+    btn.classList.remove("is-loading");
+    btn.textContent = "Calculate earnings";
+    outEl.removeAttribute("aria-busy");
   }
 }
 
