@@ -49,6 +49,29 @@ async def _in_console(page, cfg) -> bool:
     return False
 
 
+async def _ext_button_accessible(page, selector: str) -> bool:
+    """Return whether an ExtJS toolbar button exists and is not disabled.
+
+    ExtJS disables anchors with CSS classes instead of a native ``disabled``
+    attribute, so Playwright's is_enabled() alone cannot distinguish the two
+    toolbar states shown by Play/Pause.
+    """
+    try:
+        return bool(await page.locator(selector).first.evaluate(
+            """(el) => {
+                const disabled = el.classList.contains('x-item-disabled') ||
+                    el.classList.contains('x-disabled') ||
+                    el.classList.contains('x-btn-disabled') ||
+                    el.getAttribute('aria-disabled') === 'true';
+                const style = window.getComputedStyle(el);
+                return !disabled && style.display !== 'none' &&
+                    style.visibility !== 'hidden';
+            }"""
+        ))
+    except Exception:
+        return False
+
+
 async def _on_community(page, cfg) -> bool:
     """True when tab1 is on the logged-in community home (the 'Mod' link shows)."""
     try:
@@ -69,23 +92,37 @@ async def _on_login(page, cfg) -> bool:
 
 
 async def _chat_active(page, cfg) -> bool:
-    """True when a real dialog is loaded (the client panel holds a member).
+    """True when the console contains a dialog that still needs action.
 
-    The console always renders the client/fake panels, the reply box and an (often
-    empty) message grid, so none of those is a signal on its own — a FASA
-    first-contact has a client but ZERO message rows. When NO dialog is loaded the
-    client panel is blank: its username link is empty and the age reads '(NaN)'. So
-    a non-empty client username is what tells us a dialog is actually live.
+    ExtJS can leave the previous client name in the profile panel after a moderator
+    manually sends/transfers a dialog. A client name alone therefore creates a
+    false PAGE_CHAT and leaves its approval card orphaned. A normal dialog has at
+    least one pending row in the Unterhaltung grid; a FASA/queue task instead has
+    a visible, meaningful queue label and may have zero rows.
     """
     try:
-        name = await page.evaluate(
-            """(sel) => {
-                const a = document.querySelector(sel);
-                return a ? (a.textContent || '').trim() : '';
+        return bool(await page.evaluate(
+            """(s) => {
+                const text = (el) => el ? (el.textContent || '').trim() : '';
+                const client = text(document.querySelector(s.client));
+                if (!client) return false;
+
+                const grid = document.querySelector(s.grid);
+                if (grid && grid.querySelector('.x-grid-row')) return true;
+
+                const queue = document.querySelector(s.queue);
+                if (!queue) return false;
+                const style = window.getComputedStyle(queue);
+                const visible = style.display !== 'none' && style.visibility !== 'hidden';
+                const queueText = text(queue);
+                return visible && !!queueText && queueText !== 'Keine Beschreibung vorhanden';
             }""",
-            cfg.sel_client_username,
-        )
-        return bool(name)
+            {
+                "client": cfg.sel_client_username,
+                "grid": cfg.sel_conv_grid,
+                "queue": cfg.sel_queue_message,
+            },
+        ))
     except Exception:
         return False
 
@@ -211,23 +248,46 @@ async def _open_console(page, cfg, tag: str):
     await asyncio.sleep(1.5)
 
 
-async def press_play(page, cfg, tag: str = ""):
-    """Press 'Play' so the console's dialog scanner starts feeding conversations.
+async def press_play(page, cfg, tag: str = "") -> bool:
+    """Ensure the console's dialog scanner is running.
 
-    Clicking an already-running (disabled) Play button is harmless — ExtJS
-    ignores the click — so this is safe to call defensively after reaching the
-    console. It's best-effort: a missing button is logged, not raised.
+    Pause being accessible is the authoritative running state. If Pause is
+    disabled or absent, always click the outer ``#buttonTbPlay`` ExtJS control.
+    Returns True once Pause becomes accessible, otherwise False.
     """
     try:
         play = page.locator(cfg.sel_play_btn)
-        if await play.count() > 0:
-            print(f"{tag}pressing 'Play' to start the dialog scanner...", flush=True)
-            await play.first.click()
-            await asyncio.sleep(1.0)
-        else:
+        try:
+            # The ExtJS toolbar is mounted after DOMContentLoaded. An immediate
+            # count() after a reload races that render and incorrectly reports
+            # that Play is missing, even though its stable id is present shortly
+            # afterwards.
+            await play.first.wait_for(state="attached", timeout=10_000)
+        except Exception:
             print(f"{tag}'Play' button not found (already running?).", flush=True)
+            return False
+
+        # Running state shown by the console: Play disabled, Pause accessible.
+        if await _ext_button_accessible(page, cfg.sel_pause_btn):
+            return True
+
+        print(f"{tag}Pause unavailable — pressing 'Play' to start the dialog scanner...", flush=True)
+        # Click the outer anchor: that is the Ext.Component event target. Force
+        # bypasses Playwright's native-button check; ExtJS uses CSS disabled
+        # classes on an <a>, not a native disabled attribute.
+        await play.first.click(timeout=10_000, force=True)
+
+        # Confirm the toolbar flipped to its running state. A failed click returns
+        # False so recovery can retry instead of claiming the scanner is active.
+        for _ in range(20):
+            if await _ext_button_accessible(page, cfg.sel_pause_btn):
+                return True
+            await asyncio.sleep(0.25)
+        print(f"{tag}Play was clicked but Pause did not become accessible yet.", flush=True)
+        return False
     except Exception as e:
         print(f"{tag}could not press Play: {e}", flush=True)
+        return False
 
 
 # ── Public entry points ─────────────────────────────────────────────────────────

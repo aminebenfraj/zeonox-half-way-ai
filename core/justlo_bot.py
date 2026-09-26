@@ -94,7 +94,7 @@ _ASA_NUDGE_RE = re.compile(r"\bASA\s*[23]\b", re.IGNORECASE)
 _ASA_ANY_RE = re.compile(r"\bASA\b", re.IGNORECASE)
 
 POLL_INTERVAL    = 3    # seconds between idle checks
-WAITING_REPLAY_INTERVAL = 90  # seconds with no dialog before re-pressing Play / reloading the console
+WAITING_REPLAY_INTERVAL = 90  # seconds with no dialog before re-pressing Play
 UNKNOWN_RECOVER_INTERVAL = 30  # seconds between recovery attempts while stuck off the console
 EXTRACT_TIMEOUT  = 30   # seconds to wait for the Generate Reply button
 GENERATE_TIMEOUT = 90   # seconds to wait for the AI to finish
@@ -562,7 +562,8 @@ class JustloBot:
     async def _get_approved_reply(self, tab1, tab2, reply_type: str = "", last_message: str = "",
                                    customer_message: str = "",
                                    client_profile: dict | None = None, fake_profile: dict | None = None,
-                                   messages: list[dict] | None = None) -> tuple[str, str]:
+                                   messages: list[dict] | None = None,
+                                   expected_sig: str = "") -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
@@ -586,7 +587,7 @@ class JustloBot:
                 customer_message=customer_message,
                 client_profile=client_profile, fake_profile=fake_profile,
                 messages=messages,
-                chat_still_active=lambda: self._chat_still_active(tab1),
+                chat_still_active=lambda: self._approval_chat_still_active(tab1, expected_sig),
             )
             if approved:
                 self.log(f"[APPROVAL] Approved{' with edits' if final_text != reply else ''}.")
@@ -682,6 +683,12 @@ class JustloBot:
                     return PAGE_CHAT
                 # Same conversation we already handled (or nothing loaded yet) —
                 # keep waiting for the next one; do NOT skip.
+            elif state == PAGE_WAITING:
+                # ExtJS's authoritative scanner state is the Pause button: when
+                # it is disabled/unavailable, Play is enabled and must be clicked.
+                # Check every poll so a stopped scanner is recovered immediately,
+                # not only after the old 90-second recovery interval.
+                await press_play(tab1, self.cfg, f"[{self.cfg.platform}] ")
             if state == PAGE_LOGIN:
                 return PAGE_LOGIN
 
@@ -692,18 +699,20 @@ class JustloBot:
                 last_recover = now
                 last_replay = now
             elif state == PAGE_WAITING and now - last_replay >= WAITING_REPLAY_INTERVAL:
-                # The scanner can stall after a dialog ends; re-press Play, and if
-                # that doesn't help reload the console to restart it.
+                # The scanner can stall after a dialog ends, so re-press Play.
+                # Reload only if Play cannot be found/clicked: reloading directly
+                # after a successful click cancels the scanner we just started.
                 self.log(f"[RECOVERY] No dialog after {WAITING_REPLAY_INTERVAL}s — re-pressing Play...")
-                await press_play(tab1, self.cfg, f"[{self.cfg.platform}] ")
-                try:
-                    await tab1.reload(wait_until="domcontentloaded", timeout=30_000)
-                    await asyncio.sleep(1.5)
-                    await press_play(tab1, self.cfg, f"[{self.cfg.platform}] ")
-                except PlaywrightError as e:
-                    if _is_fatal(e):
-                        raise
-                    self.log(f"[WARN] Console reload failed: {e}")
+                play_found = await press_play(tab1, self.cfg, f"[{self.cfg.platform}] ")
+                if not play_found:
+                    self.log("[RECOVERY] Play unavailable — reloading the console once...")
+                    try:
+                        await tab1.reload(wait_until="domcontentloaded", timeout=30_000)
+                        await press_play(tab1, self.cfg, f"[{self.cfg.platform}] ")
+                    except PlaywrightError as e:
+                        if _is_fatal(e):
+                            raise
+                        self.log(f"[WARN] Console reload failed: {e}")
                 last_replay = now
                 last_report = now
             elif now - last_report >= 30:
@@ -955,6 +964,19 @@ class JustloBot:
                 raise
             return False
 
+    async def _approval_chat_still_active(self, tab1, expected_sig: str) -> bool:
+        """True only while the exact dialog submitted for approval is actionable.
+
+        This catches both an empty console and manual work performed while the
+        dashboard card is pending. Merely retaining the old client profile is not
+        enough: classify_page() now requires a pending row or visible queue task,
+        and the signature must still match the submitted conversation.
+        """
+        if not await self._chat_still_active(tab1):
+            return False
+        current_sig = await self._conversation_sig(tab1)
+        return bool(current_sig and (not expected_sig or current_sig == expected_sig))
+
     async def _restart_chameleon_job(self, tab1, tab2, reason: str = "Workflow interrupted"):
         """Re-establish a clean chameleon state after a mid-cycle failure."""
         await report_status(
@@ -1126,7 +1148,7 @@ class JustloBot:
                             tab1, tab2, reply_type,
                             extracted["last_message"], extracted["last_customer_message"],
                             extracted["client_profile"], extracted["fake_profile"],
-                            extracted["messages"],
+                            extracted["messages"], expected_sig=sig,
                         )
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
@@ -1149,11 +1171,19 @@ class JustloBot:
                         cycle -= 1
                         continue
                     except ApprovalCancelled:
-                        self.log("[APPROVAL] Cancelled — chat closed or operator cancelled it. "
-                                 "Restarting the Chameleon job on this chat...")
-                        await self._restart_chameleon_job(
-                            tab1, tab2, "Approval was cancelled or the conversation changed"
-                        )
+                        if await self._chat_still_active(tab1):
+                            self.log("[APPROVAL] Cancelled or conversation changed — "
+                                     "restarting Chameleon for the active dialog...")
+                            await self._restart_chameleon_job(
+                                tab1, tab2, "Approval was cancelled or the conversation changed"
+                            )
+                        else:
+                            self.log("[APPROVAL] Stale approval removed — no conversation "
+                                     "needs action; returning to Waiting.")
+                            await report_status(
+                                self.cfg.platform, "waiting", "Waiting for a conversation",
+                                checkpoint="waiting",
+                            )
                         cycle -= 1
                         continue
                     await report_status(self.cfg.platform, "sending", "Pasting and sending the approved reply", checkpoint="sending")

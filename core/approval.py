@@ -178,6 +178,7 @@ async def request_approval(
         next_chat_check = loop.time() + chat_check_interval
         next_status_ping = loop.time() + 20.0
         next_ws_retry = loop.time()
+        inactive_chat_checks = 0
         ws = None
 
         try:
@@ -242,7 +243,12 @@ async def request_approval(
                         still_there = await chat_still_active()
                     except Exception:
                         still_there = True  # flaky check — never cancel on a fluke
-                    if not still_there:
+                    inactive_chat_checks = 0 if still_there else inactive_chat_checks + 1
+                    # DOM-backed console state can flicker for one render while
+                    # ExtJS refreshes. Require two consecutive misses so a real
+                    # manual send/transfer is cleaned up without cancelling an
+                    # approval because of one transient frame.
+                    if inactive_chat_checks >= 2:
                         try:
                             await client.post(f"{APPROVAL_SERVER_URL}/api/requests/{req_id}/cancel")
                         except Exception:
