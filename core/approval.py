@@ -34,6 +34,8 @@ from typing import Awaitable, Callable
 
 import httpx
 
+from core.reply_text import strip_disallowed_reply_punctuation
+
 try:
     from simple_websocket import Client as WebSocketClient
 except ImportError:  # flask-sock normally installs this; HTTP remains the fallback
@@ -85,7 +87,10 @@ def _decision_result(data: dict, reply: str, request_id: str):
     """Convert a request snapshot into a completed decision, if any."""
     status = data.get("status")
     if status == "approved":
-        return True, (data.get("final_reply") or reply), request_id
+        final_reply = strip_disallowed_reply_punctuation(
+            data.get("final_reply") or reply
+        )
+        return True, final_reply, request_id
     if status == "rejected":
         return False, None, request_id
     if status == "cancelled":
@@ -155,6 +160,10 @@ async def request_approval(
     disappeared. Raises ApprovalSkipped when a supported approval card's
     "Skip conversation" action is clicked.
     """
+    # Clean the candidate before it is displayed on the approval card.  The
+    # decision path applies the same rule again in case an operator edit adds
+    # one of these characters back before approving.
+    reply = strip_disallowed_reply_punctuation(reply)
     async with httpx.AsyncClient(timeout=timeout, auth=_AUTH) as client:
         resp = await client.post(
             f"{APPROVAL_SERVER_URL}/api/requests",

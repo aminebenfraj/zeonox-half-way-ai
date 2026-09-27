@@ -65,6 +65,7 @@ from core.bot import pause_flag_path
 from core.platform_operations import run_browser_operation
 from core.runtime_settings import get_runtime_settings, update_runtime_settings
 from core.process_visibility import apply_current_console_visibility
+from core.reply_text import strip_disallowed_reply_punctuation
 from core.platforms import (
     KNOWN_PLATFORM_LABELS,
     PLATFORM_BY_SLUG,
@@ -1282,7 +1283,7 @@ def _prune_history_locked():
 def create_request():
     body = request.get_json(force=True, silent=True) or {}
     platform = (body.get("platform") or "unknown").strip()
-    reply = body.get("reply") or ""
+    reply = strip_disallowed_reply_punctuation(body.get("reply") or "")
     customer_message = body.get("customer_message") or ""
     # Literal latest conversation message, regardless of sender. Older bot
     # versions only send customer_message, so retain that as a display fallback.
@@ -1342,7 +1343,7 @@ def create_request():
             contains_meeting = result["contains_meeting"]
             meeting_guard = result["action"]  # recorded even for "approve" so the dashboard can show every verdict, not just the ones that changed something
             if result["contains_meeting"] and result["reply"]:
-                final_reply = result["reply"]
+                final_reply = strip_disallowed_reply_punctuation(result["reply"])
 
     # Judge AI is intentionally asynchronous whenever it is enabled. Provider
     # fallbacks can outlive the bot client's POST timeout, so the card is always
@@ -1623,7 +1624,11 @@ def approve_request(req_id):
         if r["status"] != "pending":
             return jsonify({"error": f"already {r['status']}"}), 409
         edited = body.get("edited_reply")
-        r["final_reply"] = edited.strip() if isinstance(edited, str) and edited.strip() else r["reply"]
+        r["final_reply"] = (
+            strip_disallowed_reply_punctuation(edited)
+            if isinstance(edited, str) and edited.strip()
+            else r["reply"]
+        )
         r["status"] = "approved"
         r["decided_at"] = _now()
     _bump_state()
