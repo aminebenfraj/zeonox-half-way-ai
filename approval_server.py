@@ -1300,7 +1300,12 @@ def create_request():
     # Best-effort DE->EN translation so a reviewer who doesn't read German can
     # still judge the reply. The German text is always what's authoritative /
     # editable / actually sent — translations are read-only context.
-    reply_en = _translate_de_en(reply)
+    translated_reply = _translate_de_en(reply)
+    reply_en = (
+        strip_disallowed_reply_punctuation(translated_reply)
+        if translated_reply
+        else translated_reply
+    )
     customer_message_en = _translate_de_en(customer_message) if customer_message else None
     last_message_en = _translate_de_en(last_message) if last_message else None
 
