@@ -21,7 +21,6 @@ Exit codes (used by launcher to decide restart):
 """
 
 import asyncio
-import random
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -56,6 +55,7 @@ from core.approval import (
     ApprovalCancelled, ApprovalSkipped,
 )
 from core.chameleon_data import read_extracted_data
+from core.runtime_settings import get_send_delay_seconds
 from core.xkuss_login import (
     login_xkuss,
     click_home,
@@ -80,7 +80,7 @@ _SEL_EXTRACTOR_TAB = "button[role='tab']:has-text('Extractor')"
 _SEL_HTML_TEXTAREA = "textarea[placeholder*='HTML-Quellcode']"
 _SEL_EXTRACT_BTN   = "button:has-text('Daten extrahieren')"
 _SEL_GEN_BTN       = "button:has-text('Antwort generieren')"
-_SEL_INSTRUCTIONS  = "textarea[placeholder*='Etwas flirtender']"
+_SEL_INSTRUCTIONS  = "textarea[placeholder*='Etwas flirtender'], textarea[placeholder*='Thema XYZ']"
 _SEL_COMBOBOX      = "button[role='combobox']"
 
 # Inject the HTML straight into the React-controlled textarea in ONE shot:
@@ -372,22 +372,35 @@ class XkussBot:
             self.log(f"[WARN] Could not check for First Contact: {e}")
             return False
 
-    async def _generate_reply(self, tab2) -> str:
+    async def _generate_reply(self, tab2, regeneration_instruction: str = "") -> str:
         old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
         gen_btn   = tab2.locator(_SEL_GEN_BTN)
         self.log(f"Waiting up to {EXTRACT_TIMEOUT}s for 'Generate Reply' button...")
         await gen_btn.wait_for(state="visible", timeout=EXTRACT_TIMEOUT * 1_000)
         self.log("'Generate Reply' button visible — clicking...")
-        if self.cfg.additional_instructions:
-            try:
-                instr = tab2.locator(_SEL_INSTRUCTIONS)
-                if await instr.count() > 0:
-                    await instr.fill(self.cfg.additional_instructions)
-                    self.log(f"Additional instructions set: {self.cfg.additional_instructions}")
-            except PlaywrightError as e:
-                if _is_fatal(e):
-                    raise
-                self.log(f"[WARN] Could not fill additional instructions: {e}")
+        instruction = "\n".join(filter(None, (
+            (self.cfg.additional_instructions or "").strip(),
+            regeneration_instruction.strip(),
+        )))
+        try:
+            instr = tab2.locator(_SEL_INSTRUCTIONS).first
+            if instruction:
+                await instr.wait_for(state="visible", timeout=10_000)
+            if await instr.count() > 0:
+                await instr.fill(instruction)
+                if instruction:
+                    inserted = (await instr.input_value()).strip()
+                    if inserted != instruction.strip():
+                        raise RuntimeError("Chameleon did not retain the requested instruction")
+                    self.log(f"Chameleon Zusatzanweisungen set: {instruction}")
+        except PlaywrightError as e:
+            if _is_fatal(e):
+                raise
+            if instruction:
+                raise RuntimeError(
+                    "Could not fill Chameleon's 'Zusatzanweisungen (optional)' field"
+                ) from e
+            self.log(f"[WARN] Could not fill additional instructions: {e}")
 
         # Chameleon can refuse to produce a reply in three ways:
         #  - its quality check shows "Keine sichere Antwort erstellt"
@@ -503,9 +516,11 @@ class XkussBot:
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
         clicked Cancel) so it can restart this chat's Chameleon job instead."""
+        regeneration_instruction = ""
         while True:
             await report_status(self.cfg.platform, "generating", "Generating a reply", checkpoint="generating")
-            reply = await self._generate_reply(tab2)
+            reply = await self._generate_reply(tab2, regeneration_instruction)
+            regeneration_instruction = ""
 
             banned = contains_banned_language(reply)
             if banned:
@@ -525,6 +540,7 @@ class XkussBot:
             if approved:
                 self.log(f"[APPROVAL] Approved{' with edits' if final_text != reply else ''}.")
                 return final_text, req_id
+            regeneration_instruction = final_text or ""
             self.log("[APPROVAL] Rejected — regenerating a new reply...")
 
     # ── xkuss (tab1) helpers ─────────────────────────────────────────────────
@@ -674,7 +690,7 @@ class XkussBot:
         await textarea.fill(reply)
         # Trigger the character counter so the send button un-disables.
         await self._nudge_char_counter(tab1)
-        wait = random.randint(15, 20)
+        wait = get_send_delay_seconds()
         self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
         await asyncio.sleep(wait)
         # A pause toggled during the human-like delay must prevent the send.

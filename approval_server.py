@@ -1642,12 +1642,20 @@ def approve_request(req_id):
 
 @app.post("/api/requests/<req_id>/reject")
 def reject_request(req_id):
+    body = request.get_json(force=True, silent=True) or {}
+    instruction = body.get("instruction") or ""
+    if not isinstance(instruction, str):
+        return jsonify({"error": "instruction must be text"}), 400
+    instruction = instruction.strip()
+    if len(instruction) > 4000:
+        return jsonify({"error": "instruction must be 4000 characters or fewer"}), 400
     with _lock:
         r = _requests.get(req_id)
         if not r:
             return jsonify({"error": "not found"}), 404
         if r["status"] != "pending":
             return jsonify({"error": f"already {r['status']}"}), 409
+        r["regeneration_instruction"] = instruction
         r["status"] = "rejected"
         r["decided_at"] = _now()
     _bump_state()
@@ -2466,6 +2474,42 @@ _PAGE = """<!doctype html>
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--pc, var(--ring)) 22%, transparent);
   }
 
+  .regenerate-options {
+    margin-top: 13px; border: 1px solid var(--border); border-radius: 9px;
+    background: color-mix(in srgb, var(--muted) 72%, transparent);
+    overflow: hidden; transition: border-color .15s, background .15s;
+  }
+  .regenerate-options[open] { border-color: rgba(239,68,68,.34); background: color-mix(in srgb, var(--muted) 84%, transparent); }
+  .regenerate-options summary {
+    cursor: pointer; list-style: none; padding: 10px 11px; color: var(--foreground);
+    font-size: 12px; user-select: none; display: flex; align-items: center; gap: 9px;
+  }
+  .regenerate-options summary::-webkit-details-marker { display: none; }
+  .regenerate-chevron { color: var(--destructive); font-size: 15px; line-height: 1; transition: transform .15s; }
+  .regenerate-options[open] .regenerate-chevron { transform: rotate(90deg); }
+  .regenerate-summary-copy { display: grid; gap: 1px; min-width: 0; }
+  .regenerate-summary-copy strong { font-size: 12.5px; }
+  .regenerate-summary-copy small { color: var(--muted-foreground); font-weight: 400; }
+  .instruction-state { margin-left: auto; flex: none; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted-foreground); font-size: 10px; font-weight: 700; }
+  .instruction-state.ready { color: var(--info); border-color: rgba(56,189,248,.35); background: rgba(56,189,248,.08); }
+  .regenerate-body { padding: 2px 11px 11px; border-top: 1px solid var(--border); }
+  .instruction-label { display: block; margin: 10px 0 6px; color: var(--muted-foreground); font-size: 11px; font-weight: 650; }
+  textarea.instruction-input {
+    width: 100%; min-height: 72px; resize: vertical; background: var(--background);
+    color: var(--foreground); border: 1px solid var(--input); border-radius: 8px;
+    padding: 9px 10px; font: inherit; font-size: 13px;
+  }
+  textarea.instruction-input:focus {
+    outline: none; border-color: var(--destructive);
+    box-shadow: 0 0 0 3px rgba(239,68,68,.14);
+  }
+  .instruction-tools { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .instruction-tools .char-count { margin-left: auto; color: var(--muted-foreground); font-size: 10.5px; }
+  .instruction-footer { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .btn-exact { background: rgba(56,189,248,.1); color: var(--info); border-color: rgba(56,189,248,.38); }
+  .btn-regenerate-guided { background: var(--destructive); color: white; margin-left: auto; }
+  .keyboard-hint { color: var(--muted-foreground); font-size: 10.5px; }
+
   .actions { display: flex; align-items: center; gap: 8px; margin-top: 13px; flex-wrap: wrap; }
   button {
     font: inherit; font-weight: 600; font-size: 13px; border: 1px solid transparent;
@@ -2700,7 +2744,10 @@ _PAGE = """<!doctype html>
     /* iOS Safari auto-zooms the page when a focused input's font is under
        16px — keep the textarea at 16px so approving on a phone doesn't
        trigger an unwanted zoom-in. */
-    textarea.reply-input { font-size: 16px; min-height: 100px; }
+    textarea.reply-input, textarea.instruction-input { font-size: 16px; min-height: 100px; }
+    .instruction-tools .btn-exact, .instruction-footer .btn-regenerate-guided { width: 100%; min-height: 44px; }
+    .instruction-tools .char-count { margin-left: 0; }
+    .btn-regenerate-guided { margin-left: 0; order: -1; }
 
     .nav-item, .sound-toggle, .mode-toggle { min-height: 44px; }
     .nav-item { padding: 10px 12px; font-size: 14px; }
@@ -3402,6 +3449,9 @@ const slug = (s) => "plat-" + (s || "unknown").toLowerCase().replace(/[^a-z0-9]+
 // Edits the reviewer has typed are kept here (keyed by request id) so a
 // background refresh can never silently wipe out in-progress wording changes.
 const editedReplies = new Map();
+// One-shot Chameleon instructions need the same protection from live card
+// refreshes as edits to the proposed reply.
+const regenerationInstructions = new Map();
 // Live snapshots rebuild cards. Persist disclosure state separately so an
 // open Extracted data panel never collapses just because telemetry refreshed.
 const openDisclosurePanels = new Set();
@@ -3697,10 +3747,11 @@ async function act(id, action, body, btn) {
   // double-click can't fire two decisions on the same request while the
   // first one is still in flight.
   const card = document.querySelector(`.card[data-id="${id}"]`);
-  const buttons = card ? card.querySelectorAll(".actions button") : [];
+  const buttons = card ? card.querySelectorAll(".actions button, .regenerate-body button") : [];
   buttons.forEach(b => { b.disabled = true; });
   const meta = ACTION_MESSAGES[action];
   const original = btn ? btn.innerHTML : null;
+  let succeeded = false;
   if (btn && meta) btn.innerHTML = `<span class="spinner"></span> ${escapeHtml(meta.verb)}…`;
   try {
     const res = await fetch(`/api/requests/${id}/${action}`, {
@@ -3713,21 +3764,64 @@ async function act(id, action, body, btn) {
       toast(`Could not ${action}`, { type: "error", detail: err.error || `HTTP ${res.status}` });
       buttons.forEach(b => { b.disabled = false; });
       if (btn && original != null) btn.innerHTML = original;
-    } else if (meta) {
-      toast(meta.done, { type: meta.type, duration: 2600 });
+    } else {
+      succeeded = true;
+      if (meta) toast(meta.done, { type: meta.type, duration: 2600 });
     }
   } catch (e) {
     toast(`Could not ${action}`, { type: "error", detail: "Request failed — check your connection." });
     buttons.forEach(b => { b.disabled = false; });
     if (btn && original != null) btn.innerHTML = original;
   }
-  editedReplies.delete(id);
+  if (succeeded) {
+    editedReplies.delete(id);
+    regenerationInstructions.delete(id);
+  }
   refresh();
 }
 
 function approveCard(id, btn) {
   const ta = document.getElementById(`ta-${id}`);
   act(id, "approve", { edited_reply: ta ? ta.value : undefined }, btn);
+}
+
+function insertSayExactly(id) {
+  const input = document.getElementById(`instruction-${id}`);
+  if (!input) return;
+  const prefix = '!important say exactly "';
+  const current = input.value.trim();
+  input.value = current.startsWith(prefix)
+    ? (current.endsWith('"') ? current : `${current}"`)
+    : `${prefix}${current}"`;
+  updateInstructionDraft(id, input.value);
+  input.focus();
+  const cursor = input.value.endsWith('"') ? input.value.length - 1 : input.value.length;
+  input.setSelectionRange(cursor, cursor);
+}
+
+function updateInstructionDraft(id, value) {
+  regenerationInstructions.set(id, value);
+  const count = document.getElementById(`instruction-count-${id}`);
+  if (count) count.textContent = `${value.length} / 4000`;
+  const state = document.getElementById(`instruction-state-${id}`);
+  if (state) {
+    const ready = Boolean(value.trim());
+    state.textContent = ready ? "Ready" : "Optional";
+    state.classList.toggle("ready", ready);
+  }
+}
+
+function handleInstructionKeydown(event, id, btnId) {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    regenerateCard(id, document.getElementById(btnId));
+  }
+}
+
+function regenerateCard(id, btn) {
+  const input = document.getElementById(`instruction-${id}`);
+  const instruction = input ? input.value.trim() : (regenerationInstructions.get(id) || "").trim();
+  act(id, "reject", { instruction }, btn);
 }
 
 async function cancelCard(id, btn) {
@@ -4268,6 +4362,7 @@ function conversationAnalysisHtml(r) {
 
 function pendingCardHtml(r) {
   const val = editedReplies.has(r.id) ? editedReplies.get(r.id) : r.reply;
+  const instruction = regenerationInstructions.get(r.id) || "";
   const pc = colorFor(r.platform);
   const lastMessage = r.last_message || r.customer_message || "";
   const lastMessageEn = r.last_message_en || r.customer_message_en || "";
@@ -4304,9 +4399,35 @@ function pendingCardHtml(r) {
         <span class="en-box">${r.reply_en ? escapeHtml(r.reply_en) : "(translation unavailable)"}</span>
       </div>
       ${extractedDataHtml(r)}
+      <details class="regenerate-options" data-ui-key="instruction:${r.id}" ${openDisclosurePanels.has(`instruction:${r.id}`) ? "open" : ""}>
+        <summary>
+          <span class="regenerate-chevron" aria-hidden="true">›</span>
+          <span class="regenerate-summary-copy">
+            <strong>Guide the next reply</strong>
+            <small>Add an optional instruction before regenerating in Chameleon</small>
+          </span>
+          <span class="instruction-state ${instruction.trim() ? "ready" : ""}" id="instruction-state-${r.id}">${instruction.trim() ? "Ready" : "Optional"}</span>
+        </summary>
+        <div class="regenerate-body">
+          <label class="instruction-label" for="instruction-${r.id}">Chameleon field: Zusatzanweisungen (optional)</label>
+          <textarea class="instruction-input" id="instruction-${r.id}"
+            maxlength="4000" aria-describedby="instruction-help-${r.id}"
+            placeholder="For example: Make it warmer and ask one playful question."
+            oninput="updateInstructionDraft('${r.id}', this.value)"
+            onkeydown="handleInstructionKeydown(event, '${r.id}', 'guided-regenerate-${r.id}')">${escapeHtml(instruction)}</textarea>
+          <div class="instruction-tools">
+            <button type="button" class="btn-exact" onmousedown="event.preventDefault()" onclick="insertSayExactly('${r.id}')">Say exactly (English → German)</button>
+            <span class="char-count" id="instruction-count-${r.id}">${instruction.length} / 4000</span>
+          </div>
+          <div class="instruction-footer">
+            <span class="keyboard-hint" id="instruction-help-${r.id}">The shortcut wraps your English in <code>!important say exactly &quot;…&quot;</code>. Press Ctrl/⌘ + Enter to regenerate.</span>
+            <button type="button" class="btn-regenerate-guided" id="guided-regenerate-${r.id}" onclick="regenerateCard('${r.id}', this)">Regenerate in Chameleon</button>
+          </div>
+        </div>
+      </details>
       <div class="actions">
         <button class="btn-approve" onclick="approveCard('${r.id}', this)">Approve &amp; Send</button>
-        <button class="btn-reject" onclick="act('${r.id}', 'reject', null, this)">Reject &amp; Regenerate</button>
+        <button class="btn-reject" onclick="regenerateCard('${r.id}', this)">Reject &amp; Regenerate</button>
         ${canSkipConversation ? `<button class="btn-skip" onclick="skipConversationCard('${r.id}', '${escapeHtml(r.platform)}', this)">${String(r.platform).toLowerCase() === "xkuss" ? "Skip conversation" : "Transfer / Skip"}</button>` : ""}
         <button class="btn-cancel" onclick="cancelCard('${r.id}', this)">Cancel</button>
         <span class="hint">Edit the German text above before approving. Transfer / Skip hands the conversation to another online moderator, or skips it when none are available. Cancel abandons this reply and restarts the same chat.</span>
@@ -4461,6 +4582,7 @@ function renderSections(pending, autoByPlatform) {
   // Drop edit-buffers for requests that are no longer pending (decided elsewhere).
   const stillPending = new Set(pending.map(r => r.id));
   for (const id of [...editedReplies.keys()]) if (!stillPending.has(id)) editedReplies.delete(id);
+  for (const id of [...regenerationInstructions.keys()]) if (!stillPending.has(id)) regenerationInstructions.delete(id);
   for (const key of [...openDisclosurePanels]) {
     if (key.startsWith("extracted:") && !stillPending.has(key.slice("extracted:".length))) {
       openDisclosurePanels.delete(key);
@@ -4563,7 +4685,7 @@ function applySnapshot(data) {
 
 async function refresh() {
   // Never yank the textarea out from under someone mid-keystroke.
-  if (document.activeElement && document.activeElement.classList.contains("reply-input")) return;
+  if (document.activeElement && document.activeElement.matches(".reply-input, .instruction-input")) return;
   refreshControlStatus();
   try {
     const readJson = async url => {
@@ -4660,7 +4782,7 @@ function connectLive(force = false) {
         renderSystemStatus();
         return;
       }
-      if (document.activeElement && document.activeElement.classList.contains("reply-input")) {
+      if (document.activeElement && document.activeElement.matches(".reply-input, .instruction-input")) {
         deferredSnapshot = snapshot;
         return;
       }
@@ -4678,7 +4800,7 @@ function connectLive(force = false) {
 }
 
 document.addEventListener("focusout", event => {
-  if (!event.target.classList || !event.target.classList.contains("reply-input") || !deferredSnapshot) return;
+  if (!event.target.matches || !event.target.matches(".reply-input, .instruction-input") || !deferredSnapshot) return;
   const snapshot = deferredSnapshot;
   deferredSnapshot = null;
   requestAnimationFrame(() => applySnapshot(snapshot));
@@ -5137,7 +5259,7 @@ function stepsFor(slug, approval) {
       "Click \"Antwort generieren\" and wait for Chameleon's complete reply",
       approvalStep,
       "If Transfer/Skip was requested, click Home and confirm the dashboard action completed",
-      "Otherwise paste the approved reply, wait about 15–20 seconds, and send it",
+      "Otherwise paste the approved reply, wait for the configured send timer, and send it",
       "Click Home again, reset Chameleon, and wait for a different conversation",
     ];
   }
@@ -5160,7 +5282,7 @@ function stepsFor(slug, approval) {
     "For a normal chat: click \"Antwort generieren\" and wait for Chameleon's complete reply",
     approvalStep,
     "A dashboard Transfer/Skip request uses the same Übergeben → Überspringen → Ja fallback",
-    "Otherwise paste the approved reply, wait about 15–20 seconds, and send it",
+    "Otherwise paste the approved reply, wait for the configured send timer, and send it",
     "Reset Chameleon and return to Waiting until the scanner loads another conversation",
   ];
 }

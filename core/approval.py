@@ -7,8 +7,8 @@ after generating a reply and BEFORE pasting/sending it. This blocks the bot's
 cycle until a human clicks Approve, Reject, Cancel, or Skip on the dashboard:
   - Approve -> returns the (possibly hand-edited) reply text; the bot pastes
     and sends it.
-  - Reject  -> returns None; the bot clicks 'Antwort generieren' again for a
-    fresh reply and submits that one for approval instead.
+  - Reject  -> returns an optional one-shot instruction; the bot fills it into
+    Chameleon, clicks 'Antwort generieren' again, and submits the fresh reply.
   - Cancel  -> raises ApprovalCancelled; the bot abandons this reply attempt
     and restarts/redetects the chat instead of retrying it.
   - Skip    -> raises ApprovalSkipped; supported bots actively leave the current
@@ -92,7 +92,9 @@ def _decision_result(data: dict, reply: str, request_id: str):
         )
         return True, final_reply, request_id
     if status == "rejected":
-        return False, None, request_id
+        # On rejection the second tuple slot carries an optional one-shot
+        # instruction for the next Chameleon generation.
+        return False, (data.get("regeneration_instruction") or "").strip(), request_id
     if status == "cancelled":
         raise ApprovalCancelled(request_id)
     if status == "skip_requested":
@@ -150,7 +152,8 @@ async def request_approval(
 
     Returns (approved, final_text, request_id):
       - approved=True,  final_text = the text to actually send (edits applied)
-      - approved=False, final_text = None  (human clicked Reject — regenerate)
+      - approved=False, final_text = the optional one-shot Chameleon
+        instruction (human clicked Reject — regenerate)
 
     Raises ApprovalCancelled if a human clicks 'Cancel' on the dashboard, or if
     `chat_still_active` is given and reports the chat gone (checked every

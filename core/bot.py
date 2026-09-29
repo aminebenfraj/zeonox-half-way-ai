@@ -9,7 +9,6 @@ Exit codes (used by launcher to decide restart):
 """
 
 import asyncio
-import random
 import re
 import sys
 import time
@@ -20,6 +19,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from core.login import login_mod_site, login_chameleon, chat_not_selected
 from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
 from core.chameleon_data import read_extracted_data
+from core.runtime_settings import get_send_delay_seconds
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
 # Cross-process signal: the launcher (start_all.py/launch_all.py) creates/deletes
@@ -491,7 +491,9 @@ class BotConfig:
     sel_html_textarea: str = "textarea[placeholder*='HTML-Quellcode']"
     sel_extract_btn:   str = "button:has-text('Daten extrahieren')"
     sel_gen_btn:       str = "button:has-text('Antwort generieren')"
-    sel_instructions:  str = "textarea[placeholder*='Etwas flirtender']"
+    # Chameleon's "Zusatzanweisungen (optional)" field. Keep both fragments
+    # from its current placeholder so small copy changes do not break it.
+    sel_instructions:  str = "textarea[placeholder*='Etwas flirtender'], textarea[placeholder*='Thema XYZ']"
     additional_instructions: str = ""
     # Session keep-alive popup ("Bist Du noch online?") that logs the mod out
     # if the confirm button isn't clicked within ~16s of it appearing — see
@@ -909,22 +911,37 @@ class ChatBot:
             await asyncio.sleep(0.5)
         raise RuntimeError("Send was not confirmed: the reply box did not clear.")
 
-    async def _generate_reply(self, tab2) -> str:
+    async def _generate_reply(self, tab2, regeneration_instruction: str = "") -> str:
         old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
         gen_btn   = tab2.locator(self.cfg.sel_gen_btn)
         self.log(f"Waiting up to {EXTRACT_TIMEOUT}s for 'Generate Reply' button...")
         await gen_btn.wait_for(state="visible", timeout=EXTRACT_TIMEOUT * 1_000)
         self.log("'Generate Reply' button visible — clicking...")
-        if self.cfg.additional_instructions:
-            try:
-                instr = tab2.locator(self.cfg.sel_instructions)
-                if await instr.count() > 0:
-                    await instr.fill(self.cfg.additional_instructions)
-                    self.log(f"Additional instructions set: {self.cfg.additional_instructions}")
-            except PlaywrightError as e:
-                if _is_fatal(e):
-                    raise
-                self.log(f"[WARN] Could not fill additional instructions: {e}")
+        instruction = "\n".join(filter(None, (
+            (self.cfg.additional_instructions or "").strip(),
+            regeneration_instruction.strip(),
+        )))
+        try:
+            instr = tab2.locator(self.cfg.sel_instructions).first
+            if instruction:
+                await instr.wait_for(state="visible", timeout=10_000)
+            if await instr.count() > 0:
+                # Fill even when blank so a previous one-shot instruction can
+                # never leak into a later conversation.
+                await instr.fill(instruction)
+                if instruction:
+                    inserted = (await instr.input_value()).strip()
+                    if inserted != instruction.strip():
+                        raise RuntimeError("Chameleon did not retain the requested instruction")
+                    self.log(f"Chameleon Zusatzanweisungen set: {instruction}")
+        except PlaywrightError as e:
+            if _is_fatal(e):
+                raise
+            if instruction:
+                raise RuntimeError(
+                    "Could not fill Chameleon's 'Zusatzanweisungen (optional)' field"
+                ) from e
+            self.log(f"[WARN] Could not fill additional instructions: {e}")
 
         # Chameleon can reject a generation a few different ways:
         #  - its own quality check rejects the generation and shows
@@ -1068,9 +1085,11 @@ class ChatBot:
         the dashboard, or the chat closed while this reply was still pending;
         the caller restarts/redetects rather than looping here.
         """
+        regeneration_instruction = ""
         while True:
             await report_status(self.cfg.platform, "generating", "Generating a reply", checkpoint="generating")
-            reply = await self._generate_reply(tab2)
+            reply = await self._generate_reply(tab2, regeneration_instruction)
+            regeneration_instruction = ""
 
             banned = contains_banned_language(reply)
             if banned:
@@ -1093,6 +1112,7 @@ class ChatBot:
                 else:
                     self.log("[APPROVAL] Approved.")
                 return final_text, req_id
+            regeneration_instruction = final_text or ""
             self.log("[APPROVAL] Rejected — regenerating a new reply...")
 
     # ── Main entry point ───────────────────────────────────────────────────────
@@ -1259,7 +1279,7 @@ class ChatBot:
                     textarea = tab1.locator(self.cfg.sel_textarea)
                     await textarea.click()
                     await textarea.fill(reply)
-                    wait = random.randint(15, 20)
+                    wait = get_send_delay_seconds()
                     self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
                     await asyncio.sleep(wait)
                     # Never send a message while paused, even if pause was toggled
