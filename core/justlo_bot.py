@@ -68,7 +68,8 @@ from core.approval import (
     ApprovalCancelled, ApprovalSkipped,
 )
 from core.chameleon_data import read_extracted_data
-from core.runtime_settings import get_runtime_settings, get_send_delay_seconds
+from core.runtime_settings import get_runtime_settings
+from core.send_delay import get_send_delay_seconds
 from core.justlo_login import (
     login_justlo,
     go_console,

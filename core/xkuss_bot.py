@@ -55,7 +55,7 @@ from core.approval import (
     ApprovalCancelled, ApprovalSkipped,
 )
 from core.chameleon_data import read_extracted_data
-from core.runtime_settings import get_send_delay_seconds
+from core.send_delay import get_send_delay_seconds
 from core.xkuss_login import (
     login_xkuss,
     click_home,

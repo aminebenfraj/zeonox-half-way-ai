@@ -19,7 +19,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from core.login import login_mod_site, login_chameleon, chat_not_selected
 from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
 from core.chameleon_data import read_extracted_data
-from core.runtime_settings import get_send_delay_seconds
+from core.send_delay import get_send_delay_seconds
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
 # Cross-process signal: the launcher (start_all.py/launch_all.py) creates/deletes

@@ -14,9 +14,9 @@
     .actions{display:flex;gap:8px;flex-wrap:wrap}a{min-height:42px;padding:10px 14px;border:1px solid var(--border);border-radius:7px;background:var(--card);color:var(--text);text-decoration:none;font-weight:650}a:hover{filter:brightness(1.1)}
     .section{margin-top:16px;padding:20px;border:1px solid var(--border);border-radius:10px;background:var(--card)}.section-head{margin-bottom:15px}.section h2{margin:0 0 4px;font-size:17px}.scope{display:inline-flex;margin-top:8px;padding:3px 8px;border:1px solid rgba(99,102,241,.35);border-radius:999px;background:rgba(99,102,241,.1);color:#c7d2fe;font-size:11px;font-weight:750}
     .options{display:grid;gap:9px}.option{display:grid;grid-template-columns:20px 1fr;gap:11px;padding:14px;border:1px solid var(--border);border-radius:9px;background:#101014;cursor:pointer;transition:border-color .15s,background .15s}.option:hover{border-color:#3f3f46}.option:has(input:checked){border-color:var(--primary);background:rgba(99,102,241,.09)}input{margin:3px 0 0;accent-color:var(--primary)}.option strong{display:block;margin-bottom:2px}.option small{display:block;color:var(--muted);line-height:1.45}.option .warning{color:#fbbf24}
-    .fixed-delay{display:flex;align-items:center;gap:10px;margin:12px 0 0 31px;padding:12px 14px;border:1px solid var(--border);border-radius:9px;background:#101014}.fixed-delay label{color:var(--muted);font-size:13px}.fixed-delay input{width:92px;margin:0;padding:9px 10px;border:1px solid var(--border);border-radius:7px;background:#09090b;color:var(--text);font:inherit}.fixed-delay input:focus{outline:2px solid var(--primary);outline-offset:1px}.fixed-delay input:disabled{opacity:.45}.unit{color:var(--muted);font-size:12px}
+    .delay-fields{display:flex;align-items:center;gap:10px;margin:12px 0 0 31px;padding:12px 14px;border:1px solid var(--border);border-radius:9px;background:#101014}.delay-fields label{color:var(--muted);font-size:13px}.delay-fields input{width:92px;margin:0;padding:9px 10px;border:1px solid var(--border);border-radius:7px;background:#09090b;color:var(--text);font:inherit}.delay-fields input:focus{outline:2px solid var(--primary);outline-offset:1px}.delay-fields input:disabled{opacity:.45}.range-separator,.unit{color:var(--muted);font-size:12px}
     .save-state{min-height:22px;margin-top:16px;color:var(--muted);font-size:12px}.save-state.ok{color:var(--success)}.save-state.bad{color:#f87171}.default-note{margin-top:18px;padding:12px 14px;border:1px solid var(--border);border-radius:9px;color:var(--muted);background:#101014}
-    @media(max-width:680px){html,body{max-width:100%;overflow-x:hidden}body{padding:0}main{min-height:100vh;min-height:100dvh;border:0;border-radius:0;padding:max(20px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) calc(42px + env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left))}.top{flex-direction:column}.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.actions a{display:flex;align-items:center;justify-content:center;min-width:0;min-height:44px;padding:10px 8px;text-align:center}.section{padding:16px 14px}.option{grid-template-columns:24px minmax(0,1fr);padding:14px 12px;min-height:56px;overflow-wrap:anywhere}input{width:20px;height:20px;margin:1px 0 0}.fixed-delay{margin-left:0;flex-wrap:wrap}.fixed-delay input{width:100px;height:44px}.default-note{overflow-wrap:anywhere}}
+    @media(max-width:680px){html,body{max-width:100%;overflow-x:hidden}body{padding:0}main{min-height:100vh;min-height:100dvh;border:0;border-radius:0;padding:max(20px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) calc(42px + env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left))}.top{flex-direction:column}.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.actions a{display:flex;align-items:center;justify-content:center;min-width:0;min-height:44px;padding:10px 8px;text-align:center}.section{padding:16px 14px}.option{grid-template-columns:24px minmax(0,1fr);padding:14px 12px;min-height:56px;overflow-wrap:anywhere}input{width:20px;height:20px;margin:1px 0 0}.delay-fields{margin-left:0;flex-wrap:wrap}.delay-fields input{width:86px;height:44px}.default-note{overflow-wrap:anywhere}}
   </style>
 </head>
 <body>
@@ -63,10 +63,17 @@
   <section class="section">
     <div class="section-head"><h2>Message send timer</h2><p>Choose how long Zenox waits after pasting a reply before pressing Send.</p><span class="scope">All platforms · applies immediately</span></div>
     <div class="options">
-      <label class="option"><input type="radio" name="send_delay_mode" value="random"><span><strong>Random timing — current behavior</strong><small>Wait a random 15–20 seconds so each send does not use exactly the same timing.</small></span></label>
+      <label class="option"><input type="radio" name="send_delay_mode" value="random"><span><strong>Random timing</strong><small>Choose a minimum and maximum. Zenox picks a new value inside that range for every message.</small></span></label>
       <label class="option"><input type="radio" name="send_delay_mode" value="fixed"><span><strong>Fixed timing</strong><small>Always wait the exact number of seconds entered below.</small></span></label>
     </div>
-    <div class="fixed-delay">
+    <div class="delay-fields" id="randomDelayFields">
+      <label for="sendDelayRandomMin">Random range</label>
+      <input id="sendDelayRandomMin" name="send_delay_random_min" type="number" min="0" max="300" step="1" inputmode="numeric" value="15" aria-label="Random minimum seconds" />
+      <span class="range-separator">to</span>
+      <input id="sendDelayRandomMax" name="send_delay_random_max" type="number" min="0" max="300" step="1" inputmode="numeric" value="20" aria-label="Random maximum seconds" />
+      <span class="unit">seconds</span>
+    </div>
+    <div class="delay-fields" id="fixedDelayFields">
       <label for="sendDelaySeconds">Fixed delay</label>
       <input id="sendDelaySeconds" name="send_delay_seconds" type="number" min="0" max="300" step="1" inputmode="numeric" value="15" />
       <span class="unit">seconds (0–300)</span>
@@ -86,8 +93,9 @@ async function loadSettings(){
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const settings=await response.json();
     for(const [name,value] of Object.entries(settings)){
-      if(name==="send_delay_seconds"){
-        document.getElementById("sendDelaySeconds").value=value;
+      if(name==="send_delay_seconds"||name==="send_delay_random_min"||name==="send_delay_random_max"){
+        const numberInput=document.querySelector(`input[name="${name}"]`);
+        if(numberInput)numberInput.value=value;
         continue;
       }
       const input=document.querySelector(`input[name="${name}"][value="${value}"]`);
@@ -100,11 +108,17 @@ async function loadSettings(){
 
 async function saveSetting(input){
   if(!loaded)return;
-  const radios=[...document.querySelectorAll(`input[name="${input.name}"]`)];
-  radios.forEach(item=>item.disabled=true);
+  const isRandomRange=input.name==="send_delay_random_min"||input.name==="send_delay_random_max";
+  const controls=isRandomRange
+    ? [...document.querySelectorAll('input[name="send_delay_random_min"],input[name="send_delay_random_max"]')]
+    : [...document.querySelectorAll(`input[name="${input.name}"]`)];
+  const payload=isRandomRange
+    ? {send_delay_random_min:document.getElementById("sendDelayRandomMin").value,send_delay_random_max:document.getElementById("sendDelayRandomMax").value}
+    : {[input.name]:input.value};
+  controls.forEach(item=>item.disabled=true);
   saveState.className="save-state";saveState.textContent="Saving…";
   try{
-    const response=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({[input.name]:input.value})});
+    const response=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
     const result=await response.json().catch(()=>({}));
     if(!response.ok||!result.ok)throw new Error(result.error||`HTTP ${response.status}`);
     saveState.className="save-state ok";
@@ -117,18 +131,21 @@ async function saveSetting(input){
           ? "The launcher has no switchable CMD window; it will use this mode after the next full system start."
           : "The launcher is not running; it will use this mode when it starts.";
       saveState.textContent=`Saved: ${mode}. ${consoleState} Stop, then Start a running platform to recreate its Chrome in this mode.`;
-    }else if(input.name==="send_delay_mode"||input.name==="send_delay_seconds"){
+    }else if(input.name.startsWith("send_delay_")){
       saveState.textContent="Saved. The next message send will use this timer.";
     }else{
       saveState.textContent="Saved. New conversations will use this setting immediately.";
     }
   }catch(error){saveState.className="save-state bad";saveState.textContent=`Could not save: ${error.message}`;await loadSettings();}
-  finally{radios.forEach(item=>item.disabled=false);}
+  finally{controls.forEach(item=>item.disabled=false);syncDelayControl();}
 }
 
 function syncDelayControl(){
   const fixed=document.querySelector('input[name="send_delay_mode"][value="fixed"]').checked;
+  const random=!fixed;
   document.getElementById("sendDelaySeconds").disabled=!fixed;
+  document.getElementById("sendDelayRandomMin").disabled=!random;
+  document.getElementById("sendDelayRandomMax").disabled=!random;
 }
 
 document.querySelectorAll("input[type=radio]").forEach(input=>input.addEventListener("change",()=>{
@@ -136,6 +153,8 @@ document.querySelectorAll("input[type=radio]").forEach(input=>input.addEventList
   saveSetting(input);
 }));
 document.getElementById("sendDelaySeconds").addEventListener("change",event=>saveSetting(event.target));
+document.getElementById("sendDelayRandomMin").addEventListener("change",event=>saveSetting(event.target));
+document.getElementById("sendDelayRandomMax").addEventListener("change",event=>saveSetting(event.target));
 loadSettings();
 </script>
 </body>

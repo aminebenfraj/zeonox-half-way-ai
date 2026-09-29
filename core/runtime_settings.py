@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import threading
 from pathlib import Path
 
@@ -29,6 +28,8 @@ DEFAULT_SETTINGS = {
     # Current behaviour: wait a human-like random 15–20 seconds after paste.
     "send_delay_mode": "random",
     "send_delay_seconds": 15,
+    "send_delay_random_min": 15,
+    "send_delay_random_max": 20,
 }
 
 SETTING_OPTIONS = {
@@ -54,14 +55,19 @@ def _validated(raw: object) -> dict[str, object]:
         value = raw.get(key)
         if value in allowed:
             result[key] = value
-    fixed_seconds = raw.get("send_delay_seconds")
-    if not isinstance(fixed_seconds, bool):
+    for key in ("send_delay_seconds", "send_delay_random_min", "send_delay_random_max"):
+        number = raw.get(key)
+        if isinstance(number, bool):
+            continue
         try:
-            fixed_seconds = int(fixed_seconds)
+            number = int(number)
         except (TypeError, ValueError):
-            fixed_seconds = None
-        if fixed_seconds is not None and 0 <= fixed_seconds <= 300:
-            result["send_delay_seconds"] = fixed_seconds
+            continue
+        if 0 <= number <= 300:
+            result[key] = number
+    if result["send_delay_random_min"] > result["send_delay_random_max"]:
+        result["send_delay_random_min"] = DEFAULT_SETTINGS["send_delay_random_min"]
+        result["send_delay_random_max"] = DEFAULT_SETTINGS["send_delay_random_max"]
     return result
 
 
@@ -73,17 +79,22 @@ def get_runtime_settings() -> dict[str, object]:
 
 
 def update_runtime_settings(changes: dict) -> dict[str, object]:
-    unknown = set(changes) - (set(SETTING_OPTIONS) | {"send_delay_seconds"})
+    number_keys = {
+        "send_delay_seconds",
+        "send_delay_random_min",
+        "send_delay_random_max",
+    }
+    unknown = set(changes) - (set(SETTING_OPTIONS) | number_keys)
     if unknown:
         raise ValueError(f"Unknown setting: {sorted(unknown)[0]}")
     for key, value in changes.items():
-        if key == "send_delay_seconds":
+        if key in number_keys:
             try:
                 value = int(value)
             except (TypeError, ValueError) as error:
-                raise ValueError("Send delay must be a whole number of seconds") from error
+                raise ValueError("Send delays must be whole numbers of seconds") from error
             if isinstance(changes[key], bool) or not 0 <= value <= 300:
-                raise ValueError("Send delay must be between 0 and 300 seconds")
+                raise ValueError("Send delays must be between 0 and 300 seconds")
             changes[key] = value
         elif value not in SETTING_OPTIONS[key]:
             raise ValueError(f"Invalid value for {key}")
@@ -91,6 +102,8 @@ def update_runtime_settings(changes: dict) -> dict[str, object]:
     with _write_lock:
         current = get_runtime_settings()
         current.update(changes)
+        if current["send_delay_random_min"] > current["send_delay_random_max"]:
+            raise ValueError("Random minimum delay cannot be greater than the maximum")
         temporary = SETTINGS_PATH.with_suffix(".tmp")
         temporary.write_text(
             json.dumps(current, indent=2, sort_keys=True) + "\n",
@@ -101,8 +114,7 @@ def update_runtime_settings(changes: dict) -> dict[str, object]:
 
 
 def get_send_delay_seconds() -> int:
-    """Resolve the live send delay; bot processes do not need a restart."""
-    settings = get_runtime_settings()
-    if settings["send_delay_mode"] == "fixed":
-        return int(settings["send_delay_seconds"])
-    return random.randint(15, 20)
+    """Compatibility export; bot modules use ``core.send_delay`` directly."""
+    from core.send_delay import get_send_delay_seconds as resolve
+
+    return resolve()
