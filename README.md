@@ -28,6 +28,11 @@ Gold2, Gold3, Diamond, Platin, S69, ML, Xkuss, Justlo, Linduu, and Gnoxx all
 use the same lifecycle controls. If only the dashboard is running, starting
 any platform also starts the central launcher automatically.
 
+Each bot card also has a **Login credentials** dropdown. Saving updates that
+platform's username and password in the ignored `.env` file without returning
+the saved password to the browser. Stop and start a running bot to apply newly
+saved credentials.
+
 The dashboard is the control center: Pause/Resume All and the Chameleon Fix,
 Check, and Extractor actions keep working even if the launcher's local control
 port is temporarily unavailable. Bots started from `/bots` use the central
@@ -42,8 +47,9 @@ each configured provider.
 Open `/settings` (or choose **Settings** in the sidebar) for policies shared
 by every platform. Manual mode can show or skip Judge analysis while still
 requiring human approval. Automatic mode can use the current 10/10 + manual
-fallback, reject lower Judge scores so the bot regenerates, or send directly
-without Judge. Justlo, Linduu, and Gnoxx can either transfer/skip Chameleon
+fallback, run the Judge while requiring manual approval for every score, reject
+lower Judge scores so the bot regenerates, or send directly without Judge.
+Justlo, Linduu, and Gnoxx can either transfer/skip Chameleon
 First Contact conversations or answer them through the normal workflow.
 Runtime visibility can keep the current CMD/Chrome windows or launch future
 bot processes with hidden consoles and headless Chrome. Existing Chrome
@@ -135,10 +141,9 @@ by Git. `.env.example` documents every required variable without secrets.
 | `VAPID_PUBLIC_KEY` | Public application-server key used by the phone | generated locally |
 | `VAPID_SUBJECT` | Contact identity included in push signatures | `mailto:` address |
 | `PUSH_SUBSCRIPTIONS_FILE` | Local saved phone subscriptions | `.push_subscriptions.json` |
-| `OPENROUTER_API_KEY` | Judge primary provider | blank |
-| `NVIDIA_API_KEY` | Judge fallback 1 | blank |
-| `GEMINI_API_KEY` | Judge fallback 2 | blank |
-| `BAI_API_KEY` | Judge fallback 3 | blank |
+| `GROQ_API_KEY` | Translation and meeting checks | blank |
+| `MISTRAL_API_KEY` | Judge provider | blank |
+| `MISTRAL_MODEL` | Judge model | `mistral-large-latest` |
 
 Keep `HOST`, `APPROVAL_SERVER_URL`, and `LAUNCHER_CONTROL_URL` local. The phone
 uses only `TAILSCALE_DASHBOARD_URL`.
@@ -158,10 +163,9 @@ edited before approval.
 
 If the dashboard is unavailable, bots wait instead of sending without review.
 
-The Judge tries OpenRouter, NVIDIA, Gemini, then B.AI. Network, authentication,
-rate-limit, malformed-response, and model errors move to the next provider.
-If all four fail, the reply stays available for manual review instead of being
-sent automatically.
+The Judge uses Mistral. If its request fails because of a network,
+authentication, rate-limit, malformed-response, or model error, the reply stays
+available for manual review instead of being sent automatically.
 
 Dashboard state is delivered over WebSocket while the connection is healthy.
 HTTP polling runs only as a fallback, and slow launcher-status checks run in

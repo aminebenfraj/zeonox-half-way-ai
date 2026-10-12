@@ -23,6 +23,7 @@ import io
 import asyncio
 import contextlib
 import logging
+import os
 import subprocess
 import time
 import threading
@@ -32,10 +33,11 @@ from pathlib import Path
 # Force UTF-8 stdout so bot output with non-ASCII chars (German etc.) prints correctly
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-from importlib import import_module
+from importlib import import_module, reload
 
 from flask import Flask, jsonify, request
 from playwright.async_api import async_playwright
+from dotenv import dotenv_values
 from core.bot import pause_flag_path
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp, ensure_approval_server, CONTROL_SERVER_PORT
 from core.login import login_mod_site, login_chameleon, check_chameleon, force_extractor_tab, check_stats
@@ -53,6 +55,20 @@ from core.process_visibility import (
 )
 
 BASE_DIR = Path(__file__).parent
+
+
+def _refresh_env_from_file() -> None:
+    """Refresh values that may have been edited from the Bots page."""
+    for key, value in dotenv_values(BASE_DIR / ".env").items():
+        if value is not None:
+            os.environ[key] = value
+
+
+def _platform_config(name: str):
+    _refresh_env_from_file()
+    module_name = f"configs.{name}"
+    module = reload(sys.modules[module_name]) if module_name in sys.modules else import_module(module_name)
+    return module.config
 
 # React platforms need Chrome started + mod-site/chameleon login done for them
 # (Phases 1–2 below). The self-managed ones bring up their own Chrome and log
@@ -171,7 +187,7 @@ def _port(cfg) -> int:
 def start_chrome_instances() -> dict:
     procs = {}
     for name in PLATFORMS:
-        cfg  = import_module(f"configs.{name}").config
+        cfg  = _platform_config(name)
         port = _port(cfg)
         if is_cdp_ready(port):
             print(f"[Launcher] {name.upper()}: Chrome already running on port {port}.")
@@ -186,7 +202,7 @@ def wait_all_cdp():
     print()
     failed = []
     for name in PLATFORMS:
-        cfg  = import_module(f"configs.{name}").config
+        cfg  = _platform_config(name)
         port = _port(cfg)
         if wait_for_cdp(port, timeout=30):
             print(f"[Launcher] {name.upper()}: Chrome ready on port {port}.")
@@ -232,7 +248,7 @@ async def setup_all_browsers():
 
     async with async_playwright() as p:
         tasks = [
-            _setup_platform(p, name, import_module(f"configs.{name}").config)
+            _setup_platform(p, name, _platform_config(name))
             for name in react
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -255,7 +271,7 @@ def _stream_output(platform: str, proc: subprocess.Popen):
 
 
 def _launch_bot(platform: str) -> subprocess.Popen:
-    import os
+    _refresh_env_from_file()
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen(
         [sys.executable, "-u", "run_bot.py", platform],
@@ -358,7 +374,7 @@ def run_bots():
 
     def _prepare_platform(name):
         """Bring up Chrome/login for a platform that was not in the initial set."""
-        cfg = import_module(f"configs.{name}").config
+        cfg = _platform_config(name)
         port = _port(cfg)
         if not is_cdp_ready(port):
             profile = str(BASE_DIR / "profiles" / name)
@@ -420,7 +436,7 @@ def run_bots():
         async def _check_all(names):
             async with async_playwright() as p:
                 for name in names:
-                    cfg = import_module(f"configs.{name}").config
+                    cfg = _platform_config(name)
                     try:
                         browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
                         context = browser.contexts[0]
@@ -441,7 +457,7 @@ def run_bots():
         async def _force_extractor(names):
             async with async_playwright() as p:
                 for name in names:
-                    cfg = import_module(f"configs.{name}").config
+                    cfg = _platform_config(name)
                     try:
                         browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
                         context = browser.contexts[0]
@@ -461,7 +477,7 @@ def run_bots():
         async def _fix_chameleon(names):
             async with async_playwright() as p:
                 for name in names:
-                    cfg = import_module(f"configs.{name}").config
+                    cfg = _platform_config(name)
                     try:
                         browser = await p.chromium.connect_over_cdp(cfg.cdp_url)
                         context = browser.contexts[0]
@@ -502,7 +518,7 @@ def run_bots():
             rows = []
             async with async_playwright() as p:
                 for name in names:
-                    cfg   = import_module(f"configs.{name}").config
+                    cfg   = _platform_config(name)
                     label = cfg.platform
                     try:
                         browser = await p.chromium.connect_over_cdp(cfg.cdp_url)

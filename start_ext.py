@@ -30,6 +30,10 @@ import subprocess
 import time
 import threading
 import queue
+import os
+from pathlib import Path
+
+from dotenv import dotenv_values
 
 from core.process_visibility import apply_current_console_visibility, process_window_kwargs
 
@@ -38,6 +42,7 @@ if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 ALL_PLATFORMS = ["justlo", "linduu"]
+BASE_DIR = Path(__file__).parent
 
 
 def _resolve_platforms(args):
@@ -88,8 +93,11 @@ def _stream_output(platform, proc):
 
 
 def _launch(platform):
-    import os
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, **{
+        key: value
+        for key, value in dotenv_values(BASE_DIR / ".env").items()
+        if value is not None
+    }, "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.Popen(
         [sys.executable, "-u", "run_bot.py", platform],
         stdout=subprocess.PIPE,

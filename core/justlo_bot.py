@@ -110,6 +110,21 @@ _SEL_EXTRACT_BTN   = "button:has-text('Daten extrahieren')"
 _SEL_GEN_BTN       = "button:has-text('Antwort generieren')"
 _SEL_INSTRUCTIONS  = "textarea[placeholder*='Etwas flirtender'], textarea[placeholder*='Thema XYZ']"
 _SEL_COMBOBOX      = "button[role='combobox']"
+_GET_CHAMELEON_REPLY_TYPE_JS = r"""() => {
+  const ownText = (el) => Array.from(el.childNodes)
+    .filter((node) => node.nodeType === Node.TEXT_NODE)
+    .map((node) => node.textContent || '')
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const label = Array.from(document.querySelectorAll('div, span, p'))
+    .find((el) => /^Erkannt\s*:?$/i.test(ownText(el)));
+  if (!label) return '';
+  const detected = (label.textContent || '').replace(/\s+/g, ' ').trim();
+  if (/\bASA\b/i.test(detected)) return 'ASA Follow-up';
+  if (/\bDIA\b/i.test(detected)) return 'DIA';
+  return '';
+}"""
 
 # Transfer ('Übergeben') popup — opened from tab1's toolbar on a First Contact so
 # the dialog gets handed to another moderator instead of stalling the console.
@@ -121,6 +136,7 @@ _SEL_COMBOBOX      = "button[role='combobox']"
 _SEL_TRANSFER_POPUP = ".x-window:has(#user-select-grid)"
 _SEL_TRANSFER_ROWS  = "#user-select-grid .x-grid-row"
 _SEL_SKIP_CONFIRM   = ".x-window:visible:has-text('Überspringen'):has-text('Sind Sie sicher?')"
+_SEL_FAILURE_POPUP  = "div.x-message-box:visible"
 _GET_TRANSFER_NAMES_JS = """() => {
   const rows = document.querySelectorAll('#user-select-grid .x-grid-row');
   return Array.from(rows).map((row) => {
@@ -231,6 +247,7 @@ class JustloBot:
 
     async def _detect_phase(self, tab1, *, force_log: bool = False) -> str:
         """Classify tab1's phase and log it whenever it changes."""
+        await self._dismiss_failure_popup(tab1)
         state, url, title = await describe_page(tab1, self.cfg)
         if force_log or state != self._last_phase:
             label = _PHASE_LABELS.get(state, state)
@@ -778,6 +795,44 @@ class JustloBot:
                 raise
             return False
 
+    async def _dismiss_failure_popup(self, tab1, *, timeout: int = 0) -> bool:
+        """Dismiss the moderation console's blocking ``Failure`` message box.
+
+        The console can raise this after a rejected send (most commonly its
+        minimum-10-character validation).  Leaving the ExtJS message box open
+        blocks every subsequent click, so detect it independently of generated
+        component ids, press its exact OK control, and verify that it closed.
+        """
+        dialog = tab1.locator(_SEL_FAILURE_POPUP).last
+        try:
+            if timeout:
+                await dialog.wait_for(state="visible", timeout=timeout)
+            elif await dialog.count() == 0:
+                return False
+
+            text = (await dialog.inner_text()).strip()
+            if not (
+                re.search(r"\bFailure\b", text, re.IGNORECASE)
+                or "mindestens 10 Zeichen" in text
+            ):
+                return False
+
+            ok_inner = dialog.locator('span.x-btn-inner:text-is("OK")').last
+            await ok_inner.wait_for(state="visible", timeout=3_000)
+            ok_button = ok_inner.locator('xpath=ancestor::a[@role="button"][1]')
+            await ok_button.click(force=True, timeout=3_000)
+            await dialog.wait_for(state="hidden", timeout=3_000)
+            self.log("[RECOVERY] Failure popup detected and dismissed with OK.")
+            return True
+        except PlaywrightTimeout:
+            # A zero/short timeout is also used as a cheap popup probe.
+            return False
+        except PlaywrightError as e:
+            if _is_fatal(e):
+                raise
+            self.log(f"[WARN] Could not dismiss the Failure popup: {e}")
+            return False
+
     async def _is_asa_nudge(self, tab1) -> bool:
         """True when the queue task is an ASA 2 / ASA 3 follow-up.
 
@@ -797,11 +852,7 @@ class JustloBot:
         return bool(_ASA_NUDGE_RE.search(txt or ""))
 
     async def _queue_task_type(self, tab1) -> str:
-        """Classifies the current queue task as 'DIA' (a regular dialog) or
-        'ASA Follow-up' for display on the approval dashboard. ASA 2/3 never
-        reach this (they're nudged, see _is_asa_nudge) and FASA never does
-        either (handed over before a reply is generated), so only ASA 1 and
-        plain dialogs are actually seen here."""
+        """Fallback classification from the platform queue label."""
         try:
             txt = await tab1.evaluate(
                 "(s) => { const el = document.querySelector(s);"
@@ -813,6 +864,20 @@ class JustloBot:
                 raise
             txt = ""
         return "ASA Follow-up" if _ASA_ANY_RE.search(txt or "") else "DIA"
+
+    async def _chameleon_reply_type(self, tab2) -> str:
+        """Read Chameleon's authoritative Erkannt message-type badge."""
+        try:
+            reply_type = await self._safe_evaluate(tab2, _GET_CHAMELEON_REPLY_TYPE_JS)
+        except PlaywrightError as e:
+            if _is_fatal(e):
+                raise
+            self.log(f"[WARN] Could not read Chameleon message type: {e}")
+            return ""
+        if reply_type in {"ASA Follow-up", "DIA"}:
+            self.log(f"Chameleon detected message type: {reply_type}")
+            return reply_type
+        return ""
 
     async def _click_anstupsen(self, tab1):
         """Press 'Anstupsen' to nudge the client (used for ASA 2 / ASA 3)."""
@@ -945,22 +1010,37 @@ class JustloBot:
         try:
             send_btn = tab1.locator(self.cfg.sel_send_btn)
             await send_btn.scroll_into_view_if_needed()
-            await send_btn.click()
-            await asyncio.sleep(2)
-
-            # Confirm the send registered; if the box still holds the text, re-nudge
-            # and click once more before giving up.
-            if not await self._message_box_empty(tab1):
-                self.log("[WARN] Message box not cleared after send — re-nudging and retrying once...")
-                await self._nudge_message_box(tab1)
-                await asyncio.sleep(1)
+            for attempt in range(2):
                 await send_btn.click()
                 await asyncio.sleep(2)
-                if not await self._message_box_empty(tab1):
+
+                # A validation failure is modal. Clear it first, restore the
+                # approved text (the console may have blanked the field), then
+                # retry once so the bot continues the interrupted send itself.
+                rejected = await self._dismiss_failure_popup(tab1, timeout=750)
+                if rejected:
+                    if attempt == 1 or len(reply.strip()) < 10:
+                        raise RuntimeError(
+                            "The moderation console rejected the reply with its "
+                            "minimum-10-character validation."
+                        )
+                    self.log("[RECOVERY] Re-pasting the approved reply and retrying send...")
+                    await textarea.fill(reply)
+                    await self._nudge_message_box(tab1)
+                    await asyncio.sleep(1)
+                    continue
+
+                if await self._message_box_empty(tab1):
+                    break
+                if attempt == 1:
                     raise RuntimeError(
                         "Send did not register (message box still holds the reply) — "
                         "the 'Abschicken' button may be disabled by a character counter."
                     )
+
+                self.log("[WARN] Message box not cleared after send — re-nudging and retrying once...")
+                await self._nudge_message_box(tab1)
+                await asyncio.sleep(1)
         except Exception as e:
             await mark_failed(approval_id, str(e))
             raise
@@ -1042,6 +1122,9 @@ class JustloBot:
 
             # ── Set up both tabs: login to justlo + chameleon ──────────────
             tab1 = await self._find_or_open_tab(context, self.cfg.tab1_pattern)
+            # A popup left behind by an interrupted worker otherwise prevents
+            # login/navigation from receiving clicks on startup.
+            await self._dismiss_failure_popup(tab1)
             self.log("Logging in to justlo and opening the console (Play)...")
             await login_justlo(tab1, self.cfg, self.cfg.platform)
 
@@ -1160,7 +1243,11 @@ class JustloBot:
                                  "to answer it as a normal conversation.")
 
                     try:
-                        reply_type = await self._queue_task_type(tab1)
+                        reply_type = await self._chameleon_reply_type(tab2)
+                        if not reply_type:
+                            self.log("[WARN] Chameleon message type missing — "
+                                     "falling back to the platform queue label.")
+                            reply_type = await self._queue_task_type(tab1)
                         reply, approval_id = await self._get_approved_reply(
                             tab1, tab2, reply_type,
                             extracted["last_message"], extracted["last_customer_message"],

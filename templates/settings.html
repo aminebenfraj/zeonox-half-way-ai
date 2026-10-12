@@ -30,7 +30,8 @@
     <div class="section-head"><h2>Automatic-mode decision policy</h2><p>This affects every platform that is currently set to Automatic mode.</p><span class="scope">All platform chats</span></div>
     <div class="options" id="autoOptions">
       <label class="option"><input type="radio" name="auto_mode_policy" value="judge_manual_fallback"><span><strong>Judge + manual fallback — current behavior</strong><small>A 10/10 reply sends automatically. A lower score or unavailable Judge waits in Approval Queue.</small></span></label>
-      <label class="option"><input type="radio" name="auto_mode_policy" value="judge_regenerate"><span><strong>Judge decides and regenerates</strong><small>A 10/10 reply sends automatically. A lower score is rejected automatically so the bot generates another reply. If every Judge provider fails, it safely waits for manual approval.</small></span></label>
+      <label class="option"><input type="radio" name="auto_mode_policy" value="judge_always_manual"><span><strong>Judge + always manual approval</strong><small>Mistral scores and analyzes every reply, but never sends or rejects it automatically. You must approve every reply in Approval Queue, even when it scores 10/10.</small></span></label>
+      <label class="option"><input type="radio" name="auto_mode_policy" value="judge_regenerate"><span><strong>Judge decides and regenerates</strong><small>A 10/10 reply sends automatically. A lower score is rejected automatically so the bot generates another reply. If the Mistral Judge fails, it safely waits for manual approval.</small></span></label>
       <label class="option"><input type="radio" name="auto_mode_policy" value="direct"><span><strong>Send directly without Judge</strong><small class="warning">The generated reply sends immediately after the existing meeting and banned-language safety checks. It does not wait for a Judge score or human approval.</small></span></label>
     </div>
   </section>

@@ -35,6 +35,7 @@ DEFAULT_SETTINGS = {
 SETTING_OPTIONS = {
     "auto_mode_policy": {
         "judge_manual_fallback",
+        "judge_always_manual",
         "judge_regenerate",
         "direct",
     },

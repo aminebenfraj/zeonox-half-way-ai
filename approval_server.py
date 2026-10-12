@@ -56,9 +56,9 @@ except ImportError:
 
 import httpx
 from flask import Flask, jsonify, render_template, request, Response
-from dotenv import set_key
+from dotenv import dotenv_values, set_key
 
-from core.ai_providers import gemini_generate, openai_chat_completion
+from core.ai_providers import openai_chat_completion
 from core.launcher import is_cdp_ready
 from core.bot_lifecycle import LauncherClient
 from core.bot import pause_flag_path
@@ -126,6 +126,8 @@ _FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"]
 # _control_get()/_control_post() below).
 LAUNCHER_CONTROL_URL = os.environ.get("LAUNCHER_CONTROL_URL", "http://127.0.0.1:8800")
 _BASE_DIR = Path(__file__).resolve().parent
+_ENV_PATH = _BASE_DIR / ".env"
+_env_write_lock = threading.Lock()
 _launcher_client = LauncherClient(LAUNCHER_CONTROL_URL, _BASE_DIR)
 
 app = Flask(__name__)
@@ -210,6 +212,13 @@ SKIPPABLE_APPROVAL_PLATFORMS = frozenset(SELF_MANAGED_PLATFORMS)
 # above for the same reasoning). React platforms (Gold/Diamond/...) still
 # only start via launch_all.py / Bot Controls, unchanged.
 _SELF_MANAGED_CDP_PORTS = {"xkuss": 9227, "justlo": 9229, "linduu": 9230, "gnoxx": 9231}
+_PLATFORM_CREDENTIAL_ENV = {
+    platform.slug: (
+        f"{platform.slug.upper()}_USERNAME",
+        f"{platform.slug.upper()}_PASSWORD",
+    )
+    for platform in PLATFORMS
+}
 _bot_procs: dict[str, subprocess.Popen] = {}
 
 
@@ -389,6 +398,96 @@ def bots_status():
     return jsonify(_all_bot_statuses())
 
 
+def _credential_values(platform: str) -> tuple[str, str]:
+    username_env, password_env = _PLATFORM_CREDENTIAL_ENV[platform]
+    file_values = dotenv_values(_ENV_PATH)
+    username = file_values.get(username_env)
+    password = file_values.get(password_env)
+    if username is None:
+        username = os.environ.get(username_env, "")
+    if password is None:
+        password = os.environ.get(password_env, "")
+    return str(username or ""), str(password or "")
+
+
+def _credential_response(platform: str):
+    username, password = _credential_values(platform)
+    response = jsonify({
+        "ok": True,
+        "platform": platform,
+        "username": username,
+        "password_configured": bool(password),
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/api/bots/<platform>/credentials")
+def bot_credentials(platform):
+    platform = platform.strip().lower()
+    if platform not in _PLATFORM_CREDENTIAL_ENV:
+        return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
+    return _credential_response(platform)
+
+
+@app.post("/api/bots/<platform>/credentials")
+def update_bot_credentials(platform):
+    platform = platform.strip().lower()
+    env_names = _PLATFORM_CREDENTIAL_ENV.get(platform)
+    if env_names is None:
+        return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
+
+    body = request.get_json(force=True, silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "request body must be a JSON object"}), 400
+    username = body.get("username")
+    password = body.get("password", "")
+    if not isinstance(username, str) or not isinstance(password, str):
+        return jsonify({"ok": False, "error": "username and password must be text"}), 400
+    username = username.strip()
+    if not username:
+        return jsonify({"ok": False, "error": "username is required"}), 400
+    if any(char in username for char in "\r\n\0") or len(username) > 256:
+        return jsonify({"ok": False, "error": "invalid username format"}), 400
+    if any(char in password for char in "\r\n\0") or len(password) > 2048:
+        return jsonify({"ok": False, "error": "invalid password format"}), 400
+    if password and (
+        password != password.strip()
+        or re.search(r"\s+#", password)
+    ):
+        return jsonify({
+            "ok": False,
+            "error": "password cannot start/end with whitespace or contain whitespace followed by #",
+        }), 400
+
+    username_env, password_env = env_names
+    with _env_write_lock:
+        _, current_password = _credential_values(platform)
+        if not password and not current_password:
+            return jsonify({"ok": False, "error": "password is required"}), 400
+        try:
+            set_key(str(_ENV_PATH), username_env, username, quote_mode="never")
+            if password:
+                set_key(str(_ENV_PATH), password_env, password, quote_mode="never")
+        except Exception as error:
+            return jsonify({"ok": False, "error": f"Could not update .env: {error}"}), 500
+
+        os.environ[username_env] = username
+        if password:
+            os.environ[password_env] = password
+
+    username, saved_password = _credential_values(platform)
+    response = jsonify({
+        "ok": True,
+        "platform": platform,
+        "username": username,
+        "password_configured": bool(saved_password),
+        "running": bool(_all_bot_statuses()[platform].get("running")),
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _all_bot_statuses() -> dict[str, dict]:
     """Return one lifecycle shape for every platform, regardless of owner."""
     control = _control_status_cached()
@@ -525,27 +624,17 @@ def _cancel_pending_for_platform(platform: str, detail: str) -> None:
     _bump_state()
 
 
-# Translation calls use the configured Groq account first and OpenRouter as a
-# provider-level fallback. Keep them on a bounded worker thread so an upstream
-# outage never stalls a bot cycle indefinitely.
+# Translation calls use the configured Groq account. Keep them on a bounded
+# worker thread so an upstream outage never stalls a bot cycle indefinitely.
 _translate_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="translate")
 _judge_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="judge")
 
 GROQ_TRANSLATION_MODEL = os.environ.get("GROQ_TRANSLATION_MODEL", "openai/gpt-oss-120b")
-OPENROUTER_TRANSLATION_MODEL = os.environ.get("OPENROUTER_TRANSLATION_MODEL", "openai/gpt-4o")
-OPENROUTER_JUDGE_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "cognitivecomputations/dolphin-mistral-24b-venice-edition"
-)
-NVIDIA_JUDGE_MODEL = os.environ.get("NVIDIA_MODEL", "deepseek-ai/deepseek-v4.1-flash")
-GEMINI_JUDGE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-BAI_JUDGE_MODEL = os.environ.get("BAI_MODEL", "gpt-6-luna")
+MISTRAL_JUDGE_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-large-latest")
 
 API_PROVIDER_SPECS = (
     ("groq", "Groq", "GROQ_API_KEY", GROQ_TRANSLATION_MODEL, "Translation and meeting checks"),
-    ("openrouter", "OpenRouter", "OPENROUTER_API_KEY", OPENROUTER_JUDGE_MODEL, "Judge primary"),
-    ("nvidia", "NVIDIA", "NVIDIA_API_KEY", NVIDIA_JUDGE_MODEL, "Judge fallback 1"),
-    ("gemini", "Gemini", "GEMINI_API_KEY", GEMINI_JUDGE_MODEL, "Judge fallback 2"),
-    ("bai", "B.AI", "BAI_API_KEY", BAI_JUDGE_MODEL, "Judge fallback 3"),
+    ("mistral", "Mistral", "MISTRAL_API_KEY", MISTRAL_JUDGE_MODEL, "Judge"),
 )
 API_PROVIDER_BY_NAME = {item[0]: item for item in API_PROVIDER_SPECS}
 _TRANSLATION_SYSTEM_PROMPT = (
@@ -560,10 +649,7 @@ _TRANSLATION_SYSTEM_PROMPT = (
 _api_health_lock = threading.Lock()
 _api_health: dict[str, dict] = {
     "groq": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
-    "openrouter": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
-    "nvidia": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
-    "gemini": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
-    "bai": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
+    "mistral": {"state": "unchecked", "checked_at": None, "cooldown_until": None, "detail": ""},
 }
 
 
@@ -701,48 +787,9 @@ def _translate_with_groq(text: str) -> str | None:
     return (response.choices[0].message.content or "").strip() or None
 
 
-def _translate_with_openrouter(text: str) -> str | None:
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
-        "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
-    }
-    try:
-        response = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": OPENROUTER_TRANSLATION_MODEL,
-                "messages": _translation_messages(text),
-                "temperature": 0,
-                "max_tokens": 1200,
-            },
-            timeout=12.0,
-        )
-        response.raise_for_status()
-    except Exception as error:
-        _record_api_failure("openrouter", error)
-        raise
-    _record_api_success("openrouter", "Translation request succeeded")
-    data = response.json()
-    return (data["choices"][0]["message"]["content"] or "").strip() or None
-
-
 def _translate_de_en_sync(text: str) -> str | None:
     try:
-        translated = _translate_with_groq(text)
-        if translated:
-            return translated
-    except Exception:
-        pass
-
-    try:
-        return _translate_with_openrouter(text)
+        return _translate_with_groq(text)
     except Exception:
         return None
 
@@ -939,84 +986,23 @@ def _probe_groq_key() -> None:
     _record_api_success("groq", "Key check succeeded")
 
 
-def _probe_openrouter_key() -> None:
-    api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+def _probe_mistral_key() -> None:
+    api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
     if not api_key:
         return
     try:
         openai_chat_completion(
-            url="https://openrouter.ai/api/v1/chat/completions",
+            url="https://api.mistral.ai/v1/chat/completions",
             api_key=api_key,
-            model=OPENROUTER_JUDGE_MODEL,
+            model=MISTRAL_JUDGE_MODEL,
             messages=[{"role": "user", "content": "Reply only with OK."}],
             max_tokens=8,
             timeout=12.0,
-            extra_headers={
-                "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
-                "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
-            },
         )
     except Exception as error:
-        _record_api_failure("openrouter", error)
+        _record_api_failure("mistral", error)
         return
-    _record_api_success("openrouter", "Key check succeeded")
-
-
-def _probe_nvidia_key() -> None:
-    api_key = (os.environ.get("NVIDIA_API_KEY") or "").strip()
-    if not api_key:
-        return
-    try:
-        openai_chat_completion(
-            url="https://integrate.api.nvidia.com/v1/chat/completions",
-            api_key=api_key,
-            model=NVIDIA_JUDGE_MODEL,
-            messages=[{"role": "user", "content": "Reply only with OK."}],
-            max_tokens=8,
-            timeout=15.0,
-        )
-    except Exception as error:
-        _record_api_failure("nvidia", error)
-        return
-    _record_api_success("nvidia", "Key check succeeded")
-
-
-def _probe_gemini_key() -> None:
-    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        return
-    try:
-        gemini_generate(
-            api_key=api_key,
-            model=GEMINI_JUDGE_MODEL,
-            system_prompt="Return a small JSON object.",
-            user_prompt='Return exactly {"status":"OK"}.',
-            max_tokens=20,
-            timeout=15.0,
-        )
-    except Exception as error:
-        _record_api_failure("gemini", error)
-        return
-    _record_api_success("gemini", "Key check succeeded")
-
-
-def _probe_bai_key() -> None:
-    api_key = (os.environ.get("BAI_API_KEY") or "").strip()
-    if not api_key:
-        return
-    try:
-        openai_chat_completion(
-            url="https://api.b.ai/v1/chat/completions",
-            api_key=api_key,
-            model=BAI_JUDGE_MODEL,
-            messages=[{"role": "user", "content": "Reply only with OK."}],
-            max_tokens=8,
-            timeout=15.0,
-        )
-    except Exception as error:
-        _record_api_failure("bai", error)
-        return
-    _record_api_success("bai", "Key check succeeded")
+    _record_api_success("mistral", "Key check succeeded")
 
 
 @app.get("/api/ai-keys/status")
@@ -1037,7 +1023,8 @@ def update_ai_key(provider):
 
     env_name = spec[2]
     try:
-        set_key(str(_BASE_DIR / ".env"), env_name, value, quote_mode="always")
+        with _env_write_lock:
+            set_key(str(_ENV_PATH), env_name, value, quote_mode="always")
     except Exception as error:
         return jsonify({"ok": False, "error": f"Could not update .env: {error}"}), 500
     if value:
@@ -1060,13 +1047,10 @@ def update_ai_key(provider):
 def check_ai_keys():
     # Run both small probes concurrently so one slow provider cannot hold up the
     # other's result. This is only triggered by the dashboard button.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
             pool.submit(_probe_groq_key),
-            pool.submit(_probe_openrouter_key),
-            pool.submit(_probe_nvidia_key),
-            pool.submit(_probe_gemini_key),
-            pool.submit(_probe_bai_key),
+            pool.submit(_probe_mistral_key),
         ]
         for future in futures:
             try:
@@ -1076,74 +1060,28 @@ def check_ai_keys():
     return jsonify({"ok": True, "providers": _api_health_snapshot()})
 
 
-# ── Judge provider chain ─────────────────────────────────────────────────────
-# The Judge fails over in order: OpenRouter -> NVIDIA -> Gemini -> B.AI. A provider is
-# considered failed on network/auth/rate errors or malformed Judge JSON. Only
-# when every provider fails does Auto mode fall back to manual review.
+# ── Judge provider ───────────────────────────────────────────────────────────
+# Mistral is the sole Judge. If its request fails, Auto mode falls back to
+# manual review.
 
 
 def _judge_provider_response(provider: str, payload: dict) -> str:
     user_prompt = json.dumps(payload, ensure_ascii=False)
-    if provider == "openrouter":
-        api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if provider == "mistral":
+        api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
         if not api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is not set")
+            raise RuntimeError("MISTRAL_API_KEY is not set")
         return openai_chat_completion(
-            url="https://openrouter.ai/api/v1/chat/completions",
+            url="https://api.mistral.ai/v1/chat/completions",
             api_key=api_key,
-            model=OPENROUTER_JUDGE_MODEL,
+            model=MISTRAL_JUDGE_MODEL,
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=500,
             timeout=20.0,
-            extra_headers={
-                "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://127.0.0.1:8799"),
-                "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "Zenox"),
-            },
-        )
-    if provider == "nvidia":
-        api_key = (os.environ.get("NVIDIA_API_KEY") or "").strip()
-        if not api_key:
-            raise RuntimeError("NVIDIA_API_KEY is not set")
-        return openai_chat_completion(
-            url="https://integrate.api.nvidia.com/v1/chat/completions",
-            api_key=api_key,
-            model=NVIDIA_JUDGE_MODEL,
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=500,
-            timeout=20.0,
-        )
-    if provider == "gemini":
-        api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY is not set")
-        return gemini_generate(
-            api_key=api_key,
-            model=GEMINI_JUDGE_MODEL,
-            system_prompt=JUDGE_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            max_tokens=500,
-            timeout=20.0,
-        )
-    if provider == "bai":
-        api_key = (os.environ.get("BAI_API_KEY") or "").strip()
-        if not api_key:
-            raise RuntimeError("BAI_API_KEY is not set")
-        return openai_chat_completion(
-            url="https://api.b.ai/v1/chat/completions",
-            api_key=api_key,
-            model=BAI_JUDGE_MODEL,
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=500,
-            timeout=20.0,
+            response_format={"type": "json_object"},
         )
     raise ValueError(f"Unknown Judge provider: {provider}")
 
@@ -1183,24 +1121,16 @@ def _judge_reply(platform: str, last_message: str, customer_message: str,
         "fake_profile": fake_profile,
         "proposed_reply": reply,
     }
-    errors = []
-    for provider in ("openrouter", "nvidia", "gemini", "bai"):
-        try:
-            result = _parse_judge_response(
-                _judge_provider_response(provider, payload), provider
-            )
-        except Exception as error:
-            _record_api_failure(provider, error)
-            errors.append(f"{API_PROVIDER_BY_NAME[provider][1]}: {error}")
-            continue
-        _record_api_success(provider, "Judge request succeeded")
-        result["fallback_errors"] = errors
-        return result
-    return {
-        "ok": False,
-        "error": "All Judge providers failed: " + "; ".join(errors),
-        "fallback_errors": errors,
-    }
+    provider = "mistral"
+    try:
+        result = _parse_judge_response(
+            _judge_provider_response(provider, payload), provider
+        )
+    except Exception as error:
+        _record_api_failure(provider, error)
+        return {"ok": False, "error": f"Mistral Judge failed: {error}"}
+    _record_api_success(provider, "Judge request succeeded")
+    return result
 
 
 def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: bool,
@@ -1210,9 +1140,9 @@ def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: b
     The request is inserted before this worker starts, so the bot always gets
     its request id quickly and waits on exactly one card. Auto-pilot requests
     remain pending until a perfect Judge result promotes that same request to
-    approved. Depending on Settings, a non-perfect result either leaves that
-    same card for manual review or rejects it so the bot regenerates. Provider
-    failure always falls back to manual review.
+    approved. Depending on Settings, the result can instead always leave that
+    same card for manual review, or a non-perfect result can reject it so the
+    bot regenerates. Provider failure always falls back to manual review.
     """
     judge_result = _judge_reply(**judge_payload)
     judge_score = judge_result.get("score") if judge_result["ok"] else None
@@ -1233,7 +1163,11 @@ def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: b
             "judge_pending": False,
         })
         if auto_candidate and item["status"] == "pending":
-            if judge_result["ok"] and judge_score == 10:
+            if (
+                judge_result["ok"]
+                and judge_score == 10
+                and auto_policy != "judge_always_manual"
+            ):
                 item["status"] = "approved"
                 item["auto"] = True
                 item["final_reply"] = auto_final_reply
@@ -1249,14 +1183,20 @@ def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: b
                 created_request = dict(item)
                 pending_count = sum(1 for queued in _requests.values() if queued["status"] == "pending")
     if auto_candidate:
-        if judge_result["ok"] and judge_score == 10:
+        if (
+            judge_result["ok"]
+            and judge_score == 10
+            and auto_policy != "judge_always_manual"
+        ):
             print(f"[Judge] {judge_payload['platform']} reply scored 10/10 — auto-approved")
+        elif judge_result["ok"] and auto_policy == "judge_always_manual":
+            print(f"[Judge] {judge_payload['platform']} reply scored {judge_score}/10 — manual approval required")
         elif judge_result["ok"] and auto_policy == "judge_regenerate":
             print(f"[Judge] {judge_payload['platform']} reply scored {judge_score}/10 — regenerating")
         elif judge_result["ok"]:
             print(f"[Judge] {judge_payload['platform']} reply scored {judge_score}/10 — holding for manual review")
         else:
-            print(f"[Judge] All providers failed for {judge_payload['platform']} — holding for manual review: {judge_result.get('error')}")
+            print(f"[Judge] Mistral failed for {judge_payload['platform']} — holding for manual review: {judge_result.get('error')}")
     _bump_state()
     if should_notify and created_request is not None:
         push_notifications.queue_approval(created_request, pending_count)
@@ -1288,7 +1228,7 @@ def create_request():
     # Literal latest conversation message, regardless of sender. Older bot
     # versions only send customer_message, so retain that as a display fallback.
     last_message = body.get("last_message") or customer_message
-    reply_type = (body.get("reply_type") or "").strip() or None  # e.g. "DIA" / "ASA Follow-up" (Justlo only) — None means the bot doesn't report one
+    reply_type = (body.get("reply_type") or "").strip() or None  # e.g. "DIA" / "ASA Follow-up" (Justlo family) — None means the bot doesn't report one
     # Optional profile data supplied by a bot and shown on the dashboard so a
     # reviewer can sanity-check the context before approving.
     client_profile = body.get("client_profile") or {}
@@ -1350,10 +1290,10 @@ def create_request():
             if result["contains_meeting"] and result["reply"]:
                 final_reply = strip_disallowed_reply_punctuation(result["reply"])
 
-    # Judge AI is intentionally asynchronous whenever it is enabled. Provider
-    # fallbacks can outlive the bot client's POST timeout, so the card is always
-    # inserted first. Direct Auto mode skips the Judge entirely; the other Auto
-    # policies remain pending until the background decision arrives.
+    # Judge AI is intentionally asynchronous whenever it is enabled. The
+    # provider call can outlive the bot client's POST timeout, so the card is
+    # always inserted first. Direct Auto mode skips the Judge entirely; the
+    # other Auto policies remain pending until the background decision arrives.
     direct_auto = auto and auto_policy == "direct"
     auto_candidate = auto and not direct_auto
     run_judge = auto_candidate or (
@@ -4975,6 +4915,31 @@ _BOTS_PAGE = r"""<!doctype html>
   ol.steps-list { margin: 10px 0 0; padding-left: 20px; font-size: 12.5px; color: var(--foreground); }
   ol.steps-list li { margin-bottom: 5px; }
   .error-note { color: var(--destructive); font-size: 12px; margin-top: 8px; }
+  details.credentials-block {
+    margin-top: 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: #09090b; overflow: hidden;
+  }
+  details.credentials-block summary {
+    list-style: none; padding: 10px 12px; display: flex; align-items: center;
+    gap: 8px; min-height: 40px; user-select: none;
+  }
+  details.credentials-block summary::-webkit-details-marker { display: none; }
+  details.credentials-block summary::before { content: "+"; width: 14px; color: var(--info); font-weight: 800; }
+  details.credentials-block[open] summary::before { content: "-"; }
+  .credential-status { margin-left: auto; color: var(--muted-foreground); font-size: 11px; font-weight: 600; }
+  .credential-form { border-top: 1px solid var(--border); padding: 12px; }
+  .credential-field { margin-bottom: 10px; }
+  .credential-field label { display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 11.5px; font-weight: 650; }
+  .credential-field input {
+    width: 100%; min-width: 0; border: 1px solid var(--input); border-radius: 7px;
+    background: #111114; color: var(--foreground); padding: 9px 10px; font: inherit;
+  }
+  .password-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+  .credential-reveal { background: var(--accent); color: var(--foreground); border-color: var(--border); padding-inline: 11px; }
+  .credential-save { width: 100%; background: var(--primary); color: var(--primary-foreground); }
+  .credential-message { min-height: 18px; margin-top: 7px; color: var(--muted-foreground); font-size: 11.5px; }
+  .credential-message.ok { color: var(--success); }
+  .credential-message.bad { color: var(--destructive); }
 
   /* ── Toasts + confirm modal (same component as the approval dashboard) ── */
   #toastRoot {
@@ -5151,7 +5116,8 @@ _BOTS_PAGE = r"""<!doctype html>
     .toggle-row { align-items: flex-start; flex-wrap: wrap; }
     .toggle-name { padding-top: 11px; }
     .toggle-switch-btn { min-height: 44px; max-width: 100%; touch-action: manipulation; }
-    .toggle-switch-label, .toast { overflow-wrap: anywhere; }
+    .toggle-switch-label, .toast, .credential-message { overflow-wrap: anywhere; }
+    .credential-field input, .credential-save, .credential-reveal { min-height: 44px; }
     details.steps-block summary { min-height: 44px; display: flex; align-items: center; }
     ol.steps-list { padding-left: 22px; overflow-wrap: anywhere; }
     .bot-card-head { align-items: flex-start; }
@@ -5243,7 +5209,13 @@ const PLATFORMS = __PLATFORM_DATA__;
 // every fetch/render/action below is always scoped to one `slug`, never "all".
 const state = {};
 for (const p of PLATFORMS) {
-  state[p.slug] = { approvalEffective: "manual", running: false, managedBy: null, liveDetail: "", error: "", starting: false, startingAt: 0, stopping: false, stepsOpen: false, loaded: false };
+  state[p.slug] = {
+    approvalEffective: "manual", running: false, managedBy: null, liveDetail: "", error: "",
+    starting: false, startingAt: 0, stopping: false, stepsOpen: false, loaded: false,
+    credentialsOpen: false, credentialsLoaded: false, credentialUsername: "",
+    credentialPassword: "", passwordConfigured: false, credentialsSaving: false,
+    credentialMessage: "", credentialMessageType: "",
+  };
 }
 
 function stepsFor(slug, approval) {
@@ -5316,6 +5288,35 @@ function renderCard(slug, label) {
         </button>
       </div>
 
+      <details class="credentials-block" ${s.credentialsOpen ? "open" : ""} ontoggle="state['${slug}'].credentialsOpen = this.open">
+        <summary>
+          Login credentials
+          <span class="credential-status">${s.credentialsLoaded ? (s.passwordConfigured ? "Configured" : "Password needed") : "Loading..."}</span>
+        </summary>
+        <div class="credential-form">
+          <div class="credential-field">
+            <label for="username-${slug}">Username</label>
+            <input id="username-${slug}" type="text" autocomplete="off"
+              value="${escapeHtml(s.credentialUsername)}"
+              oninput="state['${slug}'].credentialUsername = this.value" />
+          </div>
+          <div class="credential-field">
+            <label for="password-${slug}">Password</label>
+            <div class="password-row">
+              <input id="password-${slug}" type="password" autocomplete="off"
+                value="${escapeHtml(s.credentialPassword)}"
+                placeholder="${s.passwordConfigured ? "Blank keeps current" : "Enter password"}"
+                oninput="state['${slug}'].credentialPassword = this.value" />
+              <button class="credential-reveal" type="button" onclick="toggleCredentialPassword('${slug}', this)">Show</button>
+            </div>
+          </div>
+          <button class="credential-save" type="button" ${(!s.credentialsLoaded || s.credentialsSaving) ? "disabled" : ""} onclick="saveCredentials('${slug}')">
+            ${s.credentialsSaving ? '<span class="spinner"></span>Saving' : "Save credentials"}
+          </button>
+          <div class="credential-message ${escapeHtml(s.credentialMessageType)}">${escapeHtml(s.credentialMessage)}</div>
+        </div>
+      </details>
+
       <details class="steps-block" ${s.stepsOpen ? "open" : ""} ontoggle="state['${slug}'].stepsOpen = this.open">
         <summary>What happens, step by step</summary>
         <ol class="steps-list">${steps.map(st => `<li>${escapeHtml(st)}</li>`).join("")}</ol>
@@ -5330,10 +5331,71 @@ function render() {
   document.getElementById("botsGrid").innerHTML = PLATFORMS.map(p => renderCard(p.slug, p.label)).join("");
 }
 
+function renderBackgroundUpdate() {
+  const active = document.activeElement;
+  if (active && active.matches(".credential-field input")) return;
+  render();
+}
+
 function showError(slug, msg) {
   state[slug].error = msg;
   const el = document.getElementById(`err-${slug}`);
   if (el) el.textContent = msg;
+}
+
+function toggleCredentialPassword(slug, button) {
+  const input = document.getElementById(`password-${slug}`);
+  input.type = input.type === "password" ? "text" : "password";
+  button.textContent = input.type === "password" ? "Show" : "Hide";
+}
+
+async function loadCredentials(slug) {
+  try {
+    const res = await fetch(`/api/bots/${slug}/credentials`, { cache: "no-store" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    state[slug].credentialUsername = data.username || "";
+    state[slug].passwordConfigured = !!data.password_configured;
+    state[slug].credentialsLoaded = true;
+  } catch (error) {
+    state[slug].credentialsLoaded = false;
+    state[slug].credentialMessageType = "bad";
+    state[slug].credentialMessage = `Could not load credentials: ${error}`;
+  }
+}
+
+async function saveCredentials(slug) {
+  const s = state[slug];
+  s.credentialsSaving = true;
+  s.credentialMessage = "Saving...";
+  s.credentialMessageType = "";
+  render();
+  try {
+    const res = await fetch(`/api/bots/${slug}/credentials`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: s.credentialUsername, password: s.credentialPassword }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    s.credentialUsername = data.username || "";
+    s.credentialPassword = "";
+    s.passwordConfigured = !!data.password_configured;
+    s.credentialMessageType = "ok";
+    s.credentialMessage = data.running
+      ? "Saved to .env. Stop and start this bot to use the new login."
+      : "Saved to .env. The new login will be used on the next start.";
+    toast(`${PLATFORMS.find(p => p.slug === slug)?.label || slug} credentials saved`, {
+      type: "success",
+      detail: data.running ? "Restart the bot when you are ready to apply them." : "They will apply on the next start.",
+    });
+  } catch (error) {
+    s.credentialMessageType = "bad";
+    s.credentialMessage = String(error);
+  } finally {
+    s.credentialsSaving = false;
+    render();
+  }
 }
 
 async function startBot(slug) {
@@ -5420,7 +5482,7 @@ async function refreshStatus() {
     }
   } catch (e) { /* transient */ }
 
-  render();
+  renderBackgroundUpdate();
 }
 
 let botsLiveSocket = null;
@@ -5439,7 +5501,7 @@ function applyBotSnapshot(snapshot) {
     const entry = statuses[p.label] || statuses[p.label.toLowerCase()];
     if (entry) state[p.slug].liveDetail = `${entry.state}${entry.detail ? " — " + entry.detail : ""}`;
   }
-  render();
+  renderBackgroundUpdate();
 }
 
 function connectBotsLive() {
@@ -5469,11 +5531,14 @@ function connectBotsLive() {
 
 async function loadInitial() {
   await Promise.allSettled(PLATFORMS.map(async p => {
-    try {
-      const res = await fetch(`/api/mode/override?platform=${p.slug}`);
-      const data = await res.json();
-      if (data.effective) state[p.slug].approvalEffective = data.effective;
-    } catch (e) { /* keep default */ }
+    await Promise.allSettled([
+      (async () => {
+        const res = await fetch(`/api/mode/override?platform=${p.slug}`);
+        const data = await res.json();
+        if (data.effective) state[p.slug].approvalEffective = data.effective;
+      })(),
+      loadCredentials(p.slug),
+    ]);
   }));
   await refreshStatus();
   connectBotsLive();
