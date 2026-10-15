@@ -4,7 +4,9 @@ from core.bot import BotConfig
 
 config = BotConfig(
     platform="Gold3",
-    cdp_url="http://127.0.0.1:9231",
+    # Dedicated port.  9231 belongs to Gnoxx; sharing it makes both bots attach
+    # to the same browser and breaks platform/tab detection when run together.
+    cdp_url="http://127.0.0.1:9232",
     tab1_pattern="mods.gold-chat.net",
     tab2_pattern="chamaleon-ai",
     tab1_url="https://mods.gold-chat.net/login",

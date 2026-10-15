@@ -61,11 +61,33 @@ from dotenv import dotenv_values, set_key
 from core.ai_providers import openai_chat_completion
 from core.launcher import is_cdp_ready
 from core.bot_lifecycle import LauncherClient
+from core.bot_accounts import (
+    MAX_LABEL_CHARS,
+    add_account,
+    delete_account,
+    get_account,
+    list_accounts,
+    update_account,
+)
 from core.bot import pause_flag_path
 from core.platform_operations import run_browser_operation
 from core.runtime_settings import get_runtime_settings, update_runtime_settings
-from core.process_visibility import apply_current_console_visibility
+from core.process_visibility import apply_current_console_visibility, process_window_kwargs
 from core.reply_text import strip_disallowed_reply_punctuation
+from core.judge_prompt import (
+    MAX_PROMPT_CHARS,
+    get_judge_prompt,
+    judge_prompt_is_customized,
+    reset_judge_prompt,
+    save_judge_prompt,
+)
+from core.instruction_prompts import (
+    MAX_NAME_CHARS as MAX_INSTRUCTION_PROMPT_NAME_CHARS,
+    MAX_PROMPT_CHARS as MAX_INSTRUCTION_PROMPT_CHARS,
+    delete_instruction_prompt,
+    list_instruction_prompts,
+    save_instruction_prompt,
+)
 from core.platforms import (
     KNOWN_PLATFORM_LABELS,
     PLATFORM_BY_SLUG,
@@ -74,7 +96,7 @@ from core.platforms import (
     SELF_MANAGED_PLATFORM_SLUGS,
     platform_label,
 )
-from prompts import JUDGE_SYSTEM_PROMPT, MEETING_ALERT_SYSTEM_PROMPT
+from prompts import MEETING_ALERT_SYSTEM_PROMPT
 from core import push_notifications
 
 
@@ -212,6 +234,11 @@ SKIPPABLE_APPROVAL_PLATFORMS = frozenset(SELF_MANAGED_PLATFORMS)
 # above for the same reasoning). React platforms (Gold/Diamond/...) still
 # only start via launch_all.py / Bot Controls, unchanged.
 _SELF_MANAGED_CDP_PORTS = {"xkuss": 9227, "justlo": 9229, "linduu": 9230, "gnoxx": 9231}
+_BUILTIN_CDP_PORTS = {
+    "gold": 9222, "diamond": 9223, "platin": 9224, "s69": 9225,
+    "gold2": 9226, "xkuss": 9227, "ml": 9228, "justlo": 9229,
+    "linduu": 9230, "gnoxx": 9231, "gold3": 9232,
+}
 _PLATFORM_CREDENTIAL_ENV = {
     platform.slug: (
         f"{platform.slug.upper()}_USERNAME",
@@ -220,6 +247,27 @@ _PLATFORM_CREDENTIAL_ENV = {
     for platform in PLATFORMS
 }
 _bot_procs: dict[str, subprocess.Popen] = {}
+_stop_all_lock = threading.Lock()
+
+
+def _runtime_label(bot_ref: str) -> str | None:
+    """Resolve a built-in slug or additional account id to its telemetry label."""
+    bot_ref = (bot_ref or "").strip().lower()
+    if bot_ref in PLATFORM_BY_SLUG:
+        return platform_label(bot_ref)
+    account = get_account(bot_ref)
+    return str(account.get("label")) if account else None
+
+
+def _platform_type_for_runtime_name(name: str) -> str | None:
+    normalized = (name or "").strip().casefold()
+    for platform in PLATFORMS:
+        if normalized in (platform.slug.casefold(), platform.label.casefold()):
+            return platform.slug
+    for account in list_accounts():
+        if normalized == str(account.get("label", "")).casefold():
+            return str(account.get("platform_type", ""))
+    return None
 
 
 def _pid_is_running(pid: int | None) -> bool:
@@ -360,6 +408,14 @@ def _close_platform_chrome(port: int) -> bool:
     return _terminate_process_tree(browser_pid) if browser_pid else False
 
 
+def _is_cdp_ready_for_status(port: int) -> bool:
+    """Fast localhost probe used only for dashboard display state."""
+    try:
+        return httpx.get(f"http://127.0.0.1:{port}/json", timeout=0.15).is_success
+    except Exception:
+        return False
+
+
 def _standalone_bot_status(platform: str) -> dict:
     """Best-effort status for one self-managed platform. Distinguishes a bot
     this dashboard started (has a tracked Popen) from one that's merely
@@ -389,13 +445,188 @@ def _standalone_bot_status(platform: str) -> dict:
         "pid": None,
         "managed_by": None,
         "paused": False,
-        "browser_open": is_cdp_ready(_SELF_MANAGED_CDP_PORTS[platform]),
+        "browser_open": _is_cdp_ready_for_status(_SELF_MANAGED_CDP_PORTS[platform]),
+    }
+
+
+def _additional_bot_status(account: dict) -> dict:
+    account_id = account["id"]
+    label = account["label"]
+    proc = _bot_procs.get(account_id)
+    if proc is not None and proc.poll() is None:
+        return {
+            "running": True,
+            "pid": proc.pid,
+            "managed_by": "dashboard",
+            "paused": pause_flag_path(label).exists(),
+        }
+    if proc is not None:
+        _bot_procs.pop(account_id, None)
+    reported_pid = _reported_bot_pid(label.lower())
+    if reported_pid:
+        return {
+            "running": True,
+            "pid": reported_pid,
+            "managed_by": "external",
+            "paused": pause_flag_path(label).exists(),
+        }
+    return {
+        "state": "stopped",
+        "running": False,
+        "pid": None,
+        "managed_by": None,
+        "paused": False,
+        "browser_open": _is_cdp_ready_for_status(int(account["cdp_port"])),
     }
 
 
 @app.get("/api/bots/status")
 def bots_status():
     return jsonify(_all_bot_statuses())
+
+
+@app.get("/api/bot-accounts")
+def bot_accounts_list():
+    return jsonify([
+        {
+            "id": account["id"],
+            "platform_type": account["platform_type"],
+            "label": account["label"],
+            "username": account["username"],
+            "cdp_port": account["cdp_port"],
+        }
+        for account in list_accounts()
+    ])
+
+
+@app.post("/api/bot-accounts")
+def bot_accounts_create():
+    body = request.get_json(force=True, silent=True) or {}
+    platform_type = str(body.get("platform_type") or "").strip().lower()
+    label = body.get("label")
+    username = body.get("username")
+    password = body.get("password")
+    if platform_type not in PLATFORM_BY_SLUG:
+        return jsonify({"ok": False, "error": "Choose a valid platform type"}), 400
+    if not isinstance(label, str) or not label.strip():
+        return jsonify({"ok": False, "error": "Bot name is required"}), 400
+    label = label.strip()
+    if len(label) > MAX_LABEL_CHARS or any(char in label for char in "\r\n\0"):
+        return jsonify({
+            "ok": False,
+            "error": f"Bot name must be {MAX_LABEL_CHARS} characters or fewer",
+        }), 400
+    if any(platform.label.casefold() == label.casefold() for platform in PLATFORM_BY_SLUG.values()):
+        return jsonify({"ok": False, "error": "A built-in bot already uses that name"}), 409
+    if not isinstance(username, str) or not username.strip():
+        return jsonify({"ok": False, "error": "username is required"}), 400
+    if not isinstance(password, str) or not password:
+        return jsonify({"ok": False, "error": "password is required"}), 400
+    username = username.strip()
+    if any(char in username for char in "\r\n\0") or len(username) > 256:
+        return jsonify({"ok": False, "error": "invalid username format"}), 400
+    if any(char in password for char in "\r\n\0") or len(password) > 2048:
+        return jsonify({"ok": False, "error": "invalid password format"}), 400
+    if password != password.strip() or re.search(r"\s+#", password):
+        return jsonify({
+            "ok": False,
+            "error": "password cannot start/end with whitespace or contain whitespace followed by #",
+        }), 400
+    builtin_username, _ = _credential_values(platform_type)
+    if builtin_username and builtin_username.casefold() == username.casefold():
+        return jsonify({
+            "ok": False,
+            "error": "That username is already used by the built-in bot for this platform",
+        }), 409
+    try:
+        account = add_account(
+            platform_type,
+            PLATFORM_BY_SLUG[platform_type].label,
+            username,
+            password,
+            set(_BUILTIN_CDP_PORTS.values()),
+            label,
+        )
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 409
+    except Exception as error:
+        return jsonify({"ok": False, "error": f"Could not create bot: {error}"}), 500
+    _bump_state()
+    return jsonify({
+        "ok": True,
+        "bot": {
+            "id": account["id"],
+            "platform_type": account["platform_type"],
+            "label": account["label"],
+            "username": account["username"],
+            "cdp_port": account["cdp_port"],
+        },
+    }), 201
+
+
+@app.patch("/api/bot-accounts/<account_id>")
+def bot_accounts_rename(account_id):
+    account_id = account_id.strip().lower()
+    account = get_account(account_id)
+    if account is None:
+        return jsonify({"ok": False, "error": "bot account not found"}), 404
+    if _additional_bot_status(account).get("running"):
+        return jsonify({"ok": False, "error": "Stop this bot before renaming it"}), 409
+
+    body = request.get_json(force=True, silent=True) or {}
+    label = body.get("label")
+    if not isinstance(label, str) or not label.strip():
+        return jsonify({"ok": False, "error": "Bot name is required"}), 400
+    label = label.strip()
+    if len(label) > MAX_LABEL_CHARS or any(char in label for char in "\r\n\0"):
+        return jsonify({
+            "ok": False,
+            "error": f"Bot name must be {MAX_LABEL_CHARS} characters or fewer",
+        }), 400
+    if any(platform.label.casefold() == label.casefold() for platform in PLATFORM_BY_SLUG.values()):
+        return jsonify({"ok": False, "error": "A built-in bot already uses that name"}), 409
+
+    old_label = account["label"]
+    try:
+        saved = update_account(account_id, account["username"], label=label)
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 409
+    with _lock:
+        mode = _mode_overrides.pop(old_label.casefold(), None)
+        if mode is not None:
+            _mode_overrides[saved["label"].casefold()] = mode
+        status = _status.pop(old_label, None)
+        if status is not None:
+            _status[saved["label"]] = status
+    _bump_state()
+    return jsonify({
+        "ok": True,
+        "bot": {
+            "id": saved["id"],
+            "platform_type": saved["platform_type"],
+            "label": saved["label"],
+            "username": saved["username"],
+            "cdp_port": saved["cdp_port"],
+        },
+    })
+
+
+@app.delete("/api/bot-accounts/<account_id>")
+def bot_accounts_delete(account_id):
+    account_id = account_id.strip().lower()
+    account = get_account(account_id)
+    if account is None:
+        return jsonify({"ok": False, "error": "bot account not found"}), 404
+    if _additional_bot_status(account).get("running"):
+        return jsonify({"ok": False, "error": "Stop this bot before deleting it"}), 409
+    if not _close_platform_chrome(int(account["cdp_port"])):
+        return jsonify({"ok": False, "error": "Could not close this bot's browser"}), 500
+    delete_account(account_id)
+    with _lock:
+        _mode_overrides.pop(account["label"].casefold(), None)
+        _status.pop(account["label"], None)
+    _bump_state()
+    return jsonify({"ok": True})
 
 
 def _credential_values(platform: str) -> tuple[str, str]:
@@ -425,6 +656,16 @@ def _credential_response(platform: str):
 @app.get("/api/bots/<platform>/credentials")
 def bot_credentials(platform):
     platform = platform.strip().lower()
+    account = get_account(platform)
+    if account:
+        response = jsonify({
+            "ok": True,
+            "platform": platform,
+            "username": account.get("username", ""),
+            "password_configured": bool(account.get("password")),
+        })
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if platform not in _PLATFORM_CREDENTIAL_ENV:
         return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
     return _credential_response(platform)
@@ -433,8 +674,9 @@ def bot_credentials(platform):
 @app.post("/api/bots/<platform>/credentials")
 def update_bot_credentials(platform):
     platform = platform.strip().lower()
+    account = get_account(platform)
     env_names = _PLATFORM_CREDENTIAL_ENV.get(platform)
-    if env_names is None:
+    if env_names is None and account is None:
         return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
 
     body = request.get_json(force=True, silent=True) or {}
@@ -459,6 +701,23 @@ def update_bot_credentials(platform):
             "ok": False,
             "error": "password cannot start/end with whitespace or contain whitespace followed by #",
         }), 400
+
+    if account is not None:
+        if not password and not account.get("password"):
+            return jsonify({"ok": False, "error": "password is required"}), 400
+        try:
+            saved = update_account(platform, username, password)
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 409
+        response = jsonify({
+            "ok": True,
+            "platform": platform,
+            "username": saved["username"],
+            "password_configured": bool(saved.get("password")),
+            "running": bool(_all_bot_statuses()[platform].get("running")),
+        })
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     username_env, password_env = env_names
     with _env_write_lock:
@@ -519,17 +778,33 @@ def _all_bot_statuses() -> dict[str, dict]:
                 "pid": None,
                 "managed_by": None,
             }
+    for account in list_accounts():
+        result[account["id"]] = _additional_bot_status(account)
     return result
 
 
 @app.post("/api/bots/<platform>/start")
 def bots_start(platform):
     platform = platform.strip().lower()
-    if platform not in PLATFORM_BY_SLUG:
+    account = get_account(platform)
+    if platform not in PLATFORM_BY_SLUG and account is None:
         return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
     status = _all_bot_statuses()[platform]
     if status["running"]:
         return jsonify({"ok": False, "error": f"{platform} is already running ({status['managed_by']})"}), 409
+    if account is not None:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-u", str(_BASE_DIR / "run_account_bot.py"), platform],
+                cwd=str(_BASE_DIR),
+                **process_window_kwargs(visible_new_console=True),
+            )
+            _bot_procs[platform] = proc
+        except Exception as error:
+            return jsonify({"ok": False, "error": f"Could not start bot: {error}"}), 500
+        _bump_state()
+        return jsonify({"ok": True, "starting": True, "pid": proc.pid}), 202
+
     control = _control_status_cached()
     if control.get("available"):
         data, status_code = _launcher_client.command("start", platform)
@@ -545,41 +820,66 @@ def bots_start(platform):
 @app.post("/api/bots/<platform>/stop")
 def bots_stop(platform):
     platform = platform.strip().lower()
-    if platform not in PLATFORM_BY_SLUG:
+    account = get_account(platform)
+    if platform not in PLATFORM_BY_SLUG and account is None:
         return jsonify({"ok": False, "error": f"unknown platform '{platform}'"}), 404
 
     status = _all_bot_statuses()[platform]
+    if account is not None:
+        label = account["label"]
+        proc = _bot_procs.get(platform)
+        pids = set()
+        if proc is not None and proc.poll() is None:
+            pids.add(proc.pid)
+        reported_pid = _reported_bot_pid(label.lower())
+        if reported_pid:
+            pids.add(reported_pid)
+        worker_stopped = all(_terminate_process_tree(pid) for pid in pids)
+        _bot_procs.pop(platform, None)
+        browser_stopped = _close_platform_chrome(int(account["cdp_port"]))
+        _cancel_pending_for_platform(platform, "Bot and browser stopped")
+        _bump_state()
+        if not worker_stopped or not browser_stopped:
+            return jsonify({
+                "ok": False,
+                "error": "Could not fully stop the bot process or its Chrome session",
+                "worker_stopped": worker_stopped,
+                "browser_stopped": browser_stopped,
+            }), 500
+        return jsonify({"ok": True, "worker_stopped": True, "browser_stopped": True})
+
     control = _control_status_cached()
     if control.get("available") and status.get("managed_by") == "launcher":
         data, status_code = _launcher_client.command("stop", platform)
         if not data.get("ok"):
             return jsonify(data), status_code
-        _cancel_pending_for_platform(platform, "Bot stopped")
-        return jsonify(data), status_code
+        worker_stopped = True
+    else:
+        proc = _bot_procs.get(platform)
+        pids = set()
+        if proc is not None and proc.poll() is None:
+            pids.add(proc.pid)
+        reported_pid = _reported_bot_pid(platform)
+        if reported_pid:
+            pids.add(reported_pid)
 
-    if platform not in SELF_MANAGED_PLATFORMS:
-        return jsonify({"ok": True, "already_stopped": True})
+        # When launch_all.py owns this bot, this marks it intentionally stopped
+        # so its crash monitor cannot immediately relaunch the worker.
+        _stop_via_launcher(platform)
+        worker_stopped = True
+        for pid in pids:
+            worker_stopped = _terminate_process_tree(pid) and worker_stopped
 
-    port = _SELF_MANAGED_CDP_PORTS[platform]
-    proc = _bot_procs.get(platform)
-    pids = set()
-    if proc is not None and proc.poll() is None:
-        pids.add(proc.pid)
-    reported_pid = _reported_bot_pid(platform)
-    if reported_pid:
-        pids.add(reported_pid)
-
-    # When launch_all.py owns this bot, this marks it intentionally stopped so
-    # its crash monitor does not immediately relaunch the process we terminate.
-    _stop_via_launcher(platform)
-
-    worker_stopped = True
-    for pid in pids:
-        worker_stopped = _terminate_process_tree(pid) and worker_stopped
     _bot_procs.pop(platform, None)
+    port = (
+        _SELF_MANAGED_CDP_PORTS[platform]
+        if platform in SELF_MANAGED_PLATFORMS
+        else _BUILTIN_CDP_PORTS[platform]
+    )
     browser_stopped = _close_platform_chrome(port)
 
     _cancel_pending_for_platform(platform, "Bot and browser stopped")
+    _bump_state()
 
     if not worker_stopped or not browser_stopped:
         failed = []
@@ -600,14 +900,55 @@ def bots_stop(platform):
     })
 
 
+@app.post("/api/bots/stop-all")
+def bots_stop_all():
+    """Stop every worker and browser while keeping dashboard controls online."""
+    if not _stop_all_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "Stop everything is already running"}), 409
+    try:
+        targets = [platform.slug for platform in PLATFORMS]
+        targets.extend(account["id"] for account in list_accounts())
+        stopped = []
+        failures = []
+
+        for target in targets:
+            result = bots_stop(target)
+            if isinstance(result, tuple):
+                response, status_code = result[0], int(result[1])
+            else:
+                response = result
+                status_code = int(getattr(response, "status_code", 200))
+            payload = response.get_json(silent=True) or {}
+            if status_code < 400 and payload.get("ok"):
+                stopped.append(target)
+            else:
+                failures.append({
+                    "target": target,
+                    "error": payload.get("error") or f"HTTP {status_code}",
+                })
+
+        _bump_state()
+        ok = not failures
+        return jsonify({
+            "ok": ok,
+            "stopped": stopped,
+            "stopped_count": len(stopped),
+            "failures": failures,
+            "launcher_running": bool(_control_status_cached().get("available")),
+            "error": "Some processes or browser sessions could not be stopped" if not ok else "",
+        }), 200 if ok else 500
+    finally:
+        _stop_all_lock.release()
+
+
 def _cancel_pending_for_platform(platform: str, detail: str) -> None:
     """Remove approvals that a stopped worker can no longer complete."""
-    label = platform_label(platform)
+    label = _runtime_label(platform) or platform
     now = _now()
     with _lock:
         for item in _requests.values():
             if (
-                (item.get("platform") or "").strip().lower() == platform
+                (item.get("platform") or "").strip().casefold() == label.casefold()
                 and item.get("status") in ("pending", "skip_requested")
             ):
                 item["status"] = "cancelled"
@@ -634,13 +975,19 @@ MISTRAL_JUDGE_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-large-latest")
 
 API_PROVIDER_SPECS = (
     ("groq", "Groq", "GROQ_API_KEY", GROQ_TRANSLATION_MODEL, "Translation and meeting checks"),
-    ("mistral", "Mistral", "MISTRAL_API_KEY", MISTRAL_JUDGE_MODEL, "Judge"),
+    ("mistral", "Mistral", "MISTRAL_API_KEY", MISTRAL_JUDGE_MODEL, "Judge and English-to-German translation"),
 )
 API_PROVIDER_BY_NAME = {item[0]: item for item in API_PROVIDER_SPECS}
 _TRANSLATION_SYSTEM_PROMPT = (
     "Translate the user's German text into natural English. Preserve meaning, "
     "tone, names, emojis, paragraph breaks, and punctuation. Return only the "
     "English translation, with no notes, labels, or quotation marks."
+)
+_ENGLISH_TO_GERMAN_SYSTEM_PROMPT = (
+    "Translate the user's English reply into natural conversational German. "
+    "Preserve the exact meaning, tone, names, emojis, paragraph breaks, and "
+    "punctuation. Do not add, omit, soften, explain, or answer the text. Return "
+    "only the German translation with no label, notes, or quotation marks."
 )
 
 # Provider health is updated by real translation/meeting-guard calls and by the
@@ -803,6 +1150,33 @@ def _translate_de_en(text: str, timeout: float = 22.0) -> str | None:
         return future.result(timeout=timeout)
     except Exception:
         return None
+
+
+def _translate_en_de_with_mistral(text: str) -> str:
+    api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("MISTRAL_API_KEY is not configured")
+    try:
+        translated = openai_chat_completion(
+            url="https://api.mistral.ai/v1/chat/completions",
+            api_key=api_key,
+            model=MISTRAL_JUDGE_MODEL,
+            messages=[
+                {"role": "system", "content": _ENGLISH_TO_GERMAN_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            max_tokens=1600,
+            timeout=25.0,
+        ).strip()
+    except Exception as error:
+        _record_api_failure("mistral", error)
+        raise
+    if not translated:
+        error = RuntimeError("Mistral returned an empty translation")
+        _record_api_failure("mistral", error)
+        raise error
+    _record_api_success("mistral", "English-to-German translation succeeded")
+    return strip_disallowed_reply_punctuation(translated)
 
 
 def _now() -> str:
@@ -1076,7 +1450,7 @@ def _judge_provider_response(provider: str, payload: dict) -> str:
             api_key=api_key,
             model=MISTRAL_JUDGE_MODEL,
             messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": get_judge_prompt()},
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=500,
@@ -1217,6 +1591,35 @@ def _prune_history_locked():
         _requests.pop(r["id"], None)
 
 
+def _active_request_for_platform_locked(platform: str) -> dict | None:
+    """Return the one active request currently owned by this bot conversation.
+
+    A platform worker processes one live conversation at a time.  If two bot
+    loops (or a retried POST) submit before the first one is decided, exposing
+    both cards is unsafe: one conversation appears twice and two loops can
+    eventually send two replies.  Keep this check under ``_lock`` so concurrent
+    submissions cannot both pass it.
+    """
+    platform_key = (platform or "").strip().casefold()
+    return next(
+        (
+            item
+            for item in _requests.values()
+            if item.get("status") in {"pending", "approved", "sending", "skip_requested"}
+            and str(item.get("platform") or "").strip().casefold() == platform_key
+        ),
+        None,
+    )
+
+
+def _duplicate_request_response(existing: dict):
+    return jsonify({
+        "error": "this conversation already has an active approval request",
+        "duplicate": True,
+        "id": existing["id"],
+    }), 409
+
+
 # ── API ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/requests")
@@ -1236,6 +1639,14 @@ def create_request():
     messages = body.get("messages") or []
     if not reply.strip():
         return jsonify({"error": "reply is required"}), 400
+
+    # Fast path for the common retry/double-detection case.  The second check
+    # immediately before insertion below is still required to close the race
+    # while translation and analysis run outside the lock.
+    with _lock:
+        existing = _active_request_for_platform_locked(platform)
+        if existing is not None:
+            return _duplicate_request_response(existing)
 
     # Best-effort DE->EN translation so a reviewer who doesn't read German can
     # still judge the reply. The German text is always what's authoritative /
@@ -1310,6 +1721,11 @@ def create_request():
 
     req_id = str(uuid.uuid4())
     with _lock:
+        # Atomic uniqueness guard: at most one active approval lifecycle may
+        # belong to a worker, which itself can own only one conversation.
+        existing = _active_request_for_platform_locked(platform)
+        if existing is not None:
+            return _duplicate_request_response(existing)
         now = _now()
         _requests[req_id] = {
             "id": req_id,
@@ -1329,6 +1745,9 @@ def create_request():
             "created_at": body.get("created_at") or now,
             "decided_at": now if direct_auto else None,
             "sent_at": None,
+            "send_started_at": None,
+            "send_cancelled_at": None,
+            "send_cancel_revision": 0,
             "error": None,
             "auto": direct_auto,
             "auto_policy": auto_policy if auto else None,
@@ -1477,6 +1896,75 @@ def save_settings():
     return jsonify({"ok": True, "settings": settings, "runtime": runtime_result})
 
 
+@app.get("/api/judge-prompt")
+def get_judge_prompt_api():
+    prompt = get_judge_prompt()
+    return jsonify({
+        "prompt": prompt,
+        "customized": judge_prompt_is_customized(),
+        "max_chars": MAX_PROMPT_CHARS,
+    })
+
+
+@app.post("/api/judge-prompt")
+def save_judge_prompt_api():
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        prompt = save_judge_prompt(body.get("prompt"))
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except OSError as error:
+        return jsonify({"ok": False, "error": f"Could not save Judge prompt: {error}"}), 500
+    return jsonify({"ok": True, "prompt": prompt, "customized": True})
+
+
+@app.delete("/api/judge-prompt")
+def reset_judge_prompt_api():
+    try:
+        prompt = reset_judge_prompt()
+    except OSError as error:
+        return jsonify({"ok": False, "error": f"Could not reset Judge prompt: {error}"}), 500
+    return jsonify({"ok": True, "prompt": prompt, "customized": False})
+
+
+@app.get("/api/instruction-prompts")
+def get_instruction_prompts_api():
+    return jsonify({
+        "prompts": list_instruction_prompts(),
+        "max_name_chars": MAX_INSTRUCTION_PROMPT_NAME_CHARS,
+        "max_prompt_chars": MAX_INSTRUCTION_PROMPT_CHARS,
+    })
+
+
+@app.post("/api/instruction-prompts")
+def save_instruction_prompt_api():
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        saved = save_instruction_prompt(
+            body.get("name"),
+            body.get("prompt"),
+            body.get("id"),
+        )
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except KeyError:
+        return jsonify({"ok": False, "error": "Instruction prompt not found"}), 404
+    except OSError as error:
+        return jsonify({"ok": False, "error": f"Could not save instruction prompt: {error}"}), 500
+    return jsonify({"ok": True, "prompt": saved})
+
+
+@app.delete("/api/instruction-prompts/<prompt_id>")
+def delete_instruction_prompt_api(prompt_id):
+    try:
+        deleted = delete_instruction_prompt(prompt_id)
+    except KeyError:
+        return jsonify({"ok": False, "error": "Instruction prompt not found"}), 404
+    except OSError as error:
+        return jsonify({"ok": False, "error": f"Could not delete instruction prompt: {error}"}), 500
+    return jsonify({"ok": True, "prompt": deleted})
+
+
 @app.post("/api/mode")
 def set_mode():
     global _mode
@@ -1493,10 +1981,12 @@ def set_mode():
 @app.get("/api/mode/override")
 def get_mode_override():
     platform = (request.args.get("platform") or "").strip().lower()
-    if platform not in PLATFORM_BY_SLUG:
-        return jsonify({"error": f"unknown platform '{platform}'"}), 404
+    runtime_label = _runtime_label(platform)
+    if runtime_label is None:
+        return jsonify({"error": f"unknown bot '{platform}'"}), 404
+    mode_key = runtime_label.casefold()
     with _lock:
-        override = _mode_overrides.get(platform)
+        override = _mode_overrides.get(mode_key)
         effective = override or _mode
     return jsonify({"platform": platform, "override": override, "mode": _mode, "effective": effective})
 
@@ -1505,17 +1995,19 @@ def get_mode_override():
 def set_mode_override():
     body = request.get_json(force=True, silent=True) or {}
     platform = (body.get("platform") or "").strip().lower()
-    if platform not in PLATFORM_BY_SLUG:
-        return jsonify({"error": f"unknown platform '{platform}'"}), 404
+    runtime_label = _runtime_label(platform)
+    if runtime_label is None:
+        return jsonify({"error": f"unknown bot '{platform}'"}), 404
+    mode_key = runtime_label.casefold()
     mode = body.get("mode")
     if mode not in ("manual", "auto", "default"):
         return jsonify({"error": "mode must be 'manual', 'auto', or 'default'"}), 400
     with _lock:
         if mode == "default":
-            _mode_overrides.pop(platform, None)
+            _mode_overrides.pop(mode_key, None)
         else:
-            _mode_overrides[platform] = mode
-        effective = _mode_overrides.get(platform, _mode)
+            _mode_overrides[mode_key] = mode
+        effective = _mode_overrides.get(mode_key, _mode)
     _bump_state()
     # Approval mode is read live per-request (see create_request()) — no
     # restart needed for this one to take effect, unlike Source above.
@@ -1524,7 +2016,7 @@ def set_mode_override():
 
 @app.get("/api/platforms")
 def list_platforms():
-    return jsonify([
+    platforms = [
         {
             "slug": platform.slug,
             "name": platform.label,
@@ -1532,7 +2024,18 @@ def list_platforms():
             "self_managed": platform.self_managed,
         }
         for platform in PLATFORMS
-    ])
+    ]
+    for account in list_accounts():
+        base = PLATFORM_BY_SLUG[account["platform_type"]]
+        platforms.append({
+            "slug": account["id"],
+            "name": account["label"],
+            "color": base.color,
+            "self_managed": base.self_managed,
+            "platform_type": account["platform_type"],
+            "additional": True,
+        })
+    return jsonify(platforms)
 
 
 @app.get("/api/requests")
@@ -1559,6 +2062,46 @@ def get_request(req_id):
     return jsonify({k: v for k, v in r.items() if k != "_seq"})
 
 
+@app.post("/api/requests/<req_id>/translate-to-german")
+def translate_request_to_german(req_id):
+    body = request.get_json(force=True, silent=True) or {}
+    english_reply = body.get("english_reply")
+    if not isinstance(english_reply, str) or not english_reply.strip():
+        return jsonify({"ok": False, "error": "English reply is required"}), 400
+    english_reply = english_reply.strip()
+    if len(english_reply) > 8000:
+        return jsonify({"ok": False, "error": "English reply must be 8000 characters or fewer"}), 400
+
+    # Validate before making the provider call, then verify the state again
+    # afterwards in case another reviewer decided the card in the meantime.
+    with _lock:
+        item = _requests.get(req_id)
+        if item is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+        if item["status"] != "pending":
+            return jsonify({"ok": False, "error": f"already {item['status']}"}), 409
+
+    try:
+        german_reply = _translate_en_de_with_mistral(english_reply)
+    except Exception as error:
+        return jsonify({
+            "ok": False,
+            "error": f"Mistral translation failed: {str(error)[:240]}",
+        }), 502
+
+    with _lock:
+        item = _requests.get(req_id)
+        if item is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+        if item["status"] != "pending":
+            return jsonify({"ok": False, "error": f"already {item['status']}"}), 409
+        item["reply_en"] = english_reply
+        item["reply"] = german_reply
+        item["translated_from_english"] = True
+    _bump_state()
+    return jsonify({"ok": True, "reply_de": german_reply, "reply_en": english_reply})
+
+
 @app.post("/api/requests/<req_id>/approve")
 def approve_request(req_id):
     body = request.get_json(force=True, silent=True) or {}
@@ -1576,8 +2119,60 @@ def approve_request(req_id):
         )
         r["status"] = "approved"
         r["decided_at"] = _now()
+        r["send_started_at"] = None
+        r["error"] = None
     _bump_state()
     return jsonify({"ok": True})
+
+
+@app.post("/api/requests/<req_id>/cancel-send")
+def cancel_approved_send(req_id):
+    """Return an approved, not-yet-claimed reply to manual review.
+
+    The bot polls this state during its human-like send delay. Moving the
+    request back to ``pending`` stops that countdown and makes the same card,
+    with the last approved German text, editable again.
+    """
+    with _lock:
+        r = _requests.get(req_id)
+        if not r:
+            return jsonify({"error": "not found"}), 404
+        if r["status"] != "approved":
+            return jsonify({"error": f"cannot cancel send from {r['status']}"}), 409
+        r["reply"] = r.get("final_reply") or r["reply"]
+        # The old translation may no longer match an edited German reply.
+        r["reply_en"] = ""
+        r["status"] = "pending"
+        r["auto"] = False
+        r["decided_at"] = None
+        r["send_started_at"] = None
+        r["send_cancelled_at"] = _now()
+        r["send_cancel_revision"] = int(r.get("send_cancel_revision") or 0) + 1
+        r["error"] = None
+    _bump_state()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/requests/<req_id>/sending")
+def claim_request_send(req_id):
+    """Atomically commit an approved reply to the platform Send click.
+
+    ``Cancel send`` is accepted only before this transition. This lock-backed
+    claim removes the final timer/cancel race across dashboard and bot
+    processes.
+    """
+    with _lock:
+        r = _requests.get(req_id)
+        if not r:
+            return jsonify({"error": "not found"}), 404
+        if r["status"] == "sending":
+            return jsonify({"ok": True, "final_reply": r.get("final_reply")})
+        if r["status"] != "approved":
+            return jsonify({"error": f"cannot start send from {r['status']}"}), 409
+        r["status"] = "sending"
+        r["send_started_at"] = _now()
+    _bump_state()
+    return jsonify({"ok": True, "final_reply": r.get("final_reply")})
 
 
 @app.post("/api/requests/<req_id>/reject")
@@ -1637,7 +2232,8 @@ def skip_request(req_id):
         if r["status"] != "pending":
             return jsonify({"error": f"already {r['status']}"}), 409
         platform = (r.get("platform") or "").strip().lower()
-        if platform not in SKIPPABLE_APPROVAL_PLATFORMS:
+        platform_type = _platform_type_for_runtime_name(platform)
+        if platform_type not in SKIPPABLE_APPROVAL_PLATFORMS:
             return jsonify({
                 "error": "Skip conversation is only available for Xkuss, Justlo, Linduu, and Gnoxx"
             }), 400
@@ -1658,6 +2254,8 @@ def mark_request_skipped(req_id):
         r = _requests.get(req_id)
         if not r:
             return jsonify({"error": "not found"}), 404
+        if r["status"] == result:
+            return jsonify({"ok": True})
         if r["status"] != "skip_requested":
             return jsonify({"error": f"cannot mark skipped from {r['status']}"}), 409
         r["status"] = result
@@ -1670,9 +2268,14 @@ def mark_request_skipped(req_id):
 def mark_sent(req_id):
     with _lock:
         r = _requests.get(req_id)
-        if r:
-            r["status"] = "sent"
-            r["sent_at"] = _now()
+        if not r:
+            return jsonify({"error": "not found"}), 404
+        if r["status"] == "sent":
+            return jsonify({"ok": True})
+        if r["status"] not in ("approved", "sending"):
+            return jsonify({"error": f"cannot mark sent from {r['status']}"}), 409
+        r["status"] = "sent"
+        r["sent_at"] = _now()
     _bump_state()
     return jsonify({"ok": True})
 
@@ -1682,10 +2285,15 @@ def mark_failed(req_id):
     body = request.get_json(force=True, silent=True) or {}
     with _lock:
         r = _requests.get(req_id)
-        if r:
-            r["status"] = "failed"
-            r["error"] = body.get("error") or ""
-            r["sent_at"] = _now()
+        if not r:
+            return jsonify({"error": "not found"}), 404
+        if r["status"] == "failed":
+            return jsonify({"ok": True})
+        if r["status"] not in ("approved", "sending"):
+            return jsonify({"error": f"cannot mark failed from {r['status']}"}), 409
+        r["status"] = "failed"
+        r["error"] = body.get("error") or ""
+        r["sent_at"] = _now()
     _bump_state()
     return jsonify({"ok": True})
 
@@ -1716,6 +2324,7 @@ def update_status():
             "retry_count": retry_count,
             "warning": body.get("warning") or "",
             "checkpoint": body.get("checkpoint") or "",
+            "cancellable_send": bool(body.get("cancellable_send")),
             "updated_at": _now(),
         }
         _status[platform] = current
@@ -1929,13 +2538,19 @@ def control_command():
     target = (body.get("target") or "all").strip().lower()
     if not cmd:
         return jsonify({"ok": False, "error": "cmd is required"}), 400
-    if target != "all" and target not in PLATFORM_BY_SLUG:
+    if target != "all" and target not in PLATFORM_BY_SLUG and get_account(target) is None:
         return jsonify({"ok": False, "error": f"unknown platform '{target}'"}), 404
     if cmd == "pools" and target not in {"justlo", "linduu", "gnoxx"}:
         return jsonify({
             "ok": False,
             "error": "Pools is available only for Justlo, Linduu, and Gnoxx",
         }), 400
+
+    # Keep Stop identical on the Approval Queue and Bots pages: both stop the
+    # worker, close only this bot's dedicated Chrome session, and cancel cards
+    # that the stopped worker can no longer finish.
+    if cmd == "stop" and target != "all":
+        return bots_stop(target)
 
     # Pause flags are deliberately file-based inside every worker, so the web
     # app can control them even when the optional launcher API is offline.
@@ -2001,9 +2616,6 @@ def control_command():
             return jsonify({"ok": True, "output": output})
         except Exception as error:
             return jsonify({"ok": False, "error": f"{cmd.title()} failed: {error}"}), 500
-
-    if not control_available and cmd == "stop" and target != "all":
-        return bots_stop(target)
 
     try:
         r = httpx.post(
@@ -2262,7 +2874,9 @@ _PAGE = """<!doctype html>
     border: 1px dashed var(--border); border-radius: var(--radius); font-size: 13px;
   }
 
-  .cards-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 14px; }
+  /* Approval cards belong to the full platform container. A two-column auto-fill
+     left a single pending card stranded at half width on large screens. */
+  .cards-grid { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; gap: 14px; }
 
   .card {
     background: var(--card); border: 1px solid var(--border);
@@ -2288,6 +2902,7 @@ _PAGE = """<!doctype html>
   .time { color: var(--muted-foreground); font-size: 12px; margin-left: auto; }
   .status-badge { font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 3px 8px; border-radius: 6px; letter-spacing: .03em; }
   .status-badge.approved, .status-badge.sent { background: rgba(34,197,94,.15); color: var(--success); }
+  .status-badge.sending { background: rgba(56,189,248,.15); color: var(--info); }
   .status-badge.rejected, .status-badge.failed { background: rgba(239,68,68,.15); color: var(--destructive); }
   .status-badge.cancelled { background: rgba(161,161,170,.18); color: var(--muted-foreground); }
   .status-badge.skip_requested, .status-badge.skipped, .status-badge.transferred { background: rgba(249,115,22,.16); color: #fb923c; }
@@ -2367,7 +2982,9 @@ _PAGE = """<!doctype html>
   }
   .field-label:first-of-type { margin-top: 0; }
   .field-label.customer-label { color: var(--info); }
-  .field-label.reply-label { color: var(--violet); }
+  .field-label.reply-label {
+    color: var(--info); font-size: 12px; letter-spacing: .065em; margin: 0;
+  }
   .lang-tag {
     display: inline-block; font-size: 9.5px; font-weight: 700;
     border-radius: 4px; padding: 0 5px; margin-left: 6px;
@@ -2387,6 +3004,46 @@ _PAGE = """<!doctype html>
     color: var(--info); opacity: .85; font-style: italic; font-size: 12.5px;
     white-space: pre-wrap; flex: 1;
   }
+  .translation-editor { flex: 1; min-width: 0; }
+  textarea.translation-input {
+    width: 100%; min-height: 76px; resize: vertical; background: rgba(56,189,248,.055);
+    color: var(--foreground); border: 1px solid rgba(56,189,248,.3); border-radius: 8px;
+    padding: 9px 10px; font: inherit; font-size: 13px;
+  }
+  textarea.translation-input:focus {
+    outline: none; border-color: var(--info); box-shadow: 0 0 0 3px rgba(56,189,248,.13);
+  }
+  .translation-actions { display: flex; align-items: center; gap: 8px; margin-top: 7px; flex-wrap: wrap; }
+  .btn-translate { background: rgba(56,189,248,.14); color: var(--info); border-color: rgba(56,189,248,.38); }
+  .primary-action-stack { display: flex; flex-direction: column; gap: 6px; }
+  .primary-action-stack .btn-translate { min-height: 32px; }
+
+  .reply-composer {
+    position: relative; overflow: hidden; padding: 14px;
+    border: 1px solid rgba(56,189,248,.28); border-radius: 12px;
+    background: linear-gradient(145deg, rgba(56,189,248,.055), rgba(24,24,27,.34));
+  }
+  .reply-composer::before {
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+    background: var(--info);
+  }
+  .reply-composer-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 8px;
+  }
+  .reply-composer-head .lang-tag { margin-left: 0; flex: none; }
+  .reply-language-section + .reply-language-section {
+    margin-top: 13px; padding-top: 13px; border-top: 1px solid var(--border);
+  }
+  .reply-language-label {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-bottom: 7px;
+  }
+  .reply-language-title {
+    color: var(--muted-foreground); font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .055em;
+  }
+  .reply-composer .translation-editor { width: 100%; }
 
   .extracted-data { margin-top: 12px; }
   .extracted-data summary {
@@ -2396,7 +3053,6 @@ _PAGE = """<!doctype html>
   .extracted-data summary::-webkit-details-marker { display: none; }
   .extracted-data summary::before { content: "▸ "; }
   .extracted-data[open] summary::before { content: "▾ "; }
-  .extracted-data summary .hint-inline { color: var(--muted-foreground); text-transform: none; font-weight: 400; letter-spacing: 0; }
   .profile-cols { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
   .profile-col { flex: 1 1 220px; min-width: 220px; }
   .profile-col .field-label { margin: 0 0 4px; color: var(--muted-foreground); }
@@ -2429,7 +3085,6 @@ _PAGE = """<!doctype html>
   .regenerate-options[open] .regenerate-chevron { transform: rotate(90deg); }
   .regenerate-summary-copy { display: grid; gap: 1px; min-width: 0; }
   .regenerate-summary-copy strong { font-size: 12.5px; }
-  .regenerate-summary-copy small { color: var(--muted-foreground); font-weight: 400; }
   .instruction-state { margin-left: auto; flex: none; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted-foreground); font-size: 10px; font-weight: 700; }
   .instruction-state.ready { color: var(--info); border-color: rgba(56,189,248,.35); background: rgba(56,189,248,.08); }
   .regenerate-body { padding: 2px 11px 11px; border-top: 1px solid var(--border); }
@@ -2446,7 +3101,45 @@ _PAGE = """<!doctype html>
   .instruction-tools { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
   .instruction-tools .char-count { margin-left: auto; color: var(--muted-foreground); font-size: 10.5px; }
   .instruction-footer { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-  .btn-exact { background: rgba(56,189,248,.1); color: var(--info); border-color: rgba(56,189,248,.38); }
+  .instruction-prompt-menu { position: relative; min-width: min(100%, 280px); }
+  .instruction-prompt-trigger {
+    width: 100%; min-height: 38px; display: flex; align-items: center;
+    justify-content: space-between; gap: 10px; padding: 8px 10px 8px 12px;
+    border: 1px solid var(--input); border-radius: 7px; background: var(--background);
+    color: var(--foreground); font-size: 12px; font-weight: 600; text-align: left;
+  }
+  .instruction-prompt-trigger:hover { background: var(--accent); }
+  .instruction-prompt-trigger:focus-visible {
+    outline: 2px solid var(--ring); outline-offset: 2px;
+  }
+  .instruction-prompt-trigger svg { width: 15px; height: 15px; flex: none; color: var(--muted-foreground); transition: transform .15s ease; }
+  .instruction-prompt-trigger[aria-expanded="true"] svg { transform: rotate(180deg); }
+  .instruction-prompt-content {
+    position: absolute; z-index: 30; left: 0; top: calc(100% + 5px);
+    width: min(390px, calc(100vw - 48px)); max-height: 280px; overflow-y: auto;
+    padding: 5px; border: 1px solid var(--border); border-radius: 8px;
+    background: #18181b; color: var(--foreground);
+    box-shadow: 0 12px 32px rgba(0,0,0,.48), 0 0 0 1px rgba(255,255,255,.025);
+  }
+  .instruction-prompt-content[hidden] { display: none; }
+  .instruction-prompt-option {
+    width: 100%; display: grid; grid-template-columns: 18px minmax(0,1fr);
+    align-items: start; gap: 8px; padding: 8px; border: 0; border-radius: 5px;
+    background: transparent; color: var(--foreground); text-align: left;
+  }
+  .instruction-prompt-option:hover, .instruction-prompt-option:focus-visible { background: var(--accent); outline: none; }
+  .instruction-prompt-check { color: var(--info); opacity: 0; font-size: 13px; line-height: 1.35; }
+  .instruction-prompt-option:hover .instruction-prompt-check,
+  .instruction-prompt-option:focus-visible .instruction-prompt-check { opacity: 1; }
+  .instruction-prompt-copy { min-width: 0; display: grid; gap: 2px; }
+  .instruction-prompt-name { font-size: 12px; font-weight: 700; }
+  .instruction-prompt-preview {
+    color: var(--muted-foreground); font-size: 10.5px; font-weight: 400;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .instruction-prompt-empty { padding: 11px 10px; color: var(--muted-foreground); font-size: 11.5px; text-align: center; }
+  .instruction-prompt-empty a { display: block; margin-top: 7px; color: var(--info); font-weight: 700; text-decoration: none; }
+  .card.prompt-menu-open, .card.prompt-menu-open .regenerate-options[open] { overflow: visible; }
   .btn-regenerate-guided { background: var(--destructive); color: white; margin-left: auto; }
   .keyboard-hint { color: var(--muted-foreground); font-size: 10.5px; }
 
@@ -2476,6 +3169,10 @@ _PAGE = """<!doctype html>
   .history-reply { font-size: 13px; white-space: pre-wrap; }
   .history-en { color: var(--info); opacity: .8; font-style: italic; font-size: 12px; margin-top: 3px; white-space: pre-wrap; }
   .history-error { color: var(--destructive); font-size: 12px; margin-top: 5px; }
+  .history-send-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border); }
+  .history-send-note { color: var(--warning); font-size: 11.5px; }
+  .btn-cancel-send { flex: none; padding: 7px 11px; border: 1px solid rgba(239,68,68,.4); border-radius: 7px; background: rgba(239,68,68,.1); color: #f87171; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
+  .btn-cancel-send:hover:not(:disabled) { background: rgba(239,68,68,.18); }
 
   /* ── Bot controls (restart/fix/etc — proxied to launch_all.py) ──────── */
   .system-ctrl-box {
@@ -2490,6 +3187,8 @@ _PAGE = """<!doctype html>
   .btn-pause { background: var(--primary); color: #fff; }
   .btn-pause.paused { background: var(--success); color: #052e16; }
   .btn-pause:disabled { opacity: .55; cursor: default; }
+  .btn-stop-all { background: var(--destructive); color: white; border-color: var(--destructive) !important; }
+  .btn-stop-all:disabled { opacity: .55; cursor: default; }
   .system-ctrl-status { color: var(--muted-foreground); font-size: 12.5px; }
   .ctrl-unavailable {
     color: var(--muted-foreground); font-size: 12px; background: var(--muted);
@@ -2665,7 +3364,7 @@ _PAGE = """<!doctype html>
 
     .platform-head h2 { font-size: 14.5px; }
 
-    .btn-money, .btn-pause { min-height: 44px; }
+    .btn-money, .btn-pause, .btn-stop-all { min-height: 44px; }
     .system-ctrl-actions { align-items: stretch; flex-direction: column; }
     .system-ctrl-status { overflow-wrap: anywhere; }
     .earnings-dialog { place-items: end center; padding: 10px; }
@@ -2684,8 +3383,9 @@ _PAGE = """<!doctype html>
     /* iOS Safari auto-zooms the page when a focused input's font is under
        16px — keep the textarea at 16px so approving on a phone doesn't
        trigger an unwanted zoom-in. */
-    textarea.reply-input, textarea.instruction-input { font-size: 16px; min-height: 100px; }
-    .instruction-tools .btn-exact, .instruction-footer .btn-regenerate-guided { width: 100%; min-height: 44px; }
+    textarea.reply-input, textarea.translation-input, textarea.instruction-input { font-size: 16px; min-height: 100px; }
+    .instruction-tools .instruction-prompt-menu, .instruction-footer .btn-regenerate-guided { width: 100%; max-width: none; min-height: 44px; }
+    .instruction-prompt-trigger { min-height: 44px; }
     .instruction-tools .char-count { margin-left: 0; }
     .btn-regenerate-guided { margin-left: 0; order: -1; }
 
@@ -3066,6 +3766,7 @@ _PAGE = """<!doctype html>
   .btn-pause { background: var(--primary); color: #fff; }
   .btn-pause.paused { background: var(--success); color: #052e16; }
   .btn-money { background: var(--foreground); color: var(--background); }
+  .btn-stop-all { background: var(--destructive); color: white; }
   button:hover:not(:disabled) { transform: none; box-shadow: none; filter: brightness(1.08); }
   .platform-section { margin-bottom: 32px; }
   .platform-head { margin-bottom: 10px; }
@@ -3178,6 +3879,8 @@ _PAGE = """<!doctype html>
     </a>
     <a href="/bots" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M9 12h.01M15 12h.01M9 16h6M12 7V4"/></svg></span><span>Bots</span></a>
     <a href="/settings" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"/></svg></span><span>Settings</span></a>
+    <a href="/judge-prompt" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h11l5 5v11H4z"/><path d="M15 4v5h5M8 14h8M8 17h6"/></svg></span><span>Judge Prompt</span></a>
+    <a href="/instruction-prompts" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span><span>Instruction Prompts</span></a>
     <a href="/api-keys" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M15 8l2 2M17 6l2 2"/></svg></span><span>API Keys</span></a>
   </nav>
   <div class="sidebar-controls">
@@ -3224,6 +3927,7 @@ _PAGE = """<!doctype html>
       <button class="btn-pause" id="globalPauseBtn" onclick="toggleGlobalPause()" disabled>⏸ Pause all bots</button>
       <span class="system-ctrl-status" id="globalPauseStatus"></span>
       <button class="btn-money" id="checkinAllBtn" onclick="runCheckinAll()">Calculate earnings</button>
+      <button class="btn-stop-all" id="stopEverythingBtn" onclick="stopEverything()">Stop everything</button>
       <span class="system-ctrl-status" id="checkinAllStatus"></span>
     </div>
     <div class="earnings-dialog" id="checkinAllOutput" hidden onclick="if(event.target===this) closeEarningsDialog()">
@@ -3269,7 +3973,7 @@ _PAGE = """<!doctype html>
       </section>
     </div>
     <div class="ctrl-unavailable" id="ctrlUnavailableNote" style="display:none">
-      Advanced launcher controls are offline. Pause, Resume, Fix, Chameleon, Extractor, Pools, Stop, and Check-in All still work from the web app; Restart requires the launcher.
+      Advanced launcher controls are offline. Pause, Resume, Fix, Pools, Stop, and Check-in All still work from the web app; Restart requires the launcher.
     </div>
   </div>
 
@@ -3389,9 +4093,13 @@ const slug = (s) => "plat-" + (s || "unknown").toLowerCase().replace(/[^a-z0-9]+
 // Edits the reviewer has typed are kept here (keyed by request id) so a
 // background refresh can never silently wipe out in-progress wording changes.
 const editedReplies = new Map();
+// The English translation is editable too. Keep drafts across live refreshes
+// exactly like the authoritative German reply.
+const editedEnglishReplies = new Map();
 // One-shot Chameleon instructions need the same protection from live card
 // refreshes as edits to the proposed reply.
 const regenerationInstructions = new Map();
+let instructionPrompts = [];
 // Live snapshots rebuild cards. Persist disclosure state separately so an
 // open Extracted data panel never collapses just because telemetry refreshed.
 const openDisclosurePanels = new Set();
@@ -3404,6 +4112,7 @@ document.addEventListener("toggle", (event) => {
   else openDisclosurePanels.delete(key);
 }, true);
 let knownPlatforms = [];
+const platformSlugMap = new Map();
 let currentMode = "manual";
 let serviceWorkerRegistration = null;
 let currentPushSubscription = null;
@@ -3715,6 +4424,7 @@ async function act(id, action, body, btn) {
   }
   if (succeeded) {
     editedReplies.delete(id);
+    editedEnglishReplies.delete(id);
     regenerationInstructions.delete(id);
   }
   refresh();
@@ -3725,19 +4435,132 @@ function approveCard(id, btn) {
   act(id, "approve", { edited_reply: ta ? ta.value : undefined }, btn);
 }
 
-function insertSayExactly(id) {
+async function translateEnglishToGerman(id, btn) {
+  const englishInput = document.getElementById(`en-ta-${id}`);
+  const englishReply = englishInput ? englishInput.value.trim() : "";
+  if (!englishReply) {
+    toast("Enter an English reply first", { type: "warning" });
+    englishInput?.focus();
+    return;
+  }
+  const card = document.querySelector(`.card[data-id="${id}"]`);
+  const buttons = card ? card.querySelectorAll(".actions button, .regenerate-body button, .btn-translate") : [];
+  buttons.forEach(button => { button.disabled = true; });
+  const original = btn.innerHTML;
+  btn.innerHTML = '<span class="spinner"></span> Translating…';
+  try {
+    const response = await fetch(`/api/requests/${id}/translate-to-german`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ english_reply: englishReply }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const germanInput = document.getElementById(`ta-${id}`);
+    if (germanInput) germanInput.value = data.reply_de;
+    if (englishInput) englishInput.value = data.reply_en;
+    editedReplies.set(id, data.reply_de);
+    editedEnglishReplies.set(id, data.reply_en);
+    toast("German reply updated", {
+      type: "success",
+      detail: "Review it, then click Approve & Send when ready.",
+      duration: 3500,
+    });
+  } catch (error) {
+    toast("Could not translate with Mistral", {
+      type: "error",
+      detail: String(error.message || error),
+      duration: 6000,
+    });
+  } finally {
+    buttons.forEach(button => { button.disabled = false; });
+    btn.innerHTML = original;
+  }
+}
+
+function applyInstructionPrompt(id, promptId) {
+  const saved = instructionPrompts.find(item => item.id === promptId);
+  if (!saved) return;
   const input = document.getElementById(`instruction-${id}`);
   if (!input) return;
-  const prefix = '!important say exactly "';
-  const current = input.value.trim();
-  input.value = current.startsWith(prefix)
-    ? (current.endsWith('"') ? current : `${current}"`)
-    : `${prefix}${current}"`;
+  input.value = saved.prompt;
   updateInstructionDraft(id, input.value);
+  closeInstructionPromptMenus();
   input.focus();
-  const cursor = input.value.endsWith('"') ? input.value.length - 1 : input.value.length;
+  const cursor = input.value.length;
   input.setSelectionRange(cursor, cursor);
+  toast(`Instruction loaded: ${saved.name}`, { type: "info" });
 }
+
+function instructionPromptMenuItems(id) {
+  if (!instructionPrompts.length) {
+    return '<div class="instruction-prompt-empty">No saved prompts found.<a href="/instruction-prompts">Add an instruction prompt</a></div>';
+  }
+  return instructionPrompts
+    .map(item => `
+      <button type="button" class="instruction-prompt-option" role="option"
+        onclick="applyInstructionPrompt('${id}', '${escapeHtml(item.id)}')">
+        <span class="instruction-prompt-check" aria-hidden="true">✓</span>
+        <span class="instruction-prompt-copy">
+          <span class="instruction-prompt-name">${escapeHtml(item.name)}</span>
+          <span class="instruction-prompt-preview">${escapeHtml(item.prompt)}</span>
+        </span>
+      </button>`)
+    .join("");
+}
+
+async function loadInstructionPrompts() {
+  try {
+    const response = await fetch("/api/instruction-prompts", { cache: "no-store" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    instructionPrompts = Array.isArray(data.prompts) ? data.prompts : [];
+    return true;
+  } catch (error) {
+    console.warn("Could not load instruction prompts", error);
+    return false;
+  }
+}
+
+function closeInstructionPromptMenus(exceptId = "") {
+  document.querySelectorAll(".instruction-prompt-content").forEach(menu => {
+    if (menu.id === exceptId) return;
+    menu.hidden = true;
+    const trigger = menu.previousElementSibling;
+    if (trigger) trigger.setAttribute("aria-expanded", "false");
+    menu.closest(".card")?.classList.remove("prompt-menu-open");
+  });
+}
+
+async function toggleInstructionPromptMenu(id, trigger) {
+  const menu = document.getElementById(`prompt-menu-${id}`);
+  if (!menu) return;
+  const opening = menu.hidden;
+  closeInstructionPromptMenus(opening ? menu.id : "");
+  if (!opening) {
+    menu.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.closest(".card")?.classList.remove("prompt-menu-open");
+    return;
+  }
+  trigger.setAttribute("aria-expanded", "true");
+  trigger.closest(".card")?.classList.add("prompt-menu-open");
+  menu.hidden = false;
+  menu.innerHTML = '<div class="instruction-prompt-empty">Loading prompts…</div>';
+  const loaded = await loadInstructionPrompts();
+  if (!trigger.isConnected || trigger.getAttribute("aria-expanded") !== "true") return;
+  menu.innerHTML = loaded
+    ? instructionPromptMenuItems(id)
+    : '<div class="instruction-prompt-empty">Could not load prompts. Please try again.</div>';
+  menu.querySelector("button")?.focus({ preventScroll: true });
+}
+
+document.addEventListener("pointerdown", event => {
+  if (!event.target.closest(".instruction-prompt-menu")) closeInstructionPromptMenus();
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") closeInstructionPromptMenus();
+});
 
 function updateInstructionDraft(id, value) {
   regenerationInstructions.set(id, value);
@@ -3814,7 +4637,11 @@ let liveStatus = {}; // platform -> {state, detail, updated_at}
 
 function detectorFor(name) {
   const s = liveStatus[name];
-  const platformSlug = name.toLowerCase();
+  // Additional accounts report telemetry with their human-readable label,
+  // while the process APIs key them by their generated account id. Resolve
+  // both built-in and added accounts through /api/platforms before deciding
+  // whether a detector is live.
+  const platformSlug = platformSlugMap.get(name) || name.toLowerCase();
   const launcherProcess = controlsAvailable ? controlPlatformState[platformSlug] : null;
   const process = launcherProcess || botProcessState[platformSlug] || null;
   const processRunning = process && (process.state === "running" || process.running === true);
@@ -3831,7 +4658,7 @@ function detectorFor(name) {
   // a vague "Running" state while the launcher still confirms the process.
   if (processStopped) {
     const label = process.state === "dead" ? "Process stopped" : "Stopped";
-    return { live: false, label, color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "" };
+    return { live: false, label, color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "", cancellableSend: false };
   }
   if (processRunning && process.paused) {
     const pauseConfirmed = telemetryFresh && s.state === "paused";
@@ -3839,7 +4666,7 @@ function detectorFor(name) {
       live: true, label: pauseConfirmed ? "Paused" : "Pause requested", color: "var(--warning)",
       detail: pauseConfirmed ? "Paused at a safe checkpoint" : "Will pause at the next safe checkpoint",
       state: "paused",
-      retryCount: 0, warning: "", checkpoint: "paused",
+      retryCount: 0, warning: "", checkpoint: "paused", cancellableSend: !!s?.cancellable_send,
     };
   }
   if (processRunning && s && !telemetryFresh) {
@@ -3848,23 +4675,23 @@ function detectorFor(name) {
     return {
       live: true, label: meta.label, color: meta.color,
       detail: `${s.detail || meta.label} · last update ${age}; process is online`, state: s.state,
-      retryCount: Number(s.retry_count || 0), warning: s.warning || "", checkpoint: s.checkpoint || "",
+      retryCount: Number(s.retry_count || 0), warning: s.warning || "", checkpoint: s.checkpoint || "", cancellableSend: !!s.cancellable_send,
     };
   }
   if (processRunning && !s) {
     return {
       live: true, label: "Running", color: "var(--success)",
       detail: "Bot process is online; waiting for its first workflow update", state: "starting",
-      retryCount: 0, warning: "", checkpoint: "",
+      retryCount: 0, warning: "", checkpoint: "", cancellableSend: false,
     };
   }
   if (!telemetryFresh) {
-    return { live: false, label: "Offline", color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "" };
+    return { live: false, label: "Offline", color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "", cancellableSend: false };
   }
   const meta = STATE_META[s.state] || { label: s.state, color: "var(--info)" };
   return {
     live: true, label: meta.label, color: meta.color, detail: s.detail || "", state: s.state,
-    retryCount: Number(s.retry_count || 0), warning: s.warning || "", checkpoint: s.checkpoint || "",
+    retryCount: Number(s.retry_count || 0), warning: s.warning || "", checkpoint: s.checkpoint || "", cancellableSend: !!s.cancellable_send,
   };
 }
 
@@ -3910,6 +4737,7 @@ function colorFor(name) {
 let controlsAvailable = false;
 let checkinAllRunning = false;
 let globalPauseRunning = false;
+let stopAllRunning = false;
 let controlPlatformState = {}; // slug -> {state, uptime, crashes, exit_code}
 let botProcessState = {}; // dashboard-managed bot Popen/CDP state from /api/bots/status
 // Last command output per platform, kept here (not just in the DOM) because
@@ -3927,7 +4755,7 @@ function updateGlobalPauseControl() {
   btn.dataset.action = allPaused ? "resume" : "pause";
   btn.textContent = allPaused ? "▶ Resume all bots" : "⏸ Pause all bots";
   btn.classList.toggle("paused", allPaused);
-  btn.disabled = globalPauseRunning || !active.length;
+  btn.disabled = globalPauseRunning || stopAllRunning || !active.length;
   status.textContent = !active.length
     ? "No bots running"
     : allPaused
@@ -3974,11 +4802,65 @@ async function toggleGlobalPause() {
   }
 }
 
+async function stopEverything() {
+  const btn = document.getElementById("stopEverythingBtn");
+  if (!btn || btn.disabled) return;
+  const confirmed = await showConfirm(
+    "Stop everything?",
+    "This stops every bot, closes every bot Chrome session, and cancels pending approvals. The dashboard stays online so you can start individual bots again.",
+    { confirmLabel: "Stop everything", danger: true },
+  );
+  if (!confirmed) return;
+
+  stopAllRunning = true;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Stopping everything…';
+  document.getElementById("checkinAllBtn").disabled = true;
+  updateGlobalPauseControl();
+  const dismiss = toast("Stopping every bot and Chrome session…", { type: "warning", duration: 0 });
+  try {
+    const response = await fetch("/api/bots/stop-all", { method: "POST" });
+    const data = await response.json().catch(() => ({}));
+    dismiss();
+    if (!response.ok || !data.ok) {
+      const failed = Array.isArray(data.failures)
+        ? data.failures.map(item => `${item.target}: ${item.error}`).join(" · ")
+        : "";
+      toast("Could not stop everything completely", {
+        type: "error",
+        detail: failed || data.error || `HTTP ${response.status}`,
+        duration: 8000,
+      });
+      return;
+    }
+    for (const state of Object.values(botProcessState)) {
+      if (!state) continue;
+      state.state = "stopped";
+      state.running = false;
+      state.paused = false;
+      state.browser_open = false;
+    }
+    toast("Everything stopped", {
+      type: "success",
+      detail: `${data.stopped_count || 0} bots stopped and Chrome sessions closed. You can start individual bots from the Bots page.`,
+      duration: 5000,
+    });
+  } catch (error) {
+    dismiss();
+    toast("Could not stop everything", { type: "error", detail: String(error.message || error) });
+  } finally {
+    stopAllRunning = false;
+    btn.disabled = false;
+    btn.textContent = "Stop everything";
+    document.getElementById("checkinAllBtn").disabled = checkinAllRunning;
+    updateGlobalPauseControl();
+    refresh();
+  }
+}
+
 const CTRL_BUTTONS = [
   { cmd: "restart",   label: "Restart" },
   { cmd: "fix",       label: "Fix" },
-  { cmd: "chameleon", label: "Chameleon" },
-  { cmd: "extractor", label: "Extractor" },
   { cmd: "stop",      label: "Stop", cls: "danger" },
 ];
 const POOLS_PLATFORMS = new Set(["justlo", "linduu", "gnoxx"]);
@@ -4007,8 +4889,7 @@ function fmtUptime(seconds) {
 }
 
 const CTRL_VERBS = {
-  restart: "Restarting", fix: "Running Fix on", chameleon: "Opening Chameleon tab for",
-  extractor: "Opening Extractor tab for", pools: "Opening Pools for", stop: "Stopping",
+  restart: "Restarting", fix: "Running Fix on", pools: "Opening Pools for", stop: "Stopping",
 };
 
 async function runControl(btn, slug, cmd) {
@@ -4222,7 +5103,7 @@ function extractedDataHtml(r) {
   const disclosureKey = `extracted:${r.id}`;
   return `
     <details class="extracted-data" data-ui-key="${disclosureKey}" ${openDisclosurePanels.has(disclosureKey) ? "open" : ""}>
-      <summary>Extracted data <span class="hint-inline">— review before approving</span></summary>
+      <summary>Extracted data</summary>
       <div class="profile-cols">
         <div class="profile-col">
           <div class="field-label">Client data</div>
@@ -4302,6 +5183,7 @@ function conversationAnalysisHtml(r) {
 
 function pendingCardHtml(r) {
   const val = editedReplies.has(r.id) ? editedReplies.get(r.id) : r.reply;
+  const englishVal = editedEnglishReplies.has(r.id) ? editedEnglishReplies.get(r.id) : (r.reply_en || "");
   const instruction = regenerationInstructions.get(r.id) || "";
   const pc = colorFor(r.platform);
   const lastMessage = r.last_message || r.customer_message || "";
@@ -4331,12 +5213,27 @@ function pendingCardHtml(r) {
         ${judgePanelHtml(r)}
       </div>
       <div class="card-divider"></div>
-      <div class="field-label reply-label">Proposed reply <span class="lang-tag tag-de">DE · editable</span></div>
-      <textarea class="reply-input" id="ta-${r.id}"
-        oninput="editedReplies.set('${r.id}', this.value)">${escapeHtml(val)}</textarea>
-      <div class="translation-row">
-        <span class="lang-tag tag-en">EN</span>
-        <span class="en-box">${r.reply_en ? escapeHtml(r.reply_en) : "(translation unavailable)"}</span>
+      <div class="reply-composer">
+        <div class="reply-composer-head">
+          <div class="field-label reply-label">Proposed reply</div>
+          <span class="lang-tag tag-de">DE · editable</span>
+        </div>
+        <div class="reply-language-section">
+          <textarea class="reply-input" id="ta-${r.id}" aria-label="German reply that will be sent"
+            oninput="editedReplies.set('${r.id}', this.value)">${escapeHtml(val)}</textarea>
+        </div>
+        <div class="reply-language-section">
+          <div class="reply-language-label">
+            <span class="reply-language-title">English translation</span>
+            <span class="lang-tag tag-en">EN · editable</span>
+          </div>
+          <div class="translation-editor">
+            <textarea class="translation-input" id="en-ta-${r.id}"
+              aria-label="Editable English reply" maxlength="8000"
+              placeholder="Write or edit the reply in English…"
+              oninput="editedEnglishReplies.set('${r.id}', this.value)">${escapeHtml(englishVal)}</textarea>
+          </div>
+        </div>
       </div>
       ${extractedDataHtml(r)}
       <details class="regenerate-options" data-ui-key="instruction:${r.id}" ${openDisclosurePanels.has(`instruction:${r.id}`) ? "open" : ""}>
@@ -4344,7 +5241,6 @@ function pendingCardHtml(r) {
           <span class="regenerate-chevron" aria-hidden="true">›</span>
           <span class="regenerate-summary-copy">
             <strong>Guide the next reply</strong>
-            <small>Add an optional instruction before regenerating in Chameleon</small>
           </span>
           <span class="instruction-state ${instruction.trim() ? "ready" : ""}" id="instruction-state-${r.id}">${instruction.trim() ? "Ready" : "Optional"}</span>
         </summary>
@@ -4356,21 +5252,30 @@ function pendingCardHtml(r) {
             oninput="updateInstructionDraft('${r.id}', this.value)"
             onkeydown="handleInstructionKeydown(event, '${r.id}', 'guided-regenerate-${r.id}')">${escapeHtml(instruction)}</textarea>
           <div class="instruction-tools">
-            <button type="button" class="btn-exact" onmousedown="event.preventDefault()" onclick="insertSayExactly('${r.id}')">Say exactly (English → German)</button>
+            <div class="instruction-prompt-menu">
+              <button type="button" class="instruction-prompt-trigger" aria-haspopup="listbox" aria-expanded="false"
+                aria-controls="prompt-menu-${r.id}" onclick="toggleInstructionPromptMenu('${r.id}', this)">
+                <span>Choose a saved prompt</span>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+              <div class="instruction-prompt-content" id="prompt-menu-${r.id}" role="listbox" hidden></div>
+            </div>
             <span class="char-count" id="instruction-count-${r.id}">${instruction.length} / 4000</span>
           </div>
           <div class="instruction-footer">
-            <span class="keyboard-hint" id="instruction-help-${r.id}">The shortcut wraps your English in <code>!important say exactly &quot;…&quot;</code>. Press Ctrl/⌘ + Enter to regenerate.</span>
+            <span class="keyboard-hint" id="instruction-help-${r.id}">Choose a saved prompt or write an instruction. Press Ctrl/⌘ + Enter to regenerate.</span>
             <button type="button" class="btn-regenerate-guided" id="guided-regenerate-${r.id}" onclick="regenerateCard('${r.id}', this)">Regenerate in Chameleon</button>
           </div>
         </div>
       </details>
       <div class="actions">
-        <button class="btn-approve" onclick="approveCard('${r.id}', this)">Approve &amp; Send</button>
+        <div class="primary-action-stack">
+          <button class="btn-approve" onclick="approveCard('${r.id}', this)">Approve &amp; Send</button>
+          <button type="button" class="btn-translate" onclick="translateEnglishToGerman('${r.id}', this)">Translate</button>
+        </div>
         <button class="btn-reject" onclick="regenerateCard('${r.id}', this)">Reject &amp; Regenerate</button>
         ${canSkipConversation ? `<button class="btn-skip" onclick="skipConversationCard('${r.id}', '${escapeHtml(r.platform)}', this)">${String(r.platform).toLowerCase() === "xkuss" ? "Skip conversation" : "Transfer / Skip"}</button>` : ""}
         <button class="btn-cancel" onclick="cancelCard('${r.id}', this)">Cancel</button>
-        <span class="hint">Edit the German text above before approving. Transfer / Skip hands the conversation to another online moderator, or skips it when none are available. Cancel abandons this reply and restarts the same chat.</span>
       </div>
     </div>
   `;
@@ -4447,7 +5352,15 @@ function renderSections(pending, autoByPlatform) {
   const order = [...knownPlatforms];
   for (const name of byPlatform.keys()) if (!order.includes(name)) order.push(name);
   if (showAuto) for (const name of autoByPlatform.keys()) if (!order.includes(name)) order.push(name);
-  const runningOrder = order.filter(name => detectorFor(name).live);
+  // A pending approval is authoritative even if process telemetry is stale,
+  // the worker just stopped, or this is a newly-added account whose detector
+  // has not reported yet. Never hide a card merely because its bot looks
+  // offline; the reviewer may still need to approve, cancel, or inspect it.
+  const runningOrder = order.filter(name =>
+    detectorFor(name).live
+    || (byPlatform.get(name) || []).length > 0
+    || (showAuto && (autoByPlatform.get(name) || []).length > 0)
+  );
 
   document.getElementById("sections").innerHTML = runningOrder.length ? runningOrder.map(name => {
     const items = byPlatform.get(name) || [];
@@ -4509,7 +5422,7 @@ function renderSections(pending, autoByPlatform) {
   }).join("");
 
   document.getElementById("statPending").textContent = pending.length;
-  document.getElementById("statPlatforms").textContent = runningOrder.length;
+  document.getElementById("statPlatforms").textContent = order.filter(name => detectorFor(name).live).length;
   const pendingReviewCard = document.getElementById("pendingReviewCard");
   pendingReviewCard.disabled = !pending.length;
   pendingReviewCard.setAttribute("aria-label", pending.length
@@ -4522,6 +5435,7 @@ function renderSections(pending, autoByPlatform) {
   // Drop edit-buffers for requests that are no longer pending (decided elsewhere).
   const stillPending = new Set(pending.map(r => r.id));
   for (const id of [...editedReplies.keys()]) if (!stillPending.has(id)) editedReplies.delete(id);
+  for (const id of [...editedEnglishReplies.keys()]) if (!stillPending.has(id)) editedEnglishReplies.delete(id);
   for (const id of [...regenerationInstructions.keys()]) if (!stillPending.has(id)) regenerationInstructions.delete(id);
   for (const key of [...openDisclosurePanels]) {
     if (key.startsWith("extracted:") && !stillPending.has(key.slice("extracted:".length))) {
@@ -4533,7 +5447,7 @@ function renderSections(pending, autoByPlatform) {
 function historyCardHtml(r) {
   const skipState = r.status === "skip_requested" || r.status === "skipped" || r.status === "transferred";
   return `
-    <div class="history-card" style="--pc:${colorFor(r.platform)}">
+    <div class="history-card" data-id="${r.id}" style="--pc:${colorFor(r.platform)}">
       <div class="card-head">
         <span class="badge">${escapeHtml(r.platform)}</span>
         <span class="status-badge ${r.status}">${r.status}</span>
@@ -4550,8 +5464,37 @@ function historyCardHtml(r) {
         : escapeHtml(r.final_reply || r.reply)}</div>
       ${!skipState && r.reply_en ? `<div class="history-en">${escapeHtml(r.reply_en)}</div>` : ""}
       ${r.error ? `<div class="history-error">Error: ${escapeHtml(r.error)}</div>` : ""}
+      ${r.status === "approved" && detectorFor(r.platform).cancellableSend ? `<div class="history-send-actions">
+        <span class="history-send-note">Waiting for the send timer</span>
+        <button type="button" class="btn-cancel-send" onclick="cancelQueuedSend('${r.id}', this)">Cancel send</button>
+      </div>` : ""}
     </div>
   `;
+}
+
+async function cancelQueuedSend(id, btn) {
+  if (!btn || btn.disabled) return;
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Cancelling…';
+  try {
+    const response = await fetch(`/api/requests/${id}/cancel-send`, { method: "POST" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    toast("Send cancelled", {
+      type: "warning",
+      detail: "The timer stopped. The reply is back in the approval queue for editing.",
+    });
+    await refresh();
+    requestAnimationFrame(() => {
+      document.getElementById(`approval-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  } catch (error) {
+    toast("Could not cancel send", { type: "error", detail: String(error.message || error) });
+    btn.disabled = false;
+    btn.innerHTML = original;
+    refresh();
+  }
 }
 
 function renderHistory(items) {
@@ -4579,7 +5522,9 @@ function applySnapshot(data) {
   if (data.bots) botProcessState = data.bots;
   updateGlobalPauseControl();
   const checkinBtn = document.getElementById("checkinAllBtn");
-  if (checkinBtn) checkinBtn.disabled = checkinAllRunning;
+  if (checkinBtn) checkinBtn.disabled = checkinAllRunning || stopAllRunning;
+  const stopAllBtn = document.getElementById("stopEverythingBtn");
+  if (stopAllBtn) stopAllBtn.disabled = stopAllRunning;
   const unavailNote = document.getElementById("ctrlUnavailableNote");
   if (unavailNote) unavailNote.style.display = controlsAvailable ? "none" : "block";
 
@@ -4594,7 +5539,10 @@ function applySnapshot(data) {
   }
   renderHistory(history.slice(0, 30));
 
-  const pendingList = (data.pending || []).filter(r => detectorFor(r.platform).live);
+  // The request store, not detector telemetry, owns approval visibility.
+  // Filtering here used to make valid cards disappear during restarts,
+  // telemetry gaps, and for additional accounts whose label differs from id.
+  const pendingList = data.pending || [];
   const currentPendingIds = new Set(pendingList.map(r => r.id));
   if (knownPendingIds !== null) {
     for (const id of currentPendingIds) {
@@ -4625,7 +5573,7 @@ function applySnapshot(data) {
 
 async function refresh() {
   // Never yank the textarea out from under someone mid-keystroke.
-  if (document.activeElement && document.activeElement.matches(".reply-input, .instruction-input")) return;
+  if (document.activeElement && document.activeElement.matches(".reply-input, .translation-input, .instruction-input")) return;
   refreshControlStatus();
   try {
     const readJson = async url => {
@@ -4635,7 +5583,7 @@ async function refresh() {
     };
     const results = await Promise.allSettled([
       readJson("/api/requests?status=pending"),
-      readJson("/api/requests?status=approved,rejected,cancelled,skip_requested,skipped,transferred,sent,failed&limit=300"),
+      readJson("/api/requests?status=approved,sending,rejected,cancelled,skip_requested,skipped,transferred,sent,failed&limit=300"),
       readJson("/api/status"),
       readJson("/api/mode"),
       readJson("/api/bots/status"),
@@ -4722,7 +5670,7 @@ function connectLive(force = false) {
         renderSystemStatus();
         return;
       }
-      if (document.activeElement && document.activeElement.matches(".reply-input, .instruction-input")) {
+      if (document.activeElement && document.activeElement.matches(".reply-input, .translation-input, .instruction-input")) {
         deferredSnapshot = snapshot;
         return;
       }
@@ -4740,7 +5688,7 @@ function connectLive(force = false) {
 }
 
 document.addEventListener("focusout", event => {
-  if (!event.target.matches || !event.target.matches(".reply-input, .instruction-input") || !deferredSnapshot) return;
+  if (!event.target.matches || !event.target.matches(".reply-input, .translation-input, .instruction-input") || !deferredSnapshot) return;
   const snapshot = deferredSnapshot;
   deferredSnapshot = null;
   requestAnimationFrame(() => applySnapshot(snapshot));
@@ -4769,7 +5717,10 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") disconnectLive();
   else resumeLiveUpdates();
 });
-window.addEventListener("pageshow", resumeLiveUpdates);
+window.addEventListener("pageshow", () => {
+  loadInstructionPrompts();
+  resumeLiveUpdates();
+});
 window.addEventListener("online", resumeLiveUpdates);
 
 // ── System status strip ("detectors") at the top of the page ──────────────
@@ -4800,7 +5751,10 @@ async function init() {
   try {
     const platforms = await (await fetch("/api/platforms")).json();
     knownPlatforms = platforms.map(p => p.name);
-    for (const p of platforms) platformColorMap.set(p.name, p.color);
+    for (const p of platforms) {
+      platformColorMap.set(p.name, p.color);
+      platformSlugMap.set(p.name, p.slug);
+    }
   } catch (e) {
     knownPlatforms = [];
   }
@@ -4858,6 +5812,7 @@ _BOTS_PAGE = r"""<!doctype html>
     border: 1px solid var(--border); border-radius: 7px; padding: 6px 11px;
   }
   .back-link:hover { color: var(--foreground); background: var(--accent); }
+  .add-bot-button { margin-left: auto; background: var(--primary); color: #fff; }
   .topbar h1 { font-size: 19px; margin: 0; letter-spacing: -.01em; }
   .topbar p { margin: 3px 0 0; color: var(--muted-foreground); font-size: 13px; }
 
@@ -4969,6 +5924,15 @@ _BOTS_PAGE = r"""<!doctype html>
   .modal-box { width: min(400px, 100%); background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; box-shadow: 0 20px 50px rgba(0,0,0,.5); animation: toast-in .16s ease-out; }
   .modal-title { font-size: 15px; font-weight: 650; margin: 0 0 6px; }
   .modal-body { font-size: 13.5px; color: var(--muted-foreground); line-height: 1.5; }
+  .modal-form { display: grid; gap: 12px; margin-top: 14px; }
+  .modal-field label { display: block; margin-bottom: 5px; color: var(--muted-foreground); font-size: 12px; font-weight: 650; }
+  .modal-field input, .modal-field select { width: 100%; border: 1px solid var(--input); border-radius: 7px; background: #111114; color: var(--foreground); padding: 10px; font: inherit; }
+  .modal-error { min-height: 18px; color: var(--destructive); font-size: 12px; }
+  .bot-type { margin: -5px 0 12px; color: var(--muted-foreground); font-size: 12px; }
+  .bot-management { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .bot-management button { width: 100%; }
+  .btn-rename { background: var(--accent); color: var(--foreground); border-color: var(--border); }
+  .btn-delete { background: transparent; color: var(--destructive); border-color: rgba(239,68,68,.35); }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
   .modal-actions button { font: inherit; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 8px; cursor: pointer; border: 1px solid var(--border); background: var(--accent); color: var(--foreground); }
   .modal-actions .modal-confirm { background: var(--primary); border-color: transparent; color: #fff; }
@@ -5141,6 +6105,7 @@ _BOTS_PAGE = r"""<!doctype html>
     <h1>Bots</h1>
     <p>Start, stop, and configure every platform from one place. Each card controls only its own bot.</p>
   </div>
+  <button class="add-bot-button" type="button" onclick="showAddBot()">+ Add bot</button>
 </div>
 
 <div class="bots-grid" id="botsGrid"></div>
@@ -5204,6 +6169,7 @@ function showConfirm(title, body, opts) {
 }
 
 const PLATFORMS = __PLATFORM_DATA__;
+const BOT_TYPES = PLATFORMS.filter(p => !p.additional);
 
 // Per-platform client-side state, kept separate per card by construction --
 // every fetch/render/action below is always scoped to one `slug`, never "all".
@@ -5219,10 +6185,12 @@ for (const p of PLATFORMS) {
 }
 
 function stepsFor(slug, approval) {
+  const platformInfo = PLATFORMS.find(p => p.slug === slug) || {};
+  const platformType = platformInfo.platformType || slug;
   const approvalStep = approval === "auto"
     ? "Run the meeting guard, then continue automatically without waiting for a reviewer"
     : "Pause on the Approval Dashboard: Approve sends it, Reject regenerates, Cancel abandons it, and Transfer/Skip leaves the chat";
-  if (slug === "xkuss") {
+  if (platformType === "xkuss") {
     return [
       "Log in, open Home, and keep the Dialog Scanner running",
       "Detect when Home opens a new conversation and verify the chat is really active",
@@ -5235,7 +6203,7 @@ function stepsFor(slug, approval) {
       "Click Home again, reset Chameleon, and wait for a different conversation",
     ];
   }
-  if (!PLATFORMS.find(p => p.slug === slug)?.selfManaged) {
+  if (!platformInfo.selfManaged) {
     return [
       "Open the platform and Chameleon browser sessions",
       "Log in when needed and wait for an incoming conversation",
@@ -5261,6 +6229,7 @@ function stepsFor(slug, approval) {
 
 function renderCard(slug, label) {
   const s = state[slug];
+  const platformInfo = PLATFORMS.find(p => p.slug === slug) || {};
   const running = s.running;
   const busy = s.starting || s.stopping;
   const statusClass = !s.loaded ? "external" : (busy ? "external" : (running ? (s.managedBy === "external" ? "external" : "running") : ""));
@@ -5273,6 +6242,7 @@ function renderCard(slug, label) {
         <h2>${escapeHtml(label)}</h2>
         <span class="status-pill ${statusClass}">${statusText}</span>
       </div>
+      ${platformInfo.additional ? `<div class="bot-type">Type: ${escapeHtml((BOT_TYPES.find(p => p.slug === platformInfo.platformType) || {}).label || platformInfo.platformType)}</div>` : ""}
       <div class="live-line">${escapeHtml(s.liveDetail || "")}</div>
 
       <div class="start-stop-row">
@@ -5322,9 +6292,135 @@ function renderCard(slug, label) {
         <ol class="steps-list">${steps.map(st => `<li>${escapeHtml(st)}</li>`).join("")}</ol>
       </details>
 
+      ${platformInfo.additional ? `<div class="bot-management">
+        <button class="btn-rename" type="button" ${running || busy ? "disabled" : ""} onclick="showRenameBot('${slug}')">Rename</button>
+        <button class="btn-delete" type="button" ${running || busy ? "disabled" : ""} onclick="deleteBot('${slug}')">Delete bot</button>
+      </div>` : ""}
+
       <div class="error-note" id="err-${slug}">${escapeHtml(s.error || "")}</div>
     </div>
   `;
+}
+
+function showAddBot() {
+  const root = document.getElementById("modalRoot");
+  root.innerHTML = `
+    <div class="modal-box">
+      <p class="modal-title">Add bot account</p>
+      <p class="modal-body">Give this bot a name, choose its platform type, and enter a different login. It gets its own browser profile and can run beside the existing accounts.</p>
+      <form class="modal-form" id="addBotForm">
+        <div class="modal-field"><label for="newBotName">Bot name</label><input id="newBotName" maxlength="80" placeholder="For example: Justlo Evening" required /></div>
+        <div class="modal-field">
+          <label for="newBotPlatform">Platform type</label>
+          <select id="newBotPlatform" required>${BOT_TYPES.map(p => `<option value="${escapeHtml(p.slug)}">${escapeHtml(p.label)}</option>`).join("")}</select>
+        </div>
+        <div class="modal-field"><label for="newBotUsername">Username</label><input id="newBotUsername" autocomplete="username" required /></div>
+        <div class="modal-field"><label for="newBotPassword">Password</label><input id="newBotPassword" type="password" autocomplete="new-password" required /></div>
+        <div class="modal-error" id="addBotError"></div>
+        <div class="modal-actions">
+          <button type="button" class="modal-cancel">Cancel</button>
+          <button type="submit" class="modal-confirm">Add bot</button>
+        </div>
+      </form>
+    </div>`;
+  const close = () => { root.classList.remove("open"); root.innerHTML = ""; };
+  root.querySelector(".modal-cancel").onclick = close;
+  root.onclick = event => { if (event.target === root) close(); };
+  root.querySelector("#addBotForm").onsubmit = async event => {
+    event.preventDefault();
+    const submit = root.querySelector(".modal-confirm");
+    const error = root.querySelector("#addBotError");
+    submit.disabled = true;
+    submit.innerHTML = '<span class="spinner"></span>Adding';
+    error.textContent = "";
+    try {
+      const res = await fetch("/api/bot-accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label: root.querySelector("#newBotName").value,
+          platform_type: root.querySelector("#newBotPlatform").value,
+          username: root.querySelector("#newBotUsername").value,
+          password: root.querySelector("#newBotPassword").value,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      toast(`${data.bot.label} added`, { type: "success", detail: "You can now start it from its own card." });
+      close();
+      location.reload();
+    } catch (failure) {
+      error.textContent = String(failure.message || failure);
+      submit.disabled = false;
+      submit.textContent = "Add bot";
+    }
+  };
+  root.classList.add("open");
+  root.querySelector("#newBotName").focus();
+}
+
+function showRenameBot(slug) {
+  const info = PLATFORMS.find(p => p.slug === slug);
+  if (!info || !info.additional) return;
+  const root = document.getElementById("modalRoot");
+  root.innerHTML = `
+    <div class="modal-box">
+      <p class="modal-title">Rename bot</p>
+      <p class="modal-body">This changes the name shown across the dashboard. Its platform type stays ${escapeHtml((BOT_TYPES.find(p => p.slug === info.platformType) || {}).label || info.platformType)}.</p>
+      <form class="modal-form" id="renameBotForm">
+        <div class="modal-field"><label for="renameBotName">Bot name</label><input id="renameBotName" maxlength="80" value="${escapeHtml(info.label)}" required /></div>
+        <div class="modal-error" id="renameBotError"></div>
+        <div class="modal-actions">
+          <button type="button" class="modal-cancel">Cancel</button>
+          <button type="submit" class="modal-confirm">Save name</button>
+        </div>
+      </form>
+    </div>`;
+  const close = () => { root.classList.remove("open"); root.innerHTML = ""; };
+  root.querySelector(".modal-cancel").onclick = close;
+  root.onclick = event => { if (event.target === root) close(); };
+  root.querySelector("#renameBotForm").onsubmit = async event => {
+    event.preventDefault();
+    const submit = root.querySelector(".modal-confirm");
+    const error = root.querySelector("#renameBotError");
+    submit.disabled = true;
+    submit.innerHTML = '<span class="spinner"></span>Saving';
+    error.textContent = "";
+    try {
+      const res = await fetch(`/api/bot-accounts/${slug}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label: root.querySelector("#renameBotName").value }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      toast("Bot renamed", { type: "success", detail: data.bot.label });
+      close();
+      location.reload();
+    } catch (failure) {
+      error.textContent = String(failure.message || failure);
+      submit.disabled = false;
+      submit.textContent = "Save name";
+    }
+  };
+  root.classList.add("open");
+  const input = root.querySelector("#renameBotName");
+  input.focus();
+  input.select();
+}
+
+async function deleteBot(slug) {
+  const info = PLATFORMS.find(p => p.slug === slug);
+  if (!await showConfirm("Delete bot?", `Delete ${info?.label || slug}? Its saved login will be removed.`, { danger: true, confirmLabel: "Delete" })) return;
+  try {
+    const res = await fetch(`/api/bot-accounts/${slug}`, { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    toast("Bot deleted", { type: "success" });
+    location.reload();
+  } catch (failure) {
+    showError(slug, String(failure.message || failure));
+  }
 }
 
 function render() {
@@ -5382,9 +6478,12 @@ async function saveCredentials(slug) {
     s.credentialPassword = "";
     s.passwordConfigured = !!data.password_configured;
     s.credentialMessageType = "ok";
+    const storageName = PLATFORMS.find(p => p.slug === slug)?.additional
+      ? "this bot account"
+      : ".env";
     s.credentialMessage = data.running
-      ? "Saved to .env. Stop and start this bot to use the new login."
-      : "Saved to .env. The new login will be used on the next start.";
+      ? `Saved to ${storageName}. Stop and start this bot to use the new login.`
+      : `Saved to ${storageName}. The new login will be used on the next start.`;
     toast(`${PLATFORMS.find(p => p.slug === slug)?.label || slug} credentials saved`, {
       type: "success",
       detail: data.running ? "Restart the bot when you are ready to apply them." : "They will apply on the next start.",
@@ -5576,6 +6675,15 @@ def bots_page():
         }
         for platform in PLATFORMS
     ]
+    for account in list_accounts():
+        base = PLATFORM_BY_SLUG[account["platform_type"]]
+        platform_data.append({
+            "slug": account["id"],
+            "label": account["label"],
+            "selfManaged": base.self_managed,
+            "platformType": account["platform_type"],
+            "additional": True,
+        })
     return Response(
         _BOTS_PAGE.replace("__PLATFORM_DATA__", json.dumps(platform_data)),
         mimetype="text/html",
@@ -5590,6 +6698,16 @@ def api_keys_page():
 @app.get("/settings")
 def settings_page():
     return render_template("settings.html")
+
+
+@app.get("/judge-prompt")
+def judge_prompt_page():
+    return render_template("judge_prompt.html")
+
+
+@app.get("/instruction-prompts")
+def instruction_prompts_page():
+    return render_template("instruction_prompts.html")
 
 
 def main():

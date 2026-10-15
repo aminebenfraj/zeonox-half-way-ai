@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#09090b" />
+  <title>Instruction Prompts — Zenox</title>
+  <link rel="icon" type="image/png" href="/static/icons/zenox-192-v2.png" />
+  <style>
+    :root{color-scheme:dark;--bg:#09090b;--card:#18181b;--surface:#101014;--border:#27272a;--text:#fafafa;--muted:#a1a1aa;--blue:#38bdf8;--primary:#6366f1;--success:#22c55e;--danger:#ef4444}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;padding:8px;background:var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,sans-serif}button,input,textarea{font:inherit}
+    main{width:min(1120px,100%);min-height:calc(100vh - 16px);margin:auto;padding:32px clamp(18px,4vw,46px) 54px;border:1px solid var(--border);border-radius:12px;background:var(--bg)}
+    .top{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:24px}.eyebrow{margin:0;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}h1{margin:5px 0 4px;font-size:26px;letter-spacing:-.035em}p{margin:0;color:var(--muted)}
+    nav{display:flex;gap:8px;flex-wrap:wrap}nav a{min-height:42px;padding:10px 14px;border:1px solid var(--border);border-radius:7px;background:var(--card);color:var(--text);text-decoration:none;font-weight:650}nav a:hover{filter:brightness(1.1)}
+    .layout{display:grid;grid-template-columns:minmax(300px,.8fr) minmax(0,1.2fr);gap:16px;align-items:start}.panel{border:1px solid var(--border);border-radius:11px;background:var(--card);overflow:hidden}.panel-head{padding:16px 18px;border-bottom:1px solid var(--border)}.panel-head h2{margin:0 0 3px;font-size:16px}.panel-body{padding:18px}
+    label{display:block;margin:0 0 6px;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.055em}input,textarea{display:block;width:100%;border:1px solid #3f3f46;border-radius:8px;background:var(--surface);color:var(--text)}input{height:42px;padding:9px 11px}textarea{min-height:190px;padding:11px;resize:vertical;line-height:1.5}input:focus,textarea:focus{outline:2px solid rgba(56,189,248,.4);outline-offset:1px;border-color:var(--blue)}.field+.field{margin-top:14px}
+    .form-meta{display:flex;justify-content:space-between;gap:10px;margin-top:6px;color:var(--muted);font-size:11px}.form-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}button{min-height:40px;padding:9px 14px;border:1px solid var(--border);border-radius:7px;color:var(--text);font-weight:700;cursor:pointer}button:hover:not(:disabled){filter:brightness(1.1)}button:disabled{opacity:.55;cursor:default}.cancel{background:transparent}.save{background:var(--primary);border-color:var(--primary)}
+    .list{display:grid;gap:9px}.empty{padding:28px 16px;border:1px dashed #3f3f46;border-radius:9px;color:var(--muted);text-align:center}.prompt-card{padding:14px;border:1px solid var(--border);border-radius:9px;background:var(--surface)}.prompt-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.prompt-card h3{margin:0;color:var(--blue);font-size:14px}.prompt-actions{display:flex;gap:6px}.prompt-actions button{min-height:32px;padding:6px 10px;font-size:11px}.edit{background:rgba(56,189,248,.1);border-color:rgba(56,189,248,.3);color:var(--blue)}.delete{background:transparent;border-color:rgba(239,68,68,.35);color:#f87171}.prompt-text{margin-top:9px;color:#d4d4d8;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.status{min-height:20px;margin-top:11px;color:var(--muted);font-size:12px}.status.ok{color:var(--success)}.status.bad{color:#f87171}
+    @media(max-width:780px){body{padding:0}main{min-height:100vh;border:0;border-radius:0;padding:22px 14px 40px}.top{flex-direction:column}.layout{grid-template-columns:1fr}.top nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%}.top nav a{display:flex;align-items:center;justify-content:center;padding:8px 4px;font-size:12px;text-align:center}.panel-body{padding:14px}input,textarea{font-size:16px}.form-actions button{flex:1}.prompt-card-head{align-items:flex-start}}
+  </style>
+</head>
+<body>
+<main>
+  <header class="top">
+    <div><p class="eyebrow">Zenox configuration</p><h1>Instruction Prompts</h1><p>Create reusable instructions for regenerating replies in Chameleon.</p></div>
+    <nav><a href="/">Approval Queue</a><a href="/judge-prompt">Judge Prompt</a><a href="/settings">Settings</a></nav>
+  </header>
+
+  <div class="layout">
+    <section class="panel">
+      <header class="panel-head"><h2 id="formTitle">Add a prompt</h2><p>Give it a clear name so it is easy to find in the approval card.</p></header>
+      <div class="panel-body">
+        <form id="promptForm">
+          <input type="hidden" id="promptId" />
+          <div class="field"><label for="promptName">Prompt name</label><input id="promptName" maxlength="80" placeholder="For example: More playful" required /></div>
+          <div class="field"><label for="promptText">Instruction</label><textarea id="promptText" maxlength="4000" placeholder="For example: Make the reply warmer, more playful, and end with one natural question." required></textarea><div class="form-meta"><span>This text will fill the Chameleon instruction box.</span><span id="promptCount">0 / 4000</span></div></div>
+          <div class="form-actions"><button class="cancel" id="cancelButton" type="button" hidden>Cancel edit</button><button class="save" id="saveButton" type="submit">Add prompt</button></div>
+          <div class="status" id="status" aria-live="polite"></div>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel">
+      <header class="panel-head"><h2>Saved prompts</h2><p>These appear in the “Guide the next reply” dropdown on every approval card.</p></header>
+      <div class="panel-body"><div class="list" id="promptList"><div class="empty">Loading prompts…</div></div></div>
+    </section>
+  </div>
+</main>
+<script>
+const form=document.getElementById("promptForm");
+const idInput=document.getElementById("promptId");
+const nameInput=document.getElementById("promptName");
+const textInput=document.getElementById("promptText");
+const saveButton=document.getElementById("saveButton");
+const cancelButton=document.getElementById("cancelButton");
+const formTitle=document.getElementById("formTitle");
+const promptList=document.getElementById("promptList");
+const promptCount=document.getElementById("promptCount");
+const status=document.getElementById("status");
+let prompts=[];
+
+const escapeHtml=value=>String(value??"").replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+function setStatus(message,type=""){status.textContent=message;status.className=`status ${type}`.trim();}
+function syncCount(){promptCount.textContent=`${textInput.value.length} / 4000`;}
+function resetForm(){idInput.value="";nameInput.value="";textInput.value="";formTitle.textContent="Add a prompt";saveButton.textContent="Add prompt";cancelButton.hidden=true;syncCount();nameInput.focus();}
+function render(){
+  if(!prompts.length){promptList.innerHTML='<div class="empty">No prompts yet. Add your first instruction prompt.</div>';return;}
+  promptList.innerHTML=prompts.map(item=>`<article class="prompt-card"><div class="prompt-card-head"><h3>${escapeHtml(item.name)}</h3><div class="prompt-actions"><button class="edit" type="button" onclick="editPrompt('${item.id}')">Edit</button><button class="delete" type="button" onclick="removePrompt('${item.id}')">Delete</button></div></div><div class="prompt-text">${escapeHtml(item.prompt)}</div></article>`).join("");
+}
+async function loadPrompts(){
+  try{const response=await fetch("/api/instruction-prompts",{cache:"no-store"});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`);prompts=Array.isArray(data.prompts)?data.prompts:[];render();}
+  catch(error){promptList.innerHTML=`<div class="empty">Could not load prompts: ${escapeHtml(error.message)}</div>`;}
+}
+function editPrompt(id){const item=prompts.find(prompt=>prompt.id===id);if(!item)return;idInput.value=item.id;nameInput.value=item.name;textInput.value=item.prompt;formTitle.textContent="Edit prompt";saveButton.textContent="Save changes";cancelButton.hidden=false;syncCount();nameInput.focus();window.scrollTo({top:0,behavior:"smooth"});}
+async function removePrompt(id){const item=prompts.find(prompt=>prompt.id===id);if(!item||!confirm(`Delete “${item.name}”?`))return;try{const response=await fetch(`/api/instruction-prompts/${encodeURIComponent(id)}`,{method:"DELETE"});const data=await response.json().catch(()=>({}));if(!response.ok||!data.ok)throw new Error(data.error||`HTTP ${response.status}`);prompts=prompts.filter(prompt=>prompt.id!==id);if(idInput.value===id)resetForm();render();setStatus("Prompt deleted.","ok");}catch(error){setStatus(`Could not delete prompt: ${error.message}`,"bad");}}
+form.addEventListener("submit",async event=>{event.preventDefault();const payload={name:nameInput.value.trim(),prompt:textInput.value.trim()};if(idInput.value)payload.id=idInput.value;if(!payload.name||!payload.prompt)return;saveButton.disabled=true;setStatus("Saving…");try{const response=await fetch("/api/instruction-prompts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok||!data.ok)throw new Error(data.error||`HTTP ${response.status}`);const index=prompts.findIndex(item=>item.id===data.prompt.id);if(index>=0)prompts[index]=data.prompt;else prompts.push(data.prompt);render();resetForm();setStatus("Prompt saved. It is now available on approval cards.","ok");}catch(error){setStatus(`Could not save prompt: ${error.message}`,"bad");}finally{saveButton.disabled=false;}});
+textInput.addEventListener("input",syncCount);cancelButton.addEventListener("click",resetForm);syncCount();loadPrompts();
+</script>
+</body>
+</html>

@@ -17,7 +17,10 @@ from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout, Error as PlaywrightError
 from core.login import login_mod_site, login_chameleon, chat_not_selected
-from core.approval import request_approval, mark_sent, mark_failed, report_status, ApprovalCancelled
+from core.approval import (
+    request_approval, wait_for_send_clearance, mark_sent, mark_failed,
+    report_status, ApprovalCancelled, ApprovalRejected,
+)
 from core.chameleon_data import read_extracted_data
 from core.send_delay import get_send_delay_seconds
 
@@ -600,7 +603,8 @@ class ChatBot:
     async def _is_logged_out(self, tab1) -> bool:
         """True when the mod-site login form is visible (session expired)."""
         try:
-            return await tab1.query_selector("input[name='username']") is not None
+            login = tab1.locator("input[name='username']").first
+            return await login.count() > 0 and await login.is_visible()
         except PlaywrightError as e:
             if _is_fatal(e):
                 raise
@@ -721,9 +725,15 @@ class ChatBot:
                     raise LoggedOutError("Mod site session expired while waiting for conversation")
 
                 # Re-query selectors every iteration — never hold element handles
-                waiting  = await tab1.query_selector(self.cfg.sel_waiting)
-                textarea = await tab1.query_selector(self.cfg.sel_textarea)
-                if waiting is None and textarea is not None:
+                waiting = tab1.locator(self.cfg.sel_waiting).first
+                textarea = tab1.locator(self.cfg.sel_textarea).first
+                waiting_visible = (
+                    await waiting.count() > 0 and await waiting.is_visible()
+                )
+                textarea_visible = (
+                    await textarea.count() > 0 and await textarea.is_visible()
+                )
+                if not waiting_visible and textarea_visible:
                     waited = asyncio.get_event_loop().time() - t_start
                     self.log(f"Conversation detected! (waited {waited:.0f}s)")
                     await report_status(self.cfg.platform, "chat_detected")
@@ -817,23 +827,38 @@ class ChatBot:
             self.log(f"[WARN] Could not check for First Contact: {e}")
             return False
 
-    async def _wait_for_new_message(self, tab1, sent_html: str) -> bool:
+    async def _wait_for_new_message(self, tab1, previous_customer_message: str) -> bool:
         """
         Blocks after sending until either a new user message appears (True)
         or the conversation closes/goes idle (False).
+
+        Only the newest customer bubble is compared.  Comparing the serialized
+        page is not reliable because live UI details such as ``Chatdauer`` change
+        even when the customer has not written anything.
         """
         self.log("Waiting for next user message or conversation end...")
         await report_status(self.cfg.platform, "waiting", "Waiting for the customer's next message", checkpoint="waiting")
         last_status = asyncio.get_event_loop().time()
         while True:
             try:
-                waiting = await tab1.query_selector(self.cfg.sel_waiting)
-                if waiting is not None:
+                waiting = tab1.locator(self.cfg.sel_waiting).first
+                if await waiting.count() > 0 and await waiting.is_visible():
                     self.log("Conversation closed — back to idle.")
                     await report_status(self.cfg.platform, "waiting", "Waiting for a conversation", checkpoint="waiting")
                     return False
-                current_html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
-                if current_html != sent_html:
+                if not await self._chat_is_open(tab1):
+                    # The React view can briefly transition before rendering the
+                    # idle banner. Treat a missing reply box as a closed chat.
+                    self.log("Conversation closed — reply box is no longer visible.")
+                    await report_status(self.cfg.platform, "waiting", "Waiting for a conversation", checkpoint="waiting")
+                    return False
+                current_customer_message = (
+                    await self._safe_evaluate(tab1, _GET_LAST_CUSTOMER_MSG_JS)
+                ).strip()
+                if (
+                    current_customer_message
+                    and current_customer_message != previous_customer_message.strip()
+                ):
                     self.log("New message detected.")
                     return True
             except PlaywrightError as e:
@@ -857,8 +882,11 @@ class ChatBot:
         the chat_still_active check so a pending reply gets auto-cancelled if
         the conversation closes while a human hasn't decided yet."""
         try:
-            waiting = await tab1.query_selector(self.cfg.sel_waiting)
-            return waiting is None
+            waiting = tab1.locator(self.cfg.sel_waiting).first
+            if await waiting.count() > 0 and await waiting.is_visible():
+                return False
+            textarea = tab1.locator(self.cfg.sel_textarea).first
+            return await textarea.count() > 0 and await textarea.is_visible()
         except PlaywrightError as e:
             if _is_fatal(e):
                 raise
@@ -1073,7 +1101,8 @@ class ChatBot:
 
     async def _get_approved_reply(self, tab1, tab2, last_message: str,
                                   customer_message: str, client_profile: dict,
-                                  fake_profile: dict, messages: list[dict] | None = None) -> tuple[str, str]:
+                                  fake_profile: dict, messages: list[dict] | None = None,
+                                  initial_regeneration_instruction: str = "") -> tuple[str, str]:
         """Generate a reply, then block on the approval dashboard before it's
         allowed to be sent. A rejection clicks 'Antwort generieren' again for a
         fresh reply and resubmits it — repeats until something is approved.
@@ -1085,7 +1114,7 @@ class ChatBot:
         the dashboard, or the chat closed while this reply was still pending;
         the caller restarts/redetects rather than looping here.
         """
-        regeneration_instruction = ""
+        regeneration_instruction = initial_regeneration_instruction
         while True:
             await report_status(self.cfg.platform, "generating", "Generating a reply", checkpoint="generating")
             reply = await self._generate_reply(tab2, regeneration_instruction)
@@ -1098,7 +1127,6 @@ class ChatBot:
                 continue
 
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
-            await report_status(self.cfg.platform, "approval", "Waiting for approval", checkpoint="approval")
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply, last_message=last_message,
                 customer_message=customer_message,
@@ -1114,6 +1142,68 @@ class ChatBot:
                 return final_text, req_id
             regeneration_instruction = final_text or ""
             self.log("[APPROVAL] Rejected — regenerating a new reply...")
+
+    async def _send_reply(self, tab1, reply: str, approval_id: str | None = None):
+        await report_status(
+            self.cfg.platform, "sending",
+            "Pasting and sending the approved reply", checkpoint="sending",
+        )
+        await tab1.bring_to_front()
+        textarea = tab1.locator(self.cfg.sel_textarea)
+        send_cancel_revision = 0
+        while True:
+            await textarea.click()
+            await textarea.fill(reply)
+            wait = get_send_delay_seconds()
+            self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
+            updated_reply, send_cancel_revision = await wait_for_send_clearance(
+                approval_id, self.cfg.platform, wait, send_cancel_revision
+            )
+            if updated_reply is None:
+                break
+            reply = updated_reply
+            self.log(
+                "[APPROVAL] Send cancelled and approved again — "
+                "re-pasting the latest reply."
+            )
+        # Never send a message while paused, even if pause was toggled mid-delay.
+        await self._wait_while_paused()
+        try:
+            await tab1.locator(self.cfg.sel_send_btn).click()
+            await self._wait_for_send_confirmation(tab1)
+        except Exception as error:
+            await mark_failed(approval_id, str(error))
+            raise
+        self.log(f"Sent: {reply[:80]}{'...' if len(reply) > 80 else ''}")
+        log_sent_message(self.cfg.platform, reply)
+        await mark_sent(approval_id)
+        await report_status(
+            self.cfg.platform, "sent", "Reply confirmed sent", checkpoint="sent"
+        )
+        await asyncio.sleep(2)
+
+    async def _get_approved_and_send(
+        self, tab1, tab2, last_message: str, customer_message: str,
+        client_profile: dict, fake_profile: dict,
+        messages: list[dict] | None = None,
+    ) -> tuple[str, str]:
+        """Keep post-cancel decisions inside the normal approval workflow."""
+        regeneration_instruction = ""
+        while True:
+            reply, approval_id = await self._get_approved_reply(
+                tab1, tab2, last_message, customer_message,
+                client_profile, fake_profile, messages,
+                initial_regeneration_instruction=regeneration_instruction,
+            )
+            try:
+                await self._send_reply(tab1, reply, approval_id)
+                return reply, approval_id
+            except ApprovalRejected as rejected:
+                regeneration_instruction = rejected.instruction
+                self.log(
+                    "[APPROVAL] Send cancelled, then reply rejected — "
+                    "regenerating in Chameleon."
+                )
 
     # ── Main entry point ───────────────────────────────────────────────────────
 
@@ -1254,7 +1344,7 @@ class ChatBot:
 
                     await self._wait_while_paused()
                     try:
-                        reply, approval_id = await self._get_approved_reply(
+                        reply, approval_id = await self._get_approved_and_send(
                             tab1, tab2, dashboard_last_msg, dashboard_customer_msg,
                             extracted["client_profile"], extracted["fake_profile"],
                             extracted["messages"],
@@ -1274,29 +1364,6 @@ class ChatBot:
                         cycle -= 1
                         continue
 
-                    await report_status(self.cfg.platform, "sending", "Pasting and sending the approved reply", checkpoint="sending")
-                    await tab1.bring_to_front()
-                    textarea = tab1.locator(self.cfg.sel_textarea)
-                    await textarea.click()
-                    await textarea.fill(reply)
-                    wait = get_send_delay_seconds()
-                    self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
-                    await asyncio.sleep(wait)
-                    # Never send a message while paused, even if pause was toggled
-                    # mid-delay — the reply stays pasted and goes out once resumed.
-                    await self._wait_while_paused()
-                    try:
-                        await tab1.locator(self.cfg.sel_send_btn).click()
-                        await self._wait_for_send_confirmation(tab1)
-                    except Exception as e:
-                        await mark_failed(approval_id, str(e))
-                        raise
-                    self.log(f"Sent: {reply[:80]}{'...' if len(reply) > 80 else ''}")
-                    log_sent_message(self.cfg.platform, reply)
-                    await mark_sent(approval_id)
-                    await report_status(self.cfg.platform, "sent", "Reply confirmed sent", checkpoint="sent")
-                    await asyncio.sleep(2)
-
                     if self._stagnant_count >= STAGNANT_CYCLES_BEFORE_RELOGIN:
                         self.log(
                             f"[RECOVERY] Pasted and sent {self._stagnant_count} times without "
@@ -1312,8 +1379,9 @@ class ChatBot:
                         cycle -= 1
                         continue
 
-                    snapshot = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
-                    conversation_continued = await self._wait_for_new_message(tab1, snapshot)
+                    conversation_continued = await self._wait_for_new_message(
+                        tab1, last_customer_msg
+                    )
 
                     if consecutive_errors > 0:
                         self.log(f"Consecutive error counter reset (was {consecutive_errors}).")

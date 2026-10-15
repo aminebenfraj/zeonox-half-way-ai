@@ -103,8 +103,12 @@ def _decision_result(data: dict, reply: str, request_id: str):
 
 
 class ApprovalRejected(Exception):
-    """Raised... actually not used — reject is a normal return, not an error.
-    Kept out of the public API; see request_approval()'s return value instead."""
+    """Raised when a restored countdown card requests regeneration."""
+
+    def __init__(self, request_id: str | None = None, instruction: str = ""):
+        super().__init__(f"Approval request {request_id} was rejected after send cancellation")
+        self.request_id = request_id
+        self.instruction = (instruction or "").strip()
 
 
 class ApprovalCancelled(Exception):
@@ -183,8 +187,26 @@ async def request_approval(
                 "created_at": datetime.now().isoformat(timespec="seconds"),
             },
         )
+        if resp.status_code == 409:
+            data = resp.json()
+            if data.get("duplicate"):
+                # Never attach a second bot loop to the existing request.  A
+                # single approval could otherwise release both loops and send
+                # two replies into the same conversation.
+                raise ApprovalCancelled(data.get("id"))
         resp.raise_for_status()
         req_id = resp.json()["id"]
+
+        # Do not advertise the Approval stage until the server has actually
+        # created the request. The POST may perform translation and safety
+        # checks, and reporting this state before it returned made the UI say
+        # "Awaiting approval" while there was no card to display yet.
+        await report_status(
+            platform,
+            "approval",
+            "Waiting for approval",
+            checkpoint="approval",
+        )
 
         loop = asyncio.get_running_loop()
         next_chat_check = loop.time() + chat_check_interval
@@ -285,6 +307,104 @@ async def mark_sent(request_id: str | None):
         pass  # dashboard bookkeeping only — never let this break the bot cycle
 
 
+async def wait_for_send_clearance(
+    request_id: str | None,
+    platform: str,
+    delay_seconds: float,
+    known_cancel_revision: int = 0,
+) -> tuple[str | None, int]:
+    """Wait through the cancellable send timer and atomically claim the send.
+
+    Returns ``(None, revision)`` when the current approved text may be sent. If the
+    operator cancels the countdown, this waits for the same card to be approved
+    again and returns ``(new_text, revision)`` so the caller can re-paste it
+    and begin a fresh countdown. The revision prevents a very fast
+    cancel-and-reapprove from being missed between polling requests.
+    """
+    delay_seconds = max(0.0, float(delay_seconds or 0))
+    if not request_id:
+        await asyncio.sleep(delay_seconds)
+        return None, known_cancel_revision
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + delay_seconds
+    was_reopened = False
+    reported_reopened = False
+    async with httpx.AsyncClient(timeout=10.0, auth=_AUTH) as client:
+        while True:
+            response = await client.get(f"{APPROVAL_SERVER_URL}/api/requests/{request_id}")
+            response.raise_for_status()
+            data = response.json()
+            status = data.get("status")
+            cancel_revision = int(data.get("send_cancel_revision") or 0)
+            if cancel_revision > known_cancel_revision:
+                known_cancel_revision = cancel_revision
+                was_reopened = True
+
+            if status == "pending":
+                was_reopened = True
+                if not reported_reopened:
+                    await report_status(
+                        platform,
+                        "approval",
+                        "Send cancelled — waiting for approval again",
+                        checkpoint="approval",
+                    )
+                    reported_reopened = True
+                await asyncio.sleep(0.35)
+                continue
+
+            if status == "approved":
+                if was_reopened:
+                    await report_status(
+                        platform,
+                        "sending",
+                        "Reply approved again — restarting send timer",
+                        checkpoint="sending",
+                    )
+                    return (
+                        strip_disallowed_reply_punctuation(
+                            data.get("final_reply") or data.get("reply") or ""
+                        ),
+                        known_cancel_revision,
+                    )
+
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(min(0.35, remaining))
+                    continue
+
+                # This server-side transition and Cancel send share one lock.
+                # Exactly one can win at the countdown boundary.
+                claim = await client.post(
+                    f"{APPROVAL_SERVER_URL}/api/requests/{request_id}/sending"
+                )
+                if claim.is_success:
+                    return None, known_cancel_revision
+                if claim.status_code == 409:
+                    await asyncio.sleep(0.1)
+                    continue
+                claim.raise_for_status()
+
+            if status == "sending":
+                return None, known_cancel_revision
+            if status == "cancelled":
+                raise ApprovalCancelled(request_id)
+            if status == "rejected":
+                raise ApprovalRejected(
+                    request_id,
+                    data.get("regeneration_instruction") or "",
+                )
+            if status == "skip_requested":
+                raise ApprovalSkipped(request_id)
+            if status in ("sent", "failed"):
+                raise RuntimeError(
+                    f"Approval request {request_id} became {status} before this bot sent it"
+                )
+
+            await asyncio.sleep(0.35)
+
+
 async def mark_failed(request_id: str | None, error: str = ""):
     """Best-effort: tell the dashboard the approved reply failed to send."""
     if not request_id:
@@ -340,6 +460,7 @@ async def report_status(
                     "retry_count": max(0, int(retry_count or 0)),
                     "warning": warning,
                     "checkpoint": checkpoint,
+                    "cancellable_send": True,
                 },
             )
     except Exception:

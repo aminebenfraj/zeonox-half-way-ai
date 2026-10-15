@@ -51,8 +51,9 @@ from core.bot import (
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
 from core.approval import (
-    request_approval, mark_sent, mark_failed, mark_skipped, report_status,
-    ApprovalCancelled, ApprovalSkipped,
+    request_approval, wait_for_send_clearance, mark_sent, mark_failed,
+    mark_skipped, report_status,
+    ApprovalCancelled, ApprovalRejected, ApprovalSkipped,
 )
 from core.chameleon_data import read_extracted_data
 from core.send_delay import get_send_delay_seconds
@@ -106,6 +107,7 @@ class XkussConfig:
     cdp_url:  str = "http://127.0.0.1:9227"
     tab1_pattern: str = "xkuss"           # substring matched against the mod-site tab URL
     tab2_pattern: str = "chamaleon-ai"    # substring matched against the chameleon tab URL
+    profile: str = "xkuss"                # Chrome profile dir under profiles/
 
     # ── xkuss mod site ──────────────────────────────────────────────────────
     tab1_url: str = ""                    # login page URL
@@ -189,7 +191,7 @@ class XkussBot:
             return
 
         base_dir = Path(__file__).resolve().parent.parent
-        profile  = str(base_dir / "profiles" / "xkuss")
+        profile  = str(base_dir / "profiles" / self.cfg.profile)
         self.log(f"No Chrome on port {port} — launching a visible one (profile: {profile})...")
         try:
             start_chrome(profile, port)
@@ -511,12 +513,13 @@ class XkussBot:
     async def _get_approved_reply(self, tab1, tab2, last_message: str = "",
                                    customer_message: str = "",
                                    client_profile: dict | None = None, fake_profile: dict | None = None,
-                                   messages: list[dict] | None = None) -> tuple[str, str]:
+                                   messages: list[dict] | None = None,
+                                   initial_regeneration_instruction: str = "") -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
         clicked Cancel) so it can restart this chat's Chameleon job instead."""
-        regeneration_instruction = ""
+        regeneration_instruction = initial_regeneration_instruction
         while True:
             await report_status(self.cfg.platform, "generating", "Generating a reply", checkpoint="generating")
             reply = await self._generate_reply(tab2, regeneration_instruction)
@@ -529,7 +532,6 @@ class XkussBot:
                 continue
 
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
-            await report_status(self.cfg.platform, "approval", "Waiting for approval", checkpoint="approval")
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply, last_message=last_message,
                 customer_message=customer_message,
@@ -686,13 +688,21 @@ class XkussBot:
     async def _send_reply(self, tab1, reply: str, approval_id: str | None = None):
         await tab1.bring_to_front()
         textarea = tab1.locator(self.cfg.sel_textarea)
-        await textarea.click()
-        await textarea.fill(reply)
-        # Trigger the character counter so the send button un-disables.
-        await self._nudge_char_counter(tab1)
-        wait = get_send_delay_seconds()
-        self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
-        await asyncio.sleep(wait)
+        send_cancel_revision = 0
+        while True:
+            await textarea.click()
+            await textarea.fill(reply)
+            # Trigger the character counter so the send button un-disables.
+            await self._nudge_char_counter(tab1)
+            wait = get_send_delay_seconds()
+            self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
+            updated_reply, send_cancel_revision = await wait_for_send_clearance(
+                approval_id, self.cfg.platform, wait, send_cancel_revision
+            )
+            if updated_reply is None:
+                break
+            reply = updated_reply
+            self.log("[APPROVAL] Send cancelled and approved again — re-pasting the latest reply.")
         # A pause toggled during the human-like delay must prevent the send.
         await self._wait_while_paused()
 
@@ -723,6 +733,31 @@ class XkussBot:
         await mark_sent(approval_id)
         await report_status(self.cfg.platform, "sent", "Reply confirmed sent", checkpoint="sent")
         await asyncio.sleep(2)
+
+    async def _get_approved_and_send(self, tab1, tab2, extracted: dict) -> tuple[str, str]:
+        """Keep post-cancel decisions inside the normal approval workflow."""
+        regeneration_instruction = ""
+        while True:
+            reply, approval_id = await self._get_approved_reply(
+                tab1, tab2,
+                extracted["last_message"], extracted["last_customer_message"],
+                extracted["client_profile"], extracted["fake_profile"],
+                extracted["messages"],
+                initial_regeneration_instruction=regeneration_instruction,
+            )
+            await report_status(
+                self.cfg.platform, "sending",
+                "Pasting and sending the approved reply", checkpoint="sending",
+            )
+            try:
+                await self._send_reply(tab1, reply, approval_id)
+                return reply, approval_id
+            except ApprovalRejected as rejected:
+                regeneration_instruction = rejected.instruction
+                self.log(
+                    "[APPROVAL] Send cancelled, then reply rejected — "
+                    "regenerating in Chameleon."
+                )
 
     # ── Error recovery ───────────────────────────────────────────────────────
 
@@ -879,11 +914,8 @@ class XkussBot:
                         continue
 
                     try:
-                        reply, approval_id = await self._get_approved_reply(
-                            tab1, tab2,
-                            extracted["last_message"], extracted["last_customer_message"],
-                            extracted["client_profile"], extracted["fake_profile"],
-                            extracted["messages"],
+                        reply, approval_id = await self._get_approved_and_send(
+                            tab1, tab2, extracted,
                         )
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
@@ -923,9 +955,6 @@ class XkussBot:
                         )
                         cycle -= 1
                         continue
-                    await report_status(self.cfg.platform, "sending", "Pasting and sending the approved reply", checkpoint="sending")
-                    await self._send_reply(tab1, reply, approval_id)
-
                     if consecutive_errors > 0:
                         self.log(f"Consecutive error counter reset (was {consecutive_errors}).")
                     consecutive_errors = 0

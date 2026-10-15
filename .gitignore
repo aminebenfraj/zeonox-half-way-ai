@@ -36,6 +36,11 @@ coverage.xml
 # Environment variables
 .env
 .runtime_settings.json
+.judge_prompt.txt
+.instruction_prompts.json
+.instruction_prompts.json.tmp
+.bot_accounts.json
+.bot_accounts.json.tmp
 .pause_*.flag
 .env.*
 !.env.example

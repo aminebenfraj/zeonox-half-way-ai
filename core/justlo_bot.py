@@ -64,8 +64,9 @@ from core.bot import (
 from core.login import login_chameleon, chat_not_selected
 from core.launcher import is_cdp_ready, start_chrome, wait_for_cdp
 from core.approval import (
-    request_approval, mark_sent, mark_failed, mark_skipped, report_status,
-    ApprovalCancelled, ApprovalSkipped,
+    request_approval, wait_for_send_clearance, mark_sent, mark_failed,
+    mark_skipped, report_status,
+    ApprovalCancelled, ApprovalRejected, ApprovalSkipped,
 )
 from core.chameleon_data import read_extracted_data
 from core.runtime_settings import get_runtime_settings
@@ -594,12 +595,13 @@ class JustloBot:
                                    customer_message: str = "",
                                    client_profile: dict | None = None, fake_profile: dict | None = None,
                                    messages: list[dict] | None = None,
-                                   expected_sig: str = "") -> tuple[str, str]:
+                                   expected_sig: str = "",
+                                   initial_regeneration_instruction: str = "") -> tuple[str, str]:
         """Generate a reply and block on the approval dashboard before it may be
         sent. A rejection regenerates and resubmits until something is approved.
         ApprovalCancelled propagates to the caller (chat closed, or an operator
         clicked Cancel) so it can restart this chat's Chameleon job instead."""
-        regeneration_instruction = ""
+        regeneration_instruction = initial_regeneration_instruction
         while True:
             await report_status(self.cfg.platform, "generating", "Generating a reply", checkpoint="generating")
             reply = await self._generate_reply(tab2, regeneration_instruction)
@@ -612,7 +614,6 @@ class JustloBot:
                 continue
 
             self.log(f"Reply generated — awaiting approval: {reply[:80]}{'...' if len(reply) > 80 else ''}")
-            await report_status(self.cfg.platform, "approval", "Waiting for approval", checkpoint="approval")
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply,
                 reply_type=reply_type,
@@ -998,12 +999,20 @@ class JustloBot:
     async def _send_reply(self, tab1, reply: str, approval_id: str | None = None):
         await tab1.bring_to_front()
         textarea = tab1.locator(self.cfg.sel_textarea)
-        await textarea.click()
-        await textarea.fill(reply)
-        await self._nudge_message_box(tab1)
-        wait = get_send_delay_seconds()
-        self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
-        await asyncio.sleep(wait)
+        send_cancel_revision = 0
+        while True:
+            await textarea.click()
+            await textarea.fill(reply)
+            await self._nudge_message_box(tab1)
+            wait = get_send_delay_seconds()
+            self.log(f"Reply pasted ({len(reply)} chars) — sending in {wait}s...")
+            updated_reply, send_cancel_revision = await wait_for_send_clearance(
+                approval_id, self.cfg.platform, wait, send_cancel_revision
+            )
+            if updated_reply is None:
+                break
+            reply = updated_reply
+            self.log("[APPROVAL] Send cancelled and approved again — re-pasting the latest reply.")
         # A pause toggled during the human-like delay must prevent the send.
         await self._wait_while_paused()
 
@@ -1048,6 +1057,33 @@ class JustloBot:
         log_sent_message(self.cfg.platform, reply)
         await mark_sent(approval_id)
         await report_status(self.cfg.platform, "sent", "Reply confirmed sent", checkpoint="sent")
+
+    async def _get_approved_and_send(
+        self, tab1, tab2, reply_type: str, extracted: dict, expected_sig: str,
+    ) -> tuple[str, str]:
+        """Keep post-cancel decisions inside the normal approval workflow."""
+        regeneration_instruction = ""
+        while True:
+            reply, approval_id = await self._get_approved_reply(
+                tab1, tab2, reply_type,
+                extracted["last_message"], extracted["last_customer_message"],
+                extracted["client_profile"], extracted["fake_profile"],
+                extracted["messages"], expected_sig=expected_sig,
+                initial_regeneration_instruction=regeneration_instruction,
+            )
+            await report_status(
+                self.cfg.platform, "sending",
+                "Pasting and sending the approved reply", checkpoint="sending",
+            )
+            try:
+                await self._send_reply(tab1, reply, approval_id)
+                return reply, approval_id
+            except ApprovalRejected as rejected:
+                regeneration_instruction = rejected.instruction
+                self.log(
+                    "[APPROVAL] Send cancelled, then reply rejected — "
+                    "regenerating in Chameleon."
+                )
 
     # ── Error recovery ───────────────────────────────────────────────────────
 
@@ -1248,11 +1284,8 @@ class JustloBot:
                             self.log("[WARN] Chameleon message type missing — "
                                      "falling back to the platform queue label.")
                             reply_type = await self._queue_task_type(tab1)
-                        reply, approval_id = await self._get_approved_reply(
-                            tab1, tab2, reply_type,
-                            extracted["last_message"], extracted["last_customer_message"],
-                            extracted["client_profile"], extracted["fake_profile"],
-                            extracted["messages"], expected_sig=sig,
+                        reply, approval_id = await self._get_approved_and_send(
+                            tab1, tab2, reply_type, extracted, sig,
                         )
                     except ManualReviewLimitExceeded:
                         self.log("[RECOVERY] Chameleon kept flagging this request for manual "
@@ -1290,8 +1323,6 @@ class JustloBot:
                             )
                         cycle -= 1
                         continue
-                    await report_status(self.cfg.platform, "sending", "Pasting and sending the approved reply", checkpoint="sending")
-                    await self._send_reply(tab1, reply, approval_id)
                     # Mark this conversation handled so we don't answer it again;
                     # the next cycle waits until a different conversation appears.
                     self._last_sig = sig
