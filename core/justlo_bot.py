@@ -32,6 +32,7 @@ Exit codes (used by launcher to decide restart):
 """
 
 import asyncio
+import os
 import random
 import re
 import sys
@@ -145,6 +146,20 @@ _GET_TRANSFER_NAMES_JS = """() => {
     return cells.length ? (cells[cells.length - 1].textContent || '').trim() : '';
   });
 }"""
+
+
+def _transfer_excluded_accounts(current_username: str) -> set[str]:
+    """Return every Justlo-family account that must never receive a handover."""
+    return {
+        name.strip().casefold()
+        for name in (
+            current_username,
+            os.environ.get("JUSTLO_USERNAME", ""),
+            os.environ.get("LINDUU_USERNAME", ""),
+            os.environ.get("GNOXX_USERNAME", ""),
+        )
+        if name and name.strip()
+    }
 
 # Inject the HTML straight into the React-controlled chameleon textarea in ONE
 # shot: native value setter + a single 'input' event so React picks it up without
@@ -926,11 +941,15 @@ class JustloBot:
 
             names = await tab1.evaluate(_GET_TRANSFER_NAMES_JS)
             own = self.cfg.username
-            candidates = [i for i, name in enumerate(names) if name and name != own]
+            excluded_accounts = _transfer_excluded_accounts(own)
+            candidates = [
+                i for i, name in enumerate(names)
+                if name and name.strip().casefold() not in excluded_accounts
+            ]
 
             if not candidates:
-                self.log(f"[WARN] No other moderator in the transfer popup besides '{own}' — "
-                         f"closing popup and pressing 'Überspringen' instead.")
+                self.log("[WARN] No eligible moderator in the transfer popup — "
+                         "closing popup and pressing 'Überspringen' instead.")
                 cancel_btn = popup.locator("a[role='button']:has-text('Abbrechen')")
                 if await cancel_btn.count() > 0:
                     await cancel_btn.first.click()
@@ -944,7 +963,8 @@ class JustloBot:
                 return "skipped"
 
             pick = random.choice(candidates)
-            self.log(f"[FC] Handing dialog to '{names[pick]}' (excluding own account '{own}').")
+            self.log(f"[FC] Handing dialog to '{names[pick]}' "
+                     "(excluding all Justlo-family bot accounts).")
             await rows.nth(pick).click()
             await asyncio.sleep(0.3)
 
