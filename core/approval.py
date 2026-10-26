@@ -190,12 +190,18 @@ async def request_approval(
         if resp.status_code == 409:
             data = resp.json()
             if data.get("duplicate"):
-                # Never attach a second bot loop to the existing request.  A
-                # single approval could otherwise release both loops and send
-                # two replies into the same conversation.
-                raise ApprovalCancelled(data.get("id"))
-        resp.raise_for_status()
-        req_id = resp.json()["id"]
+                # A worker may restart after the server created the card but
+                # before it began polling it. Reuse that lifecycle so recovery
+                # resumes at Approval instead of regenerating forever against
+                # the uniqueness guard.
+                req_id = data.get("id")
+                if not req_id:
+                    resp.raise_for_status()
+            else:
+                resp.raise_for_status()
+        else:
+            resp.raise_for_status()
+            req_id = resp.json()["id"]
 
         # Do not advertise the Approval stage until the server has actually
         # created the request. The POST may perform translation and safety

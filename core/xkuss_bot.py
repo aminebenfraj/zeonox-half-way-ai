@@ -364,6 +364,9 @@ class XkussBot:
         self.log("Clicking 'Daten extrahieren'...")
         await tab2.locator(_SEL_EXTRACT_BTN).click()
         self.log("Extraction triggered — waiting for 'Generate Reply' button...")
+        await tab2.locator(_SEL_GEN_BTN).wait_for(
+            state="visible", timeout=EXTRACT_TIMEOUT * 1_000,
+        )
 
     async def _is_first_contact(self, tab2) -> bool:
         try:

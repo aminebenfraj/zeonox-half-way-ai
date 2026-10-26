@@ -431,8 +431,9 @@ _GET_SERVER_ERROR_JS = """
 
 _IS_FIRST_CONTACT_JS = """
 () => {
-    const spans = [...document.querySelectorAll('span')];
-    return spans.some(s => s.textContent.trim().includes('FC') && s.textContent.trim().includes('First Contact'));
+    const badgePattern = /^FC\\s*[—–-]\\s*First Contact$/i;
+    return [...document.querySelectorAll('span')]
+        .some(span => badgePattern.test((span.textContent || '').replace(/\\s+/g, ' ').trim()));
 }
 """
 
@@ -805,6 +806,9 @@ class ChatBot:
         self.log("Clicking 'Daten extrahieren'...")
         await tab2.locator(self.cfg.sel_extract_btn).click()
         self.log("Extraction triggered — waiting for 'Generate Reply' button...")
+        await tab2.locator(self.cfg.sel_gen_btn).wait_for(
+            state="visible", timeout=EXTRACT_TIMEOUT * 1_000,
+        )
 
     async def _chat_duration_is_zero(self, tab1) -> bool:
         """True when the chat's 'Chatdauer' timer reads 00:00 (stuck chat)."""
