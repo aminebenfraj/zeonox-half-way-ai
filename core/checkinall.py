@@ -5,13 +5,14 @@ The dashboard's ``Check-in All`` button is the automated version of
 
     goldins
     + (xkussins * 0.20 * 3.4)
-    + ((justloins + linduuins + gnoxxins) * 0.17 * 3.4)
+    + ((justloins + linduuins + gnoxxins + justlo_frins) * 0.17 * 3.4)
     + 200
 
 ``goldins`` is the already-converted subtotal from the React/Gold-family
 accounts (their Ins and ASA Outs use the existing 0.15/0.05 rates). Xkuss is
 read from the ``oldview_inout.php`` account link. Justlo, Linduu, and Gnoxx are
-read from the ``Im Monat`` counter in their shared ExtJS moderation console.
+read from the ``Im Monat`` counter in their shared ExtJS moderation console;
+the same calculation applies to Justlo FR.
 
 Missing counters are reported as UNAVAILABLE and never silently replaced with
 zero or an old value. In that case the report shows a known subtotal and marks
@@ -43,12 +44,12 @@ ASA_OUT_VALUE = ASA_OUT_RATE * FX
 XKUSS_VALUE = XKUSS_RATE * FX
 SHARED_VALUE = SHARED_RATE * FX
 
-FORMULA_VERSION = 2
+FORMULA_VERSION = 3
 NOTE_PATH = Path.home() / "Desktop" / "checkinall.txt"
 STATE_PATH = Path(__file__).resolve().parent.parent / ".checkinall_state.json"
 
 REACT_NAMES = {"gold", "gold2", "diamond", "platin", "s69", "ml"}
-SHARED_NAMES = {"justlo", "linduu", "gnoxx"}
+SHARED_NAMES = ("justlo", "linduu", "gnoxx", "justlo_fr")
 
 
 def _react_money(ins: int, asa_outs: int) -> float:
@@ -120,7 +121,7 @@ def _build_note(rows: list[dict]) -> str:
     shared_values = {
         name: int(shared_rows[name]["ins"])
         if name in shared_rows and shared_rows[name].get("available") else None
-        for name in ("justlo", "linduu", "gnoxx")
+        for name in SHARED_NAMES
     }
 
     known_total = gold_money + FIXED_BONUS
@@ -169,6 +170,7 @@ def _build_note(rows: list[dict]) -> str:
         variable_line("justloins", shared_values["justlo"], SHARED_RATE),
         variable_line("linduuins", shared_values["linduu"], SHARED_RATE),
         variable_line("gnoxxins", shared_values["gnoxx"], SHARED_RATE),
+        variable_line("justlo_frins", shared_values["justlo_fr"], SHARED_RATE),
         f"  {'fixed':<12s}: {FIXED_BONUS:,.2f} DT",
     ]
 
@@ -206,7 +208,7 @@ def _build_note(rows: list[dict]) -> str:
         f"CHECK-IN ALL CALCULATOR — {now:%Y-%m-%d %H:%M:%S}\n"
         f"{sep}\n"
         "Formula: goldins + (xkussins × 0.20 × 3.4) + "
-        "((justloins + linduuins + gnoxxins) × 0.17 × 3.4) + 200\n\n"
+        "((justloins + linduuins + gnoxxins + justlo_frins) × 0.17 × 3.4) + 200\n\n"
         "Live counters:\n"
         + ("\n".join(account_lines) if account_lines else "  No platform data available")
         + "\n\nCalculator variables:\n"
@@ -246,6 +248,10 @@ def _build_note(rows: list[dict]) -> str:
             "gnoxx": (
                 shared_values["gnoxx"] * SHARED_VALUE
                 if shared_values["gnoxx"] is not None else None
+            ),
+            "justlo_fr": (
+                shared_values["justlo_fr"] * SHARED_VALUE
+                if shared_values["justlo_fr"] is not None else None
             ),
             "shared": (
                 sum(value * SHARED_VALUE for value in shared_values.values() if value is not None)

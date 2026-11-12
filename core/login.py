@@ -95,25 +95,34 @@ async def login_chameleon(page, email: str, password: str, platform: str = "", c
     else:
         print(f"{tag}Chameleon: already logged in.", flush=True)
 
-    # Step 3: Select the chat from the dropdown combobox if not already chosen.
-    # The combobox shows 'Select chat...' until a chat is picked.
+    # Step 3: Select the configured chat. A persisted selection from another
+    # platform is not good enough: the available workspace tabs and extraction
+    # rules depend on the exact chat (for example Linduu US vs Linduu FR).
     combobox = page.locator("button[role='combobox']")
     if await combobox.count() > 0:
-        combo_text = await combobox.inner_text()
-        if chat_not_selected(combo_text):
+        combo_text = (await combobox.inner_text()).strip()
+        chat_matches = combo_text.casefold() == chat_name.strip().casefold()
+        if not chat_matches:
             print(f"{tag}Chameleon: selecting chat '{chat_name}'...", flush=True)
             await combobox.click()
             await asyncio.sleep(0.5)
             # Radix UI renders options in a portal with role="option"
-            option = page.locator(f"[role='option']:has-text('{chat_name}')")
+            option = page.get_by_role("option", name=chat_name, exact=True)
             try:
                 await option.wait_for(state="visible", timeout=10_000)
-                await option.click()
+                await option.first.click()
             except Exception:
-                # Fallback: pick the first available option
-                fallback = page.locator("[role='option']")
-                if await fallback.count() > 0:
-                    await fallback.first.click()
+                # Never silently choose another chat: that can apply the wrong
+                # language/workspace rules while making startup appear healthy.
+                print(
+                    f"{tag}Chameleon: exact chat '{chat_name}' was not found; "
+                    "leaving the current selection unchanged.",
+                    flush=True,
+                )
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
             await asyncio.sleep(1.5)
         else:
             print(f"{tag}Chameleon: chat already selected ({combo_text.strip()}).", flush=True)
@@ -129,21 +138,25 @@ async def login_chameleon(page, email: str, password: str, platform: str = "", c
     print(f"{tag}Chameleon: ready. URL: {page.url}", flush=True)
 
 
-async def force_extractor_tab(page, platform: str = "") -> bool:
+async def force_extractor_tab(
+    page,
+    platform: str = "",
+    workspace_tab: str = "Extractor",
+) -> bool:
     """Force the Chat Extractor tab active regardless of its current state.
 
     Returns True if the tab is active afterwards, False if not found.
     """
     tag = f"[{platform}] " if platform else ""
-    extractor_tab = page.locator("button[role='tab']:has-text('Extractor')")
+    extractor_tab = page.get_by_role("tab", name=workspace_tab, exact=True)
     if await extractor_tab.count() == 0:
-        print(f"{tag}Chameleon: Chat Extractor tab not found on page.", flush=True)
+        print(f"{tag}Chameleon: '{workspace_tab}' workspace tab not found on page.", flush=True)
         return False
     state = await extractor_tab.get_attribute("data-state")
     if state == "active":
-        print(f"{tag}Chameleon: Chat Extractor tab already active.", flush=True)
+        print(f"{tag}Chameleon: '{workspace_tab}' workspace tab already active.", flush=True)
         return True
-    print(f"{tag}Chameleon: forcing Chat Extractor tab active...", flush=True)
+    print(f"{tag}Chameleon: forcing '{workspace_tab}' workspace tab active...", flush=True)
     await extractor_tab.click()
     await asyncio.sleep(0.5)
     state = await extractor_tab.get_attribute("data-state")
@@ -280,7 +293,11 @@ async def check_stats(page, platform: str = "") -> dict | None:
     return _normalize_stats(captured)
 
 
-async def check_chameleon(page, platform: str = "") -> bool:
+async def check_chameleon(
+    page,
+    platform: str = "",
+    workspace_tab: str = "Extractor",
+) -> bool:
     """Check whether the Chameleon tab is in the correct ready state.
 
     Prints a per-condition report and returns True if everything is OK,
@@ -315,7 +332,7 @@ async def check_chameleon(page, platform: str = "") -> bool:
         ok = False
 
     # 4. Chat Extractor tab active
-    extractor_tab = page.locator("button[role='tab']:has-text('Extractor')")
+    extractor_tab = page.get_by_role("tab", name=workspace_tab, exact=True)
     if await extractor_tab.count() > 0:
         state = await extractor_tab.get_attribute("data-state")
         tab_ok = state == "active"

@@ -43,8 +43,10 @@ async def run_browser_operation(command: str, platforms: list[str]) -> str:
                 browser = await playwright.chromium.connect_over_cdp(cfg.cdp_url)
                 context = browser.contexts[0]
                 if command == "pools":
-                    if slug not in {"justlo", "linduu", "gnoxx"}:
-                        raise ValueError("Pools is available only for Justlo, Linduu, and Gnoxx")
+                    if slug not in {"justlo", "linduu", "gnoxx", "justlo_fr"}:
+                        raise ValueError(
+                            "Pools is available only for Justlo-family moderation consoles"
+                        )
                     platform_tabs = [
                         page for page in context.pages if cfg.tab1_pattern in page.url
                     ]
@@ -92,14 +94,27 @@ async def run_browser_operation(command: str, platforms: list[str]) -> str:
                         cfg.platform,
                         cfg.chameleon_chat,
                     )
+                    await force_extractor_tab(
+                        tab,
+                        cfg.platform,
+                        getattr(cfg, "chameleon_workspace_tab", "Extractor"),
+                    )
                     output.append(f"[{cfg.platform}] Fix completed: {tab.url}")
                 elif tab is None:
                     output.append(f"[{cfg.platform}] Chameleon tab was not found.")
                 elif command == "chameleon":
-                    await check_chameleon(tab, cfg.platform)
+                    await check_chameleon(
+                        tab,
+                        cfg.platform,
+                        getattr(cfg, "chameleon_workspace_tab", "Extractor"),
+                    )
                     output.append(f"[{cfg.platform}] Chameleon check completed.")
                 else:
-                    await force_extractor_tab(tab, cfg.platform)
+                    await force_extractor_tab(
+                        tab,
+                        cfg.platform,
+                        getattr(cfg, "chameleon_workspace_tab", "Extractor"),
+                    )
                     output.append(f"[{cfg.platform}] Extractor tab activated.")
             except Exception as error:
                 if command == "pools":

@@ -2,7 +2,7 @@
 """
 ExtJS mod-site login + navigation + page-classification helpers.
 
-Shared by justlo AND linduu: both drive the SAME old ExtJS moderation console
+Shared by the Justlo-family sites: all drive the SAME old ExtJS moderation console
 (Play/Pause, the 'Unterhaltung' grid, the message box) but reach it through
 DIFFERENT login flows. Everything here is config-driven so one module serves both.
 
@@ -73,9 +73,20 @@ async def _ext_button_accessible(page, selector: str) -> bool:
 
 
 async def _on_community(page, cfg) -> bool:
-    """True when tab1 is on the logged-in community home (the 'Mod' link shows)."""
+    """True when tab1 is on a logged-in community home.
+
+    Most variants expose the Mod link directly. Justlo FR first exposes an eye
+    control and only renders ``Alter Mod`` after that control is clicked, so the
+    opener itself is also a valid logged-in marker.
+    """
     try:
-        return await page.query_selector(cfg.sel_mod_link) is not None
+        if await page.query_selector(cfg.sel_mod_link) is not None:
+            return True
+        menu_selector = getattr(cfg, "sel_mod_menu_btn", "") or ""
+        if menu_selector:
+            menu_selector = menu_selector.format(username=cfg.username)
+            return await page.query_selector(menu_selector) is not None
+        return False
     except Exception:
         return False
 
@@ -234,11 +245,20 @@ async def _open_console(page, cfg, tag: str):
         print(f"{tag}opening the moderation console at {cfg.mod_url}...", flush=True)
         await page.goto(cfg.mod_url, wait_until="domcontentloaded", timeout=30_000)
     else:
+        menu_selector = getattr(cfg, "sel_mod_menu_btn", "") or ""
+        if menu_selector:
+            menu_selector = menu_selector.format(username=cfg.username)
+            print(f"{tag}clicking the navbar eye control...", flush=True)
+            opener = page.locator(menu_selector)
+            await opener.first.wait_for(state="visible", timeout=15_000)
+            await opener.first.click()
+
         print(f"{tag}clicking 'Mod' to open the moderation console...", flush=True)
         link = page.locator(cfg.sel_mod_link)
-        if await link.count() > 0:
+        try:
+            await link.first.wait_for(state="visible", timeout=10_000)
             await link.first.click()
-        else:
+        except Exception:
             print(f"{tag}'Mod' link not found — navigating to {cfg.mod_url}", flush=True)
             await page.goto(cfg.mod_url, wait_until="domcontentloaded", timeout=30_000)
     try:

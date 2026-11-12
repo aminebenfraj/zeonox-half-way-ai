@@ -216,7 +216,7 @@ STATUS_STALE_AFTER = 45  # workflow telemetry freshness; process liveness is tra
 _mode = "manual"
 
 # Per-platform override of the review mode above, keyed by lowercase platform
-# slug ("xkuss"/"justlo"/"linduu"/"gnoxx" — see /bots). Populated only when a platform
+# slug (for example "xkuss"/"justlo"/"justlo_fr" — see /bots). Populated only when a platform
 # has explicitly chosen something other than "use the global default"; a
 # platform with no entry here just falls back to _mode. Read live on every
 # request (see create_request()'s `_mode_overrides.get(...)` lookup) — no
@@ -233,11 +233,17 @@ SKIPPABLE_APPROVAL_PLATFORMS = frozenset(SELF_MANAGED_PLATFORMS)
 # launch_all.py, kept deliberately out of this process; see KNOWN_PLATFORMS
 # above for the same reasoning). React platforms (Gold/Diamond/...) still
 # only start via launch_all.py / Bot Controls, unchanged.
-_SELF_MANAGED_CDP_PORTS = {"xkuss": 9227, "justlo": 9229, "linduu": 9230, "gnoxx": 9231}
+_SELF_MANAGED_CDP_PORTS = {
+    "xkuss": 9227,
+    "justlo": 9229,
+    "linduu": 9230,
+    "gnoxx": 9231,
+    "justlo_fr": 9233,
+}
 _BUILTIN_CDP_PORTS = {
     "gold": 9222, "diamond": 9223, "platin": 9224, "s69": 9225,
     "gold2": 9226, "xkuss": 9227, "ml": 9228, "justlo": 9229,
-    "linduu": 9230, "gnoxx": 9231, "gold3": 9232,
+    "linduu": 9230, "gnoxx": 9231, "gold3": 9232, "justlo_fr": 9233,
 }
 _PLATFORM_CREDENTIAL_ENV = {
     platform.slug: (
@@ -975,20 +981,9 @@ MISTRAL_JUDGE_MODEL = os.environ.get("MISTRAL_MODEL", "mistral-large-latest")
 
 API_PROVIDER_SPECS = (
     ("groq", "Groq", "GROQ_API_KEY", GROQ_TRANSLATION_MODEL, "Translation and meeting checks"),
-    ("mistral", "Mistral", "MISTRAL_API_KEY", MISTRAL_JUDGE_MODEL, "Judge and English-to-German translation"),
+    ("mistral", "Mistral", "MISTRAL_API_KEY", MISTRAL_JUDGE_MODEL, "Judge and reply translation"),
 )
 API_PROVIDER_BY_NAME = {item[0]: item for item in API_PROVIDER_SPECS}
-_TRANSLATION_SYSTEM_PROMPT = (
-    "Translate the user's German text into natural English. Preserve meaning, "
-    "tone, names, emojis, paragraph breaks, and punctuation. Return only the "
-    "English translation, with no notes, labels, or quotation marks."
-)
-_ENGLISH_TO_GERMAN_SYSTEM_PROMPT = (
-    "Translate the user's English reply into natural conversational German. "
-    "Preserve the exact meaning, tone, names, emojis, paragraph breaks, and "
-    "punctuation. Do not add, omit, soften, explain, or answer the text. Return "
-    "only the German translation with no label, notes, or quotation marks."
-)
 
 # Provider health is updated by real translation/meeting-guard calls and by the
 # dashboard's explicit "Check now" action. It intentionally stores only a
@@ -1106,21 +1101,35 @@ def _api_health_snapshot() -> list[dict]:
     return result
 
 
-def _translation_messages(text: str) -> list[dict[str, str]]:
+def _reply_language_for_platform(platform: str) -> tuple[str, str]:
+    """Return the authoritative send language name and short UI code."""
+    if _platform_type_for_runtime_name(platform) == "justlo_fr":
+        return "French", "FR"
+    return "German", "DE"
+
+
+def _translation_messages(text: str, source_language: str) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": _TRANSLATION_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": (
+                f"Translate the user's {source_language} text into natural English. "
+                "Preserve meaning, tone, names, emojis, paragraph breaks, and punctuation. "
+                "Return only the English translation, with no notes, labels, or quotation marks."
+            ),
+        },
         {"role": "user", "content": text},
     ]
 
 
-def _translate_with_groq(text: str) -> str | None:
+def _translate_with_groq(text: str, source_language: str = "German") -> str | None:
     client = _get_groq_test_client()
     if client is None:
         return None
     try:
         response = client.chat.completions.create(
             model=GROQ_TRANSLATION_MODEL,
-            messages=_translation_messages(text),
+            messages=_translation_messages(text, source_language),
             temperature=0,
             max_completion_tokens=1200,
             top_p=1,
@@ -1134,25 +1143,29 @@ def _translate_with_groq(text: str) -> str | None:
     return (response.choices[0].message.content or "").strip() or None
 
 
-def _translate_de_en_sync(text: str) -> str | None:
+def _translate_de_en_sync(text: str, source_language: str = "German") -> str | None:
     try:
-        return _translate_with_groq(text)
+        return _translate_with_groq(text, source_language)
     except Exception:
         return None
 
 
-def _translate_de_en(text: str, timeout: float = 22.0) -> str | None:
+def _translate_de_en(
+    text: str,
+    source_language: str = "German",
+    timeout: float = 22.0,
+) -> str | None:
     text = (text or "").strip()
     if not text:
         return None
     try:
-        future = _translate_pool.submit(_translate_de_en_sync, text)
+        future = _translate_pool.submit(_translate_de_en_sync, text, source_language)
         return future.result(timeout=timeout)
     except Exception:
         return None
 
 
-def _translate_en_de_with_mistral(text: str) -> str:
+def _translate_en_to_language_with_mistral(text: str, target_language: str) -> str:
     api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("MISTRAL_API_KEY is not configured")
@@ -1162,7 +1175,15 @@ def _translate_en_de_with_mistral(text: str) -> str:
             api_key=api_key,
             model=MISTRAL_JUDGE_MODEL,
             messages=[
-                {"role": "system", "content": _ENGLISH_TO_GERMAN_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": (
+                        f"Translate the user's English reply into natural conversational {target_language}. "
+                        "Preserve the exact meaning, tone, names, emojis, paragraph breaks, and punctuation. "
+                        "Do not add, omit, soften, explain, or answer the text. Return only the translation "
+                        "with no label, notes, or quotation marks."
+                    ),
+                },
                 {"role": "user", "content": text},
             ],
             max_tokens=1600,
@@ -1175,8 +1196,13 @@ def _translate_en_de_with_mistral(text: str) -> str:
         error = RuntimeError("Mistral returned an empty translation")
         _record_api_failure("mistral", error)
         raise error
-    _record_api_success("mistral", "English-to-German translation succeeded")
+    _record_api_success("mistral", f"English-to-{target_language} translation succeeded")
     return strip_disallowed_reply_punctuation(translated)
+
+
+def _translate_en_de_with_mistral(text: str) -> str:
+    """Compatibility wrapper for existing callers."""
+    return _translate_en_to_language_with_mistral(text, "German")
 
 
 def _now() -> str:
@@ -1197,7 +1223,7 @@ Step 2:
 - If it IS about a meeting/plans: write a reply that does ONE of: stall/procrastinate, propose a reschedule, or politely decline while keeping the conversation open.
 
 Hard rules for the "reply" field, whenever you write a new one (Step 2's meeting case):
-- Always write it in German. Never any other language, even if the input message is in a different language.
+- Always write it in __REPLY_LANGUAGE__. Never any other language, even if the input message is in a different language.
 - Never use an en dash or em dash followed by a space (no "– " and no "— ") as a stylistic pause. Use a comma or a period instead.
 
 Respond ONLY with valid JSON, no markdown fences, in this exact shape:
@@ -1220,10 +1246,10 @@ def _get_groq_test_client():
     return Groq(api_key=api_key)
 
 
-def _classify_message_with_groq(message: str) -> dict:
+def _classify_message_with_groq(message: str, reply_language: str = "German") -> dict:
     """Runs the meeting-guard prompt on `message`. Returns either
     {"ok": True, "contains_meeting", "action", "reply"} (reply already
-    sanitized — German-only instruction is the model's job, the dash strip is
+    sanitized — the requested-language instruction is the model's job, the dash strip is
     enforced here regardless of whether the model actually complied) or
     {"ok": False, "error"}."""
     client = _get_groq_test_client()
@@ -1235,7 +1261,12 @@ def _classify_message_with_groq(message: str) -> dict:
         resp = client.chat.completions.create(
             model=GROQ_TEST_MODEL,
             messages=[
-                {"role": "system", "content": _GROQ_TEST_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": _GROQ_TEST_SYSTEM_PROMPT.replace(
+                        "__REPLY_LANGUAGE__", reply_language
+                    ),
+                },
                 {"role": "user", "content": message},
             ],
             temperature=0,
@@ -1627,6 +1658,7 @@ def create_request():
     body = request.get_json(force=True, silent=True) or {}
     platform = (body.get("platform") or "unknown").strip()
     reply = strip_disallowed_reply_punctuation(body.get("reply") or "")
+    reply_language, reply_language_code = _reply_language_for_platform(platform)
     customer_message = body.get("customer_message") or ""
     # Literal latest conversation message, regardless of sender. Older bot
     # versions only send customer_message, so retain that as a display fallback.
@@ -1648,17 +1680,19 @@ def create_request():
         if existing is not None:
             return _duplicate_request_response(existing)
 
-    # Best-effort DE->EN translation so a reviewer who doesn't read German can
-    # still judge the reply. The German text is always what's authoritative /
+    # Best-effort source->EN translation for review. The platform's configured
+    # language is always what's authoritative /
     # editable / actually sent — translations are read-only context.
-    translated_reply = _translate_de_en(reply)
+    translated_reply = _translate_de_en(reply, reply_language)
     reply_en = (
         strip_disallowed_reply_punctuation(translated_reply)
         if translated_reply
         else translated_reply
     )
-    customer_message_en = _translate_de_en(customer_message) if customer_message else None
-    last_message_en = _translate_de_en(last_message) if last_message else None
+    customer_message_en = (
+        _translate_de_en(customer_message, reply_language) if customer_message else None
+    )
+    last_message_en = _translate_de_en(last_message, reply_language) if last_message else None
 
     # Meeting-alert analyzer: advisory only, never affects auto/manual routing
     # -- just a warning banner + a running conversation read for whoever ends
@@ -1682,7 +1716,7 @@ def create_request():
     # auto-send. Classifies the customer's message when the bot forwarded one
     # (most platforms do); falls back to classifying the reply text itself for
     # the platforms that currently don't (xkuss, justlo). If a meeting is
-    # detected, the German stall/reschedule/decline text replaces the reply.
+    # detected, a stall/reschedule/decline in the platform language replaces the reply.
     # If the check itself fails (key missing/invalid, network, bad JSON), this
     # fails SAFE: falls back to pending exactly like manual mode, rather than
     # auto-sending something that was never actually checked.
@@ -1691,7 +1725,7 @@ def create_request():
     contains_meeting = None  # None = guard never ran (manual mode, or fell back before checking)
     if auto:
         classify_input = customer_message.strip() or reply
-        result = _classify_message_with_groq(classify_input)
+        result = _classify_message_with_groq(classify_input, reply_language)
         if not result["ok"]:
             print(f"[MeetingGuard] Groq check failed for {platform} — holding for manual review: {result.get('error')}")
             auto = False
@@ -1740,6 +1774,8 @@ def create_request():
             "reply_type": reply_type,
             "reply": reply,
             "reply_en": reply_en,
+            "reply_language": reply_language,
+            "reply_language_code": reply_language_code,
             "final_reply": final_reply if direct_auto else None,
             "status": "approved" if direct_auto else "pending",
             "created_at": body.get("created_at") or now,
@@ -2080,9 +2116,13 @@ def translate_request_to_german(req_id):
             return jsonify({"ok": False, "error": "not found"}), 404
         if item["status"] != "pending":
             return jsonify({"ok": False, "error": f"already {item['status']}"}), 409
+        target_language = item.get("reply_language") or "German"
+        target_language_code = item.get("reply_language_code") or "DE"
 
     try:
-        german_reply = _translate_en_de_with_mistral(english_reply)
+        translated_reply = _translate_en_to_language_with_mistral(
+            english_reply, target_language
+        )
     except Exception as error:
         return jsonify({
             "ok": False,
@@ -2096,10 +2136,17 @@ def translate_request_to_german(req_id):
         if item["status"] != "pending":
             return jsonify({"ok": False, "error": f"already {item['status']}"}), 409
         item["reply_en"] = english_reply
-        item["reply"] = german_reply
+        item["reply"] = translated_reply
         item["translated_from_english"] = True
     _bump_state()
-    return jsonify({"ok": True, "reply_de": german_reply, "reply_en": english_reply})
+    return jsonify({
+        "ok": True,
+        "reply": translated_reply,
+        "reply_de": translated_reply,
+        "reply_en": english_reply,
+        "reply_language": target_language,
+        "reply_language_code": target_language_code,
+    })
 
 
 @app.post("/api/requests/<req_id>/approve")
@@ -2131,7 +2178,7 @@ def cancel_approved_send(req_id):
 
     The bot polls this state during its human-like send delay. Moving the
     request back to ``pending`` stops that countdown and makes the same card,
-    with the last approved German text, editable again.
+    with the last approved platform-language text, editable again.
     """
     with _lock:
         r = _requests.get(req_id)
@@ -2140,7 +2187,7 @@ def cancel_approved_send(req_id):
         if r["status"] != "approved":
             return jsonify({"error": f"cannot cancel send from {r['status']}"}), 409
         r["reply"] = r.get("final_reply") or r["reply"]
-        # The old translation may no longer match an edited German reply.
+        # The old translation may no longer match an edited platform-language reply.
         r["reply_en"] = ""
         r["status"] = "pending"
         r["auto"] = False
@@ -2222,7 +2269,7 @@ def skip_request(req_id):
 
     The request stays ``skip_requested`` until the bot acknowledges that the
     real platform UI action succeeded. Xkuss leaves via Home. The shared
-    Justlo/Linduu/Gnoxx engine tries ``Übergeben`` first and presses
+    Justlo-family engine tries ``Übergeben`` first and presses
     ``Überspringen`` only when no other moderator is available.
     """
     with _lock:
@@ -2235,7 +2282,7 @@ def skip_request(req_id):
         platform_type = _platform_type_for_runtime_name(platform)
         if platform_type not in SKIPPABLE_APPROVAL_PLATFORMS:
             return jsonify({
-                "error": "Skip conversation is only available for Xkuss, Justlo, Linduu, and Gnoxx"
+                "error": "Skip conversation is only available for Xkuss and Justlo-family bots"
             }), 400
         r["status"] = "skip_requested"
         r["decided_at"] = _now()
@@ -2540,10 +2587,10 @@ def control_command():
         return jsonify({"ok": False, "error": "cmd is required"}), 400
     if target != "all" and target not in PLATFORM_BY_SLUG and get_account(target) is None:
         return jsonify({"ok": False, "error": f"unknown platform '{target}'"}), 404
-    if cmd == "pools" and target not in {"justlo", "linduu", "gnoxx"}:
+    if cmd == "pools" and target not in {"justlo", "linduu", "gnoxx", "justlo_fr"}:
         return jsonify({
             "ok": False,
-            "error": "Pools is available only for Justlo, Linduu, and Gnoxx",
+            "error": "Pools is available only for Justlo-family moderation consoles",
         }), 400
 
     # Keep Stop identical on the Approval Queue and Bots pages: both stop the
@@ -2583,7 +2630,7 @@ def control_command():
         try:
             from core.checkinall import gather_and_write, load_latest_result
             platforms = ["gold", "gold2", "diamond", "platin", "s69", "ml",
-                         "xkuss", "justlo", "linduu", "gnoxx"]
+                         "xkuss", "justlo", "linduu", "gnoxx", "justlo_fr"]
             text, path = asyncio.run(gather_and_write(platforms))
             return jsonify({
                 "ok": True,
@@ -3906,7 +3953,7 @@ _PAGE = """<!doctype html>
 <main id="main">
   <div class="page-head">
     <h1>Approval Queue</h1>
-    <p>Review every AI reply before it's pasted and sent — German is what actually goes out, English is a translation for review.</p>
+    <p>Review every AI reply before it's pasted and sent — the platform language goes out, and English is a translation for review.</p>
   </div>
 
   <div class="system-status" id="systemStatus"></div>
@@ -4094,7 +4141,7 @@ const slug = (s) => "plat-" + (s || "unknown").toLowerCase().replace(/[^a-z0-9]+
 // background refresh can never silently wipe out in-progress wording changes.
 const editedReplies = new Map();
 // The English translation is editable too. Keep drafts across live refreshes
-// exactly like the authoritative German reply.
+// exactly like the authoritative platform-language reply.
 const editedEnglishReplies = new Map();
 // One-shot Chameleon instructions need the same protection from live card
 // refreshes as edits to the proposed reply.
@@ -4389,7 +4436,7 @@ const ACTION_MESSAGES = {
   skip:    { verb: "Transferring", done: "Transfer requested — the bot will skip only if nobody is online", type: "warning" },
 };
 
-const SKIPPABLE_CARD_PLATFORMS = new Set(["xkuss", "justlo", "linduu", "gnoxx"]);
+const SKIPPABLE_CARD_PLATFORMS = new Set(["xkuss", "justlo", "linduu", "gnoxx", "justlo fr"]);
 
 async function act(id, action, body, btn) {
   // Disable the whole card's action row (not just the clicked button) so a
@@ -4456,12 +4503,12 @@ async function translateEnglishToGerman(id, btn) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    const germanInput = document.getElementById(`ta-${id}`);
-    if (germanInput) germanInput.value = data.reply_de;
+    const targetInput = document.getElementById(`ta-${id}`);
+    if (targetInput) targetInput.value = data.reply;
     if (englishInput) englishInput.value = data.reply_en;
-    editedReplies.set(id, data.reply_de);
+    editedReplies.set(id, data.reply);
     editedEnglishReplies.set(id, data.reply_en);
-    toast("German reply updated", {
+    toast(`${data.reply_language || "Platform-language"} reply updated`, {
       type: "success",
       detail: "Review it, then click Approve & Send when ready.",
       duration: 3500,
@@ -4863,7 +4910,7 @@ const CTRL_BUTTONS = [
   { cmd: "fix",       label: "Fix" },
   { cmd: "stop",      label: "Stop", cls: "danger" },
 ];
-const POOLS_PLATFORMS = new Set(["justlo", "linduu", "gnoxx"]);
+const POOLS_PLATFORMS = new Set(["justlo", "linduu", "gnoxx", "justlo_fr"]);
 
 async function refreshControlStatus() {
   try {
@@ -5031,6 +5078,7 @@ function renderCheckinResult(result) {
     ["Justlo", componentValue("justlo")],
     ["Linduu", componentValue("linduu")],
     ["Gnoxx", componentValue("gnoxx")],
+    ["Justlo FR", componentValue("justlo_fr")],
     ["Bonus", result.components?.fixed],
   ];
   document.getElementById("earningsBreakdown").innerHTML = parts.map(([label, value]) => {
@@ -5189,6 +5237,8 @@ function pendingCardHtml(r) {
   const lastMessage = r.last_message || r.customer_message || "";
   const lastMessageEn = r.last_message_en || r.customer_message_en || "";
   const canSkipConversation = SKIPPABLE_CARD_PLATFORMS.has(String(r.platform || "").toLowerCase());
+  const replyLanguage = r.reply_language || "German";
+  const replyLanguageCode = r.reply_language_code || "DE";
   return `
     <div class="card" id="approval-${r.id}" data-id="${r.id}" style="--pc:${pc}">
       <div class="card-head">
@@ -5201,7 +5251,7 @@ function pendingCardHtml(r) {
       <div class="message-judge-grid">
         <div class="message-pane">
           ${lastMessage ? `
-            <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
+            <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">${escapeHtml(replyLanguageCode)}</span></div>
             <div class="de-box">${escapeHtml(lastMessage)}</div>
             ${lastMessageEn ? `
               <div class="translation-row">
@@ -5216,10 +5266,10 @@ function pendingCardHtml(r) {
       <div class="reply-composer">
         <div class="reply-composer-head">
           <div class="field-label reply-label">Proposed reply</div>
-          <span class="lang-tag tag-de">DE · editable</span>
+          <span class="lang-tag tag-de">${escapeHtml(replyLanguageCode)} · editable</span>
         </div>
         <div class="reply-language-section">
-          <textarea class="reply-input" id="ta-${r.id}" aria-label="German reply that will be sent"
+          <textarea class="reply-input" id="ta-${r.id}" aria-label="${escapeHtml(replyLanguage)} reply that will be sent"
             oninput="editedReplies.set('${r.id}', this.value)">${escapeHtml(val)}</textarea>
         </div>
         <div class="reply-language-section">
@@ -5291,6 +5341,7 @@ function autoCardHtml(r) {
   const detected = r.contains_meeting === true ? "yes" : (r.contains_meeting === false ? "no" : null);
   const changed = !!(r.meeting_guard && r.meeting_guard !== "approve" && r.final_reply && r.final_reply !== r.reply);
   const actionLabel = ACTION_LABELS[r.meeting_guard] || r.meeting_guard;
+  const replyLanguageCode = r.reply_language_code || "DE";
   return `
     <div class="card" data-id="${r.id}" style="--pc:${pc}">
       <div class="card-head">
@@ -5302,7 +5353,7 @@ function autoCardHtml(r) {
       ${meetingAlertBannerHtml(r)}
       ${conversationAnalysisHtml(r)}
       ${lastMessage ? `
-        <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">DE</span></div>
+        <div class="field-label customer-label">Last Message <span class="lang-tag tag-de">${escapeHtml(replyLanguageCode)}</span></div>
         <div class="de-box">${escapeHtml(lastMessage)}</div>
         ${lastMessageEn ? `
           <div class="translation-row">
@@ -5328,7 +5379,7 @@ function autoCardHtml(r) {
       ${judgePanelHtml(r)}
       ${changed ? `
         <div class="card-divider"></div>
-        <div class="field-label changed-label">Guard changed it to <span class="lang-tag tag-de">DE · sent</span></div>
+        <div class="field-label changed-label">Guard changed it to <span class="lang-tag tag-de">${escapeHtml(replyLanguageCode)} · sent</span></div>
         <div class="de-box">${escapeHtml(r.final_reply)}</div>
       ` : ""}
       ${r.error ? `<div class="history-error">Error: ${escapeHtml(r.error)}</div>` : ""}
@@ -5452,7 +5503,7 @@ function historyCardHtml(r) {
         <span class="badge">${escapeHtml(r.platform)}</span>
         <span class="status-badge ${r.status}">${r.status}</span>
         ${r.auto ? '<span class="status-badge" style="background:rgba(99,102,241,.15);color:var(--primary)">auto</span>' : ""}
-        ${r.meeting_guard ? `<span class="status-badge" style="background:rgba(234,179,8,.15);color:var(--warning)" title="Meeting detected — reply rewritten in German">guard: ${escapeHtml(r.meeting_guard)}</span>` : ""}
+        ${r.meeting_guard ? `<span class="status-badge" style="background:rgba(234,179,8,.15);color:var(--warning)" title="Meeting detected — reply rewritten in ${escapeHtml(r.reply_language || "German")}">guard: ${escapeHtml(r.meeting_guard)}</span>` : ""}
         <span class="time">${timeAgo(r.decided_at || r.sent_at || r.created_at)}</span>
       </div>
       <div class="history-reply">${skipState

@@ -49,7 +49,6 @@ from playwright.async_api import (
 # Reuse the shared chameleon-side pieces — they are identical for every platform.
 from core.bot import (
     _HTML_SERIALIZER_JS,
-    _GET_DE_REPLY_JS,
     _GET_QUALITY_FAILURE_JS,
     _GET_MANUAL_REVIEW_JS,
     _GET_SERVER_ERROR_JS,
@@ -128,6 +127,44 @@ _GET_CHAMELEON_REPLY_TYPE_JS = r"""() => {
   return '';
 }"""
 
+_GET_CONFIGURED_REPLY_JS = r"""(labels) => {
+  const normalized = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const key = (value) => normalized(value).toLocaleLowerCase();
+  const wanted = (labels || []).map(key).filter(Boolean);
+  const nodes = [...document.querySelectorAll('span, div, p')];
+  let label = null;
+  for (const candidate of wanted) {
+    label = nodes.find((node) => key(node.textContent) === candidate);
+    if (label) break;
+  }
+  if (!label) {
+    for (const candidate of wanted) {
+      // Chameleon may decorate and uppercase card titles, e.g.
+      // "🇩🇪 ANTWORT (DEUTSCH)". Match the configured semantic label while
+      // ignoring those presentation details. Restrict matches to an actual
+      // result card and prefer the smallest node; otherwise a page-level div
+      // that happens to contain the title wins before the title span itself.
+      label = nodes
+        .filter((node) => (
+          key(node.textContent).includes(candidate)
+          && node.closest('div[class*="rounded-2xl"]')
+        ))
+        .sort((left, right) => key(left.textContent).length - key(right.textContent).length)[0] || null;
+      if (label) break;
+    }
+  }
+  if (!label) return '';
+  const section = label.closest('div[class*="rounded-2xl"]');
+  if (!section) return '';
+  const paragraphs = [...section.querySelectorAll('p')];
+  const reply = paragraphs.find((p) => {
+    const text = normalized(p.textContent);
+    const textKey = key(text);
+    return text && !wanted.some((candidate) => textKey.includes(candidate));
+  });
+  return reply ? normalized(reply.textContent) : '';
+}"""
+
 # Transfer ('Übergeben') popup — opened from tab1's toolbar on a First Contact so
 # the dialog gets handed to another moderator instead of stalling the console.
 # The popup window itself gets a fresh Ext auto-id every time it's opened
@@ -157,6 +194,7 @@ def _transfer_excluded_accounts(current_username: str) -> set[str]:
             os.environ.get("JUSTLO_USERNAME", ""),
             os.environ.get("LINDUU_USERNAME", ""),
             os.environ.get("GNOXX_USERNAME", ""),
+            os.environ.get("JUSTLO_FR_USERNAME", ""),
         )
         if name and name.strip()
     }
@@ -201,7 +239,15 @@ class JustloConfig:
     chameleon_email:    str = ""
     chameleon_password: str = ""
     chameleon_chat:     str = "Justlo/Linduu DE"
+    chameleon_workspace_tab: str = "Extractor"
     additional_instructions: str = ""
+    # Chameleon can render more than one translated answer card.  The
+    # Justlo-family bot used to hard-code ``Antwort (Deutsch)``; platform
+    # variants can now name the card that is actually reviewed and sent.
+    reply_language_labels: tuple[str, ...] = ("Antwort (Deutsch)",)
+    # Legacy German Justlo-family queues use ASA 2/3 as nudge-only tasks.
+    # Platform variants without that rule keep the normal reply workflow.
+    asa_2_3_nudge_enabled: bool = True
 
     # ── justlo-specific selectors ────────────────────────────────────────────
     # landing page / login modal (`#login` form is unique to the logged-out page)
@@ -210,6 +256,9 @@ class JustloConfig:
     sel_login_pass: str = "#login input[name='password']"
     sel_login_btn:  str = "#login input[type='submit'][value='Einloggen']"
     # community home -> console
+    # Some variants hide the mod link behind a separate navbar control (the
+    # eye button on Justlo FR).  ``{username}`` is expanded at runtime.
+    sel_mod_menu_btn: str = ""
     sel_mod_link:   str = "a[href*='community-mod']"
     # ExtJS moderation console
     sel_play_btn:   str = "#buttonTbPlay"
@@ -379,6 +428,8 @@ class JustloBot:
             tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
             self.cfg.platform, self.cfg.chameleon_chat,
         )
+        await self._ensure_chat_selected(tab2)
+        await self._ensure_extractor_tab_active(tab2)
         self.log("[RECOVERY] Chameleon fix done.")
 
     async def _is_chat_selected(self, tab2) -> bool:
@@ -411,10 +462,14 @@ class JustloBot:
                 await option.wait_for(state="visible", timeout=10_000)
                 await option.first.click()
             except Exception:
-                fallback = tab2.locator("[role='option']")
-                if await fallback.count() > 0:
-                    self.log(f"[RECOVERY] '{chat}' not found — selecting first available chat.")
-                    await fallback.first.click()
+                self.log(
+                    f"[RECOVERY] Exact chat '{chat}' was not found — refusing "
+                    "to select a different chat."
+                )
+                try:
+                    await tab2.keyboard.press("Escape")
+                except Exception:
+                    pass
             await asyncio.sleep(1.5)
         except PlaywrightError as e:
             if _is_fatal(e):
@@ -427,11 +482,14 @@ class JustloBot:
 
     async def _ensure_extractor_tab_active(self, tab2):
         try:
-            btn = tab2.locator(_SEL_EXTRACTOR_TAB)
+            tab_name = self.cfg.chameleon_workspace_tab or "Extractor"
+            btn = tab2.get_by_role("tab", name=tab_name, exact=True)
             if await btn.count() > 0:
                 if await btn.get_attribute("data-state") != "active":
                     await btn.click()
                     await asyncio.sleep(0.5)
+            else:
+                self.log(f"[WARN] Chameleon workspace tab '{tab_name}' was not found.")
         except PlaywrightError as e:
             if _is_fatal(e):
                 raise
@@ -473,8 +531,18 @@ class JustloBot:
             self.log(f"[WARN] Could not check for First Contact: {e}")
             return False
 
+    async def _get_chameleon_reply(self, tab2) -> str:
+        labels = tuple(
+            label.strip()
+            for label in self.cfg.reply_language_labels
+            if label and label.strip()
+        )
+        if not labels:
+            labels = ("Antwort (Deutsch)",)
+        return await self._safe_evaluate(tab2, _GET_CONFIGURED_REPLY_JS, list(labels))
+
     async def _generate_reply(self, tab2, regeneration_instruction: str = "") -> str:
-        old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
+        old_reply = await self._get_chameleon_reply(tab2)
         gen_btn   = tab2.locator(_SEL_GEN_BTN)
         self.log(f"Waiting up to {EXTRACT_TIMEOUT}s for 'Generate Reply' button...")
         await gen_btn.wait_for(state="visible", timeout=EXTRACT_TIMEOUT * 1_000)
@@ -539,7 +607,7 @@ class JustloBot:
 
             while asyncio.get_event_loop().time() < deadline:
                 try:
-                    reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
+                    reply = await self._get_chameleon_reply(tab2)
                     if reply and reply != old_reply:
                         elapsed = asyncio.get_event_loop().time() - t_start
                         self.log(f"AI reply received in {elapsed:.1f}s: {reply[:80]}{'...' if len(reply) > 80 else ''}")
@@ -858,6 +926,8 @@ class JustloBot:
         Those are answered with a nudge ('Anstupsen'), not a written reply, so the
         caller skips the whole chameleon step and just waits for the next dialog.
         """
+        if not self.cfg.asa_2_3_nudge_enabled:
+            return False
         try:
             txt = await tab1.evaluate(
                 "(s) => { const el = document.querySelector(s);"
@@ -1193,6 +1263,8 @@ class JustloBot:
                 tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
                 self.cfg.platform, self.cfg.chameleon_chat,
             )
+            await self._ensure_chat_selected(tab2)
+            await self._ensure_extractor_tab_active(tab2)
 
             # A worker restart can happen after Überspringen was clicked but
             # before its confirmation was accepted. Clear that exact modal so

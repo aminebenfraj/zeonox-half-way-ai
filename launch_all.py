@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+    #!/usr/bin/env python3
 """
 Full-system launcher — one command to rule them all.
 
@@ -83,7 +83,10 @@ DEFAULT_PLATFORMS = list(DEFAULT_PLATFORM_SLUGS)
 ALL_PLATFORMS     = REACT_PLATFORMS
 CHECKINALL_PLATFORMS = [p for p in REACT_PLATFORMS if p != "gold3"] + SELF_MANAGED
 
-_CLI_ALIASES = {"plat": "platin", "g2": "gold2", "g3": "gold3", "lindu": "linduu", "just": "justlo", "gnox": "gnoxx"}
+_CLI_ALIASES = {
+    "plat": "platin", "g2": "gold2", "g3": "gold3", "lindu": "linduu",
+    "just": "justlo", "gnox": "gnoxx", "justfr": "justlo_fr", "fr": "justlo_fr",
+}
 
 def _resolve_platforms(args: list[str]) -> list[str]:
     resolved = []
@@ -114,6 +117,7 @@ _COLORS = {
     "justlo":  "\033[34m",
     "linduu":  "\033[92m",
     "gnoxx":   "\033[96m",
+    "justlo_fr": "\033[94m",
 }
 
 _ALIASES = _CLI_ALIASES
@@ -131,13 +135,13 @@ _HELP = (
     "  chameleon [platform|all]  — check if Chameleon tab is on the right page\n"
     "  extractor [platform|all]  — force-activate the Chat Extractor tab\n"
     "  fix [platform|all]        — full Chameleon re-setup: navigate + login + select chat + extractor tab\n"
-    "  pools [justlo|linduu|gnoxx] — open the moderation Pools queue and resume the bot\n"
+    "  pools [justlo|linduu|gnoxx|justlo_fr] — open the moderation Pools queue and resume the bot\n"
     "  checkins [platform|all]   — open 'Meine Statistiken' and report money made (Ins + ASA Outs)\n"
     "  checkinall                — save/update a Desktop note (checkinall.txt) with money made across all accounts\n"
     "  help                      — show this list\n"
     "  quit / exit               — stop everything and exit\n"
-    f"  Active platforms: {', '.join(PLATFORMS)}  (aliases: plat=platin, g2=gold2, lindu=linduu, gnox=gnoxx)\n"
-    f"  Launch specific: python launch_all.py gold justlo linduu gnoxx\n"
+    f"  Active platforms: {', '.join(PLATFORMS)}  (aliases: plat=platin, g2=gold2, lindu=linduu, gnox=gnoxx, fr=justlo_fr)\n"
+    f"  Launch specific: python launch_all.py gold justlo linduu gnoxx justlo_fr\n"
     f"  Every command above is also available as a button on the approval dashboard."
 )
 
@@ -236,7 +240,7 @@ async def _setup_platform(playwright, name: str, cfg):
 
 
 async def setup_all_browsers():
-    # Only React platforms are logged in here. xkuss/justlo/linduu/gnoxx sign themselves
+    # Only React platforms are logged in here. The self-managed platforms sign themselves
     # in inside their own run() (different sites + login flows), so we skip them.
     react = [n for n in PLATFORMS if n in REACT_PLATFORMS]
     skipped = [n for n in PLATFORMS if n in SELF_MANAGED]
@@ -338,7 +342,7 @@ def run_bots():
             targets = [n for n in KNOWN_PLATFORMS if n not in stopped] if target == "all" else [target]
             return [n for n in targets if n in KNOWN_PLATFORMS], KNOWN_PLATFORMS
         if cmd == "pools":
-            options = ["justlo", "linduu", "gnoxx"]
+            options = ["justlo", "linduu", "gnoxx", "justlo_fr"]
             targets = options if target == "all" else [target]
             return [n for n in targets if n in options], options
         if cmd in ("checkins", "checkin", "ins"):

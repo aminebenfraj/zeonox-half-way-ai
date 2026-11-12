@@ -29,6 +29,7 @@ PLATFORMS = (
     Platform("justlo", "Justlo", "#3b82f6", self_managed=True),
     Platform("linduu", "Linduu", "#10b981", self_managed=True),
     Platform("gnoxx", "Gnoxx", "#0ea5e9", self_managed=True),
+    Platform("justlo_fr", "Justlo FR", "#06b6d4", self_managed=True),
 )
 
 PLATFORM_BY_SLUG = {platform.slug: platform for platform in PLATFORMS}
