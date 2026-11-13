@@ -41,6 +41,7 @@ from core.bot import (
     _GET_SERVER_ERROR_JS,
     _IS_FIRST_CONTACT_JS,
     _is_fatal,
+    _stop_after_browser_disconnect,
     _is_context_destroyed,
     ManualReviewLimitExceeded,
     log_sent_message,
@@ -998,8 +999,9 @@ class XkussBot:
 
                 except Exception as e:
                     if _is_fatal(e):
-                        self.log(f"[FATAL] Browser disconnected: {e}")
-                        sys.exit(1)
+                        await _stop_after_browser_disconnect(
+                            self.cfg.platform, self.log, e,
+                        )
                     consecutive_errors += 1
                     self.log(
                         f"[ERROR] {type(e).__name__}: {e} "

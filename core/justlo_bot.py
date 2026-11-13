@@ -27,8 +27,8 @@ Flow (matches the manual process):
   4. land on an unexpected page / logged out at any point -> re-run login_justlo()
 
 Exit codes (used by launcher to decide restart):
-  0 = setup failure (Chrome unreachable, tabs cannot be opened) — do NOT restart
-  1 = runtime crash (browser dropped, repeated errors)          — DO restart
+  0 = setup failure or browser closed by the operator — do NOT restart
+  1 = recoverable runtime crash / repeated errors     — DO restart
 """
 
 import asyncio
@@ -54,6 +54,7 @@ from core.bot import (
     _GET_SERVER_ERROR_JS,
     _IS_FIRST_CONTACT_JS,
     _is_fatal,
+    _stop_after_browser_disconnect,
     _is_context_destroyed,
     ManualReviewLimitExceeded,
     log_sent_message,
@@ -153,14 +154,45 @@ _GET_CONFIGURED_REPLY_JS = r"""(labels) => {
       if (label) break;
     }
   }
-  if (!label) return '';
-  const section = label.closest('div[class*="rounded-2xl"]');
+  let section = label ? label.closest('div[class*="rounded-2xl"]') : null;
+  let draftCard = false;
+  if (!section) {
+    // A successful guarded generation is sometimes rendered in Chameleon's
+    // alternate amber draft card instead of the language-labelled cards.
+    // Its first non-italic paragraph is the authoritative French reply; the
+    // italic paragraph below it is only an English reference translation.
+    const draft = nodes
+      .filter((node) => (
+        key(node.textContent).includes('entwurf (nicht freigegeben)')
+        || key(node.textContent).includes('draft (not approved)')
+      ))
+      .sort((left, right) => key(left.textContent).length - key(right.textContent).length)[0] || null;
+    let parent = draft;
+    while (parent) {
+      if (
+        parent.tagName === 'DIV'
+        && parent.querySelectorAll('p').length > 0
+        && /qualit[aä]tspr[uü]fung|quality check/i.test(parent.textContent || '')
+      ) {
+        section = parent;
+        draftCard = true;
+        break;
+      }
+      parent = parent.parentElement;
+    }
+  }
   if (!section) return '';
   const paragraphs = [...section.querySelectorAll('p')];
   const reply = paragraphs.find((p) => {
     const text = normalized(p.textContent);
     const textKey = key(text);
-    return text && !wanted.some((candidate) => textKey.includes(candidate));
+    if (!text || wanted.some((candidate) => textKey.includes(candidate))) return false;
+    if (draftCard) {
+      const classes = String(p.className || '').toLocaleLowerCase();
+      if (classes.includes('italic')) return false;
+      if (/qualit[aä]tspr[uü]fung|bitte vor dem senden|quality check/i.test(text)) return false;
+    }
+    return true;
   });
   return reply ? normalized(reply.textContent) : '';
 }"""
@@ -193,6 +225,7 @@ def _transfer_excluded_accounts(current_username: str) -> set[str]:
             current_username,
             os.environ.get("JUSTLO_USERNAME", ""),
             os.environ.get("LINDUU_USERNAME", ""),
+            os.environ.get("LINDUU_US_USERNAME", ""),
             os.environ.get("GNOXX_USERNAME", ""),
             os.environ.get("JUSTLO_FR_USERNAME", ""),
         )
@@ -210,6 +243,87 @@ _PASTE_HTML_JS = """(payload) => {
   setter.call(ta, payload);
   ta.dispatchEvent(new Event('input', { bubbles: true }));
   return true;
+}"""
+
+# Chameleon's FR extractor expects the newer French moderation markup
+# (``#chatconversations`` with ``chat-text-left/right`` bubbles), while
+# justlo.fr currently serves the same ExtJS grid used by Justlo/Linduu. Build a
+# temporary compatibility subtree from that real grid before serialization so
+# the FR extractor receives the actual transcript instead of zero messages.
+_PREPARE_FR_CHAMELEON_HTML_JS = r"""(selectors) => {
+  document.getElementById('__zenox_fr_chameleon_adapter')?.remove();
+
+  const clean = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const root = document.createElement('section');
+  root.id = '__zenox_fr_chameleon_adapter';
+  root.style.display = 'none';
+
+  const clientName = clean(document.querySelector(selectors.client)?.textContent);
+  const fakeName = clean(document.querySelector(selectors.fake)?.textContent);
+
+  const left = document.createElement('div');
+  left.id = 'leftbox';
+  const realUsername = document.createElement('span');
+  realUsername.id = 'realusername';
+  realUsername.textContent = clientName;
+  left.appendChild(realUsername);
+
+  const right = document.createElement('div');
+  right.id = 'rightsidebox';
+  const fakeInput = document.createElement('input');
+  fakeInput.id = 'dbfake_username_full';
+  fakeInput.value = fakeName;
+  fakeInput.setAttribute('value', fakeName);
+  const fakeUsername = document.createElement('span');
+  fakeUsername.id = 'fakeusername';
+  fakeUsername.textContent = fakeName;
+  right.append(fakeInput, fakeUsername);
+
+  const conversation = document.createElement('div');
+  conversation.id = 'chatconversations';
+  const records = [];
+  document.querySelectorAll('[id^="gridview-"][id$="-body"]').forEach((body) => {
+    body.querySelectorAll(':scope > tr.x-grid-data-row').forEach((header) => {
+      const side = header.classList.contains('row-user')
+        ? 'client'
+        : header.classList.contains('row-moderator') ? 'fake' : '';
+      if (!side) return;
+      const messageRow = header.nextElementSibling;
+      if (!messageRow || !messageRow.classList.contains('row-body')) return;
+      const text = clean(messageRow.textContent);
+      if (!text) return;
+      const timestamp = clean(header.children[2]?.textContent);
+      records.push({ side, text, timestamp });
+    });
+  });
+
+  const unique = new Map();
+  for (const record of records) {
+    unique.set(`${record.side}|${record.timestamp}|${record.text}`, record);
+  }
+  const ordered = [...unique.values()].sort((leftRecord, rightRecord) =>
+    leftRecord.timestamp.localeCompare(rightRecord.timestamp)
+  );
+  for (const record of ordered) {
+    const bubble = document.createElement('div');
+    bubble.className = record.side === 'client' ? 'chat-text-left' : 'chat-text-right';
+    const message = document.createElement('span');
+    message.className = 'next-line';
+    message.textContent = record.text;
+    const date = document.createElement('span');
+    date.className = 'chat-date';
+    date.textContent = record.timestamp;
+    bubble.append(message, date);
+    conversation.appendChild(bubble);
+  }
+
+  root.append(left, right, conversation);
+  document.body.appendChild(root);
+  return { messages: ordered.length, client: !!clientName, fake: !!fakeName };
+}"""
+
+_REMOVE_FR_CHAMELEON_HTML_JS = """() => {
+  document.getElementById('__zenox_fr_chameleon_adapter')?.remove();
 }"""
 
 
@@ -240,6 +354,7 @@ class JustloConfig:
     chameleon_password: str = ""
     chameleon_chat:     str = "Justlo/Linduu DE"
     chameleon_workspace_tab: str = "Extractor"
+    chameleon_html_adapter: str = ""
     additional_instructions: str = ""
     # Chameleon can render more than one translated answer card.  The
     # Justlo-family bot used to hard-code ``Antwort (Deutsch)``; platform
@@ -275,7 +390,12 @@ class JustloConfig:
     sel_client_username: str = "#user-panel a.username"           # the client (Kunde)
     sel_fake_username:   str = "#moderator-user-panel a.username"  # the fake account
     sel_queue_message:   str = "#queue-message"                   # FASA / queue task line
-    sel_conv_grid:  str = "#gridview-1055-body"          # message rows (empty on a FASA)
+    # ``gridview-1055-body`` is an ExtJS-generated id and can shift when the
+    # console creates components in a different order.  ``conversation-grid-body``
+    # is the stable component id shared by Linduu, Linduu US, Gnoxx and Justlo FR.
+    # Keep the generated selector only as a compatibility fallback for older
+    # console builds. The grid is empty on a FASA/ASA queue task.
+    sel_conv_grid:  str = "#conversation-grid-body, #gridview-1055-body"
     sel_conv_root:  str = "#panel-1012-body"             # serialized to chameleon (profiles + convo)
 
 
@@ -357,7 +477,7 @@ class JustloBot:
         for attempt in range(retries):
             pages = context.pages
             self.log(f"Tab search (attempt {attempt + 1}/{retries}) — {len(pages)} page(s) open.")
-            tab1 = next((p for p in pages if self.cfg.tab1_pattern in p.url), None)
+            tab1 = await self._select_platform_tab(context, close_duplicates=True)
             tab2 = next((p for p in pages if tab2_pattern in p.url), None)
             if tab1 and tab2:
                 self.log(f"  Tab1 OK -> {tab1.url[:80]}")
@@ -380,7 +500,59 @@ class JustloBot:
         self.log(f"[ERROR] Could not find required tabs after {retries} attempts.")
         return None, None
 
+    async def _select_platform_tab(self, context, *, close_duplicates: bool = False):
+        """Choose the one authoritative Justlo-family tab.
+
+        ``Alter Mod`` can open the moderation console in a new tab while the
+        community page remains open. A plain hostname match then sometimes
+        selects the community page for scraping, producing an empty Chameleon
+        conversation. Prefer a real moderation console (and especially one
+        with a loaded chat), then close the redundant platform tabs.
+        """
+        matches = [
+            page for page in context.pages
+            if self.cfg.tab1_pattern.casefold() in page.url.casefold()
+        ]
+        if not matches:
+            return None
+
+        ranked = []
+        state_rank = {
+            PAGE_CHAT: 4,
+            PAGE_WAITING: 3,
+            PAGE_COMMUNITY: 2,
+            PAGE_LOGIN: 1,
+            PAGE_UNKNOWN: 0,
+        }
+        for index, page in enumerate(matches):
+            url = page.url.casefold()
+            console_url = "community-mod" in url
+            try:
+                state = await classify_page(page, self.cfg)
+            except Exception:
+                state = PAGE_UNKNOWN
+            ranked.append(((1 if console_url else 0, state_rank.get(state, 0), -index), page))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        selected = ranked[0][1]
+        if close_duplicates:
+            for _, duplicate in ranked[1:]:
+                try:
+                    self.log(f"Closing duplicate platform tab -> {duplicate.url[:80]}")
+                    await duplicate.close()
+                except PlaywrightError as error:
+                    if _is_fatal(error):
+                        raise
+                    self.log(f"[WARN] Could not close duplicate platform tab: {error}")
+        return selected
+
     async def _find_or_open_tab(self, context, url_pattern: str):
+        if url_pattern == self.cfg.tab1_pattern:
+            platform_tab = await self._select_platform_tab(
+                context, close_duplicates=True,
+            )
+            if platform_tab is not None:
+                return platform_tab
         for page in context.pages:
             if url_pattern in page.url:
                 return page
@@ -436,7 +608,7 @@ class JustloBot:
         try:
             combobox = tab2.locator(_SEL_COMBOBOX)
             if await combobox.count() == 0:
-                return True
+                return False
             combo_text = (await combobox.first.inner_text()).strip()
             if chat_not_selected(combo_text):
                 return False
@@ -480,7 +652,7 @@ class JustloBot:
         self.log(f"[RECOVERY] Chat selection {'OK' if selected else 'STILL STUCK'}.")
         return selected
 
-    async def _ensure_extractor_tab_active(self, tab2):
+    async def _ensure_extractor_tab_active(self, tab2) -> bool:
         try:
             tab_name = self.cfg.chameleon_workspace_tab or "Extractor"
             btn = tab2.get_by_role("tab", name=tab_name, exact=True)
@@ -488,12 +660,15 @@ class JustloBot:
                 if await btn.get_attribute("data-state") != "active":
                     await btn.click()
                     await asyncio.sleep(0.5)
+                return await btn.get_attribute("data-state") == "active"
             else:
                 self.log(f"[WARN] Chameleon workspace tab '{tab_name}' was not found.")
+                return False
         except PlaywrightError as e:
             if _is_fatal(e):
                 raise
             self.log(f"[WARN] Could not activate extractor tab: {e}")
+            return False
 
     async def _paste_and_extract(self, tab2, html: str):
         self.log(f"Switching to extractor tab and pasting {len(html):,} chars of HTML...")
@@ -507,7 +682,10 @@ class JustloBot:
 
         textarea = tab2.locator(_SEL_HTML_TEXTAREA)
         self.log("Waiting for HTML textarea to be visible...")
-        await textarea.wait_for(state="visible", timeout=15_000)
+        # Selecting a newly renamed Chameleon chat remounts its workspace.
+        # A cold/restarted browser can take more than 15 seconds to expose the
+        # textarea even though the correct chat and tab are already selected.
+        await textarea.wait_for(state="visible", timeout=30_000)
         self.log("Textarea ready — injecting HTML...")
         await textarea.click()
         ok = await tab2.evaluate(_PASTE_HTML_JS, html)
@@ -728,8 +906,44 @@ class JustloBot:
         # serialize document.body and wrap it in <html>...</html>. Passing the
         # workspace selector here produced a bare subtree, so the bot's capture
         # could never match HTML copied by the extension's Full Page button.
+        # ExtJS renders the pending row first and hydrates the conversation
+        # history immediately afterwards. Wait for the row set to settle so a
+        # launch-time capture cannot hand Chameleon an empty history shell.
+        previous_rows = -1
+        stable_samples = 0
+        for _ in range(10):
+            rows = await tab1.evaluate(
+                """() => Array.from(document.querySelectorAll('[role="row"]'))
+                    .filter((row) => row.offsetParent !== null).length"""
+            )
+            if rows > 0 and rows == previous_rows:
+                stable_samples += 1
+                if stable_samples >= 2:
+                    break
+            else:
+                stable_samples = 0
+            previous_rows = rows
+            await asyncio.sleep(0.25)
         await _wait_for_scrape_layout(tab1)
-        html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
+        adapter_enabled = getattr(self.cfg, "chameleon_html_adapter", "") == "fr_extjs"
+        if adapter_enabled:
+            adapter = await self._safe_evaluate(
+                tab1,
+                _PREPARE_FR_CHAMELEON_HTML_JS,
+                {
+                    "client": self.cfg.sel_client_username,
+                    "fake": self.cfg.sel_fake_username,
+                },
+            )
+            self.log(
+                "FR Chameleon adapter prepared "
+                f"{int((adapter or {}).get('messages', 0))} conversation messages."
+            )
+        try:
+            html = await self._safe_evaluate(tab1, _HTML_SERIALIZER_JS)
+        finally:
+            if adapter_enabled:
+                await self._safe_evaluate(tab1, _REMOVE_FR_CHAMELEON_HTML_JS)
         elapsed = asyncio.get_event_loop().time() - t0
         if html:
             self.log(f"HTML captured: {len(html):,} chars in {elapsed:.1f}s.")
@@ -1263,8 +1477,14 @@ class JustloBot:
                 tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
                 self.cfg.platform, self.cfg.chameleon_chat,
             )
-            await self._ensure_chat_selected(tab2)
-            await self._ensure_extractor_tab_active(tab2)
+            if not await self._ensure_chat_selected(tab2):
+                raise RuntimeError(
+                    f"Chameleon chat '{self.cfg.chameleon_chat}' was not selected"
+                )
+            if not await self._ensure_extractor_tab_active(tab2):
+                raise RuntimeError(
+                    f"Chameleon workspace tab '{self.cfg.chameleon_workspace_tab}' is unavailable"
+                )
 
             # A worker restart can happen after Überspringen was clicked but
             # before its confirmation was accepted. Clear that exact modal so
@@ -1457,8 +1677,9 @@ class JustloBot:
 
                 except Exception as e:
                     if _is_fatal(e):
-                        self.log(f"[FATAL] Browser disconnected: {e}")
-                        sys.exit(1)
+                        await _stop_after_browser_disconnect(
+                            self.cfg.platform, self.log, e,
+                        )
                     consecutive_errors += 1
                     self.log(
                         f"[WARN] {type(e).__name__}: {e} — "

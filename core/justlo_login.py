@@ -257,7 +257,28 @@ async def _open_console(page, cfg, tag: str):
         link = page.locator(cfg.sel_mod_link)
         try:
             await link.first.wait_for(state="visible", timeout=10_000)
+            # Justlo FR renders ``Alter Mod`` as a new-tab link. Keep the
+            # normal Justlo/Linduu flow in one authoritative tab; otherwise the
+            # bot can later match and scrape the leftover community page.
+            await link.first.evaluate(
+                """(el) => {
+                    const anchor = el.closest('a') || el;
+                    anchor.removeAttribute('target');
+                    anchor.setAttribute('target', '_self');
+                }"""
+            )
+            pages_before = set(page.context.pages)
             await link.first.click()
+            await asyncio.sleep(0.5)
+            # Defensive cleanup for sites whose click handler calls
+            # window.open() directly and ignores the anchor target.
+            popups = [candidate for candidate in page.context.pages if candidate not in pages_before]
+            if popups:
+                popup = popups[-1]
+                popup_url = popup.url
+                await popup.close()
+                if popup_url and popup_url != "about:blank":
+                    await page.goto(popup_url, wait_until="domcontentloaded", timeout=30_000)
         except Exception:
             print(f"{tag}'Mod' link not found — navigating to {cfg.mod_url}", flush=True)
             await page.goto(cfg.mod_url, wait_until="domcontentloaded", timeout=30_000)

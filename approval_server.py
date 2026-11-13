@@ -237,6 +237,7 @@ _SELF_MANAGED_CDP_PORTS = {
     "xkuss": 9227,
     "justlo": 9229,
     "linduu": 9230,
+    "linduu_us": 9234,
     "gnoxx": 9231,
     "justlo_fr": 9233,
 }
@@ -244,6 +245,7 @@ _BUILTIN_CDP_PORTS = {
     "gold": 9222, "diamond": 9223, "platin": 9224, "s69": 9225,
     "gold2": 9226, "xkuss": 9227, "ml": 9228, "justlo": 9229,
     "linduu": 9230, "gnoxx": 9231, "gold3": 9232, "justlo_fr": 9233,
+    "linduu_us": 9234,
 }
 _PLATFORM_CREDENTIAL_ENV = {
     platform.slug: (
@@ -1103,8 +1105,11 @@ def _api_health_snapshot() -> list[dict]:
 
 def _reply_language_for_platform(platform: str) -> tuple[str, str]:
     """Return the authoritative send language name and short UI code."""
-    if _platform_type_for_runtime_name(platform) == "justlo_fr":
+    platform_type = _platform_type_for_runtime_name(platform)
+    if platform_type == "justlo_fr":
         return "French", "FR"
+    if platform_type == "linduu_us":
+        return "English", "EN"
     return "German", "DE"
 
 
@@ -1158,6 +1163,8 @@ def _translate_de_en(
     text = (text or "").strip()
     if not text:
         return None
+    if source_language.strip().casefold() == "english":
+        return text
     try:
         future = _translate_pool.submit(_translate_de_en_sync, text, source_language)
         return future.result(timeout=timeout)
@@ -1165,15 +1172,14 @@ def _translate_de_en(
         return None
 
 
-def _translate_en_to_language_with_mistral(text: str, target_language: str) -> str:
-    api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("MISTRAL_API_KEY is not configured")
+def _translate_en_to_language_with_groq(text: str, target_language: str) -> str:
+    """Fallback used when Mistral returns an empty card translation."""
+    client = _get_groq_test_client()
+    if client is None:
+        raise RuntimeError("GROQ_API_KEY is not configured")
     try:
-        translated = openai_chat_completion(
-            url="https://api.mistral.ai/v1/chat/completions",
-            api_key=api_key,
-            model=MISTRAL_JUDGE_MODEL,
+        response = client.chat.completions.create(
+            model=GROQ_TRANSLATION_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -1186,18 +1192,72 @@ def _translate_en_to_language_with_mistral(text: str, target_language: str) -> s
                 },
                 {"role": "user", "content": text},
             ],
-            max_tokens=1600,
-            timeout=25.0,
-        ).strip()
+            temperature=0,
+            max_completion_tokens=1600,
+            top_p=1,
+            reasoning_effort="low",
+            timeout=12.0,
+        )
+        translated = (response.choices[0].message.content or "").strip()
     except Exception as error:
-        _record_api_failure("mistral", error)
+        _record_api_failure("groq", error)
         raise
     if not translated:
-        error = RuntimeError("Mistral returned an empty translation")
-        _record_api_failure("mistral", error)
+        error = RuntimeError("Groq returned an empty translation")
+        _record_api_failure("groq", error)
         raise error
-    _record_api_success("mistral", f"English-to-{target_language} translation succeeded")
+    _record_api_success("groq", f"English-to-{target_language} fallback translation succeeded")
     return strip_disallowed_reply_punctuation(translated)
+
+
+def _translate_en_to_language_with_mistral(text: str, target_language: str) -> str:
+    """Translate a card reply using the fast provider with one fallback.
+
+    The name is retained for compatibility with existing callers and tests.
+    Groq is the primary path because it consistently completes card-sized
+    translations quickly; Mistral is attempted once only when Groq fails.
+    """
+    groq_error = None
+    try:
+        return _translate_en_to_language_with_groq(text, target_language)
+    except Exception as error:
+        groq_error = error
+
+    api_key = (os.environ.get("MISTRAL_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            f"Groq translation failed ({groq_error}); MISTRAL_API_KEY is not configured"
+        ) from groq_error
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"Translate the user's English reply into natural conversational {target_language}. "
+                "Preserve the exact meaning, tone, names, emojis, paragraph breaks, and punctuation. "
+                "Do not add, omit, soften, explain, or answer the text. Return only the translation "
+                "with no label, notes, or quotation marks."
+            ),
+        },
+        {"role": "user", "content": text},
+    ]
+    try:
+        translated = openai_chat_completion(
+            url="https://api.mistral.ai/v1/chat/completions",
+            api_key=api_key,
+            model=MISTRAL_JUDGE_MODEL,
+            messages=messages,
+            max_tokens=1600,
+            timeout=12.0,
+        ).strip()
+        if not translated:
+            raise RuntimeError("Mistral returned an empty translation")
+        _record_api_success("mistral", f"English-to-{target_language} fallback translation succeeded")
+        return strip_disallowed_reply_punctuation(translated)
+    except Exception as mistral_error:
+        _record_api_failure("mistral", mistral_error)
+        raise RuntimeError(
+            f"Groq translation failed ({groq_error}); Mistral fallback failed ({mistral_error})"
+        ) from mistral_error
 
 
 def _translate_en_de_with_mistral(text: str) -> str:
@@ -1396,14 +1456,19 @@ def _probe_mistral_key() -> None:
     if not api_key:
         return
     try:
-        openai_chat_completion(
+        result = openai_chat_completion(
             url="https://api.mistral.ai/v1/chat/completions",
             api_key=api_key,
             model=MISTRAL_JUDGE_MODEL,
             messages=[{"role": "user", "content": "Reply only with OK."}],
-            max_tokens=8,
+            # The current Mistral response may include an internal thinking
+            # block before its text block. Eight tokens can finish before any
+            # visible text is emitted even when the key is valid.
+            max_tokens=128,
             timeout=12.0,
         )
+        if not result:
+            raise RuntimeError("Mistral returned an empty key-check response")
     except Exception as error:
         _record_api_failure("mistral", error)
         return
@@ -1643,6 +1708,34 @@ def _active_request_for_platform_locked(platform: str) -> dict | None:
     )
 
 
+def _retire_unacknowledged_skip_locked(platform: str) -> bool:
+    """Close a skip decision that no longer has a worker to acknowledge it.
+
+    A bot cannot submit another candidate while it is still handling the
+    transfer/skip decision for its current conversation.  Consequently, a new
+    request POST for the same platform proves that any older
+    ``skip_requested`` lifecycle was orphaned by a crash or restart.  Leaving
+    that hidden decision active makes the deduplication response attach the new
+    conversation to the old request: the UI briefly reports Approval but has no
+    pending card, and the bot then tries to skip the wrong conversation.
+
+    Retire only this already-decided state.  Pending, approved, and sending
+    requests retain the normal duplicate protection.
+    """
+    platform_key = (platform or "").strip().casefold()
+    retired = False
+    for item in _requests.values():
+        if (
+            item.get("status") == "skip_requested"
+            and str(item.get("platform") or "").strip().casefold() == platform_key
+        ):
+            item["status"] = "cancelled"
+            item["error"] = "Skip was not acknowledged before the next conversation"
+            item["decided_at"] = _now()
+            retired = True
+    return retired
+
+
 def _duplicate_request_response(existing: dict):
     return jsonify({
         "error": "this conversation already has an active approval request",
@@ -1676,9 +1769,12 @@ def create_request():
     # immediately before insertion below is still required to close the race
     # while translation and analysis run outside the lock.
     with _lock:
+        retired_skip = _retire_unacknowledged_skip_locked(platform)
         existing = _active_request_for_platform_locked(platform)
         if existing is not None:
             return _duplicate_request_response(existing)
+    if retired_skip:
+        _bump_state()
 
     # Best-effort source->EN translation for review. The platform's configured
     # language is always what's authoritative /
@@ -1757,6 +1853,7 @@ def create_request():
     with _lock:
         # Atomic uniqueness guard: at most one active approval lifecycle may
         # belong to a worker, which itself can own only one conversation.
+        retired_skip = _retire_unacknowledged_skip_locked(platform)
         existing = _active_request_for_platform_locked(platform)
         if existing is not None:
             return _duplicate_request_response(existing)
@@ -2587,7 +2684,7 @@ def control_command():
         return jsonify({"ok": False, "error": "cmd is required"}), 400
     if target != "all" and target not in PLATFORM_BY_SLUG and get_account(target) is None:
         return jsonify({"ok": False, "error": f"unknown platform '{target}'"}), 404
-    if cmd == "pools" and target not in {"justlo", "linduu", "gnoxx", "justlo_fr"}:
+    if cmd == "pools" and target not in {"justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"}:
         return jsonify({
             "ok": False,
             "error": "Pools is available only for Justlo-family moderation consoles",
@@ -2630,7 +2727,7 @@ def control_command():
         try:
             from core.checkinall import gather_and_write, load_latest_result
             platforms = ["gold", "gold2", "diamond", "platin", "s69", "ml",
-                         "xkuss", "justlo", "linduu", "gnoxx", "justlo_fr"]
+                         "xkuss", "justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"]
             text, path = asyncio.run(gather_and_write(platforms))
             return jsonify({
                 "ok": True,
@@ -2646,7 +2743,7 @@ def control_command():
     # Pools is always handled by the current dashboard code so it works even
     # when the long-running launcher predates this command. Other browser
     # operations stay local only when launcher control is unavailable.
-    if cmd == "pools" or (
+    if cmd == "pools" or (cmd in ("fix", "chameleon", "extractor") and target in {"justlo_fr", "linduu_us"}) or (
         not control_available and cmd in ("fix", "chameleon", "extractor")
     ):
         statuses = _all_bot_statuses()
@@ -2676,6 +2773,14 @@ def control_command():
             # only after the real browser click succeeds.
             pause_flag_path(target).unlink(missing_ok=True)
             _bump_state()
+        if cmd == "restart" and target != "all" and r.is_success:
+            # The old worker may have been blocked inside wait_for_approval().
+            # Once it is replaced, that card can never complete and must not
+            # remain actionable beside the new worker's card.
+            _cancel_pending_for_platform(
+                target,
+                "Bot restarted; stale approval card cancelled",
+            )
         return Response(r.content, status=r.status_code, mimetype="application/json")
     except Exception as e:
         return jsonify({"ok": False, "error": f"Launcher control server unreachable at {LAUNCHER_CONTROL_URL}: {e}"}), 502
@@ -3928,6 +4033,7 @@ _PAGE = """<!doctype html>
     <a href="/settings" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"/></svg></span><span>Settings</span></a>
     <a href="/judge-prompt" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h11l5 5v11H4z"/><path d="M15 4v5h5M8 14h8M8 17h6"/></svg></span><span>Judge Prompt</span></a>
     <a href="/instruction-prompts" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span><span>Instruction Prompts</span></a>
+    <a href="/chat-html-to-json" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h14v16H5z"/><path d="m9 9-2 3 2 3M15 9l2 3-2 3M13 8l-2 8"/></svg></span><span>Chat HTML → JSON</span></a>
     <a href="/api-keys" class="sidebar-link"><span class="sidebar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M15 8l2 2M17 6l2 2"/></svg></span><span>API Keys</span></a>
   </nav>
   <div class="sidebar-controls">
@@ -4436,7 +4542,7 @@ const ACTION_MESSAGES = {
   skip:    { verb: "Transferring", done: "Transfer requested — the bot will skip only if nobody is online", type: "warning" },
 };
 
-const SKIPPABLE_CARD_PLATFORMS = new Set(["xkuss", "justlo", "linduu", "gnoxx", "justlo fr"]);
+const SKIPPABLE_CARD_PLATFORMS = new Set(["xkuss", "justlo", "linduu", "linduu us", "gnoxx", "justlo fr"]);
 
 async function act(id, action, body, btn) {
   // Disable the whole card's action row (not just the clicked button) so a
@@ -4514,7 +4620,7 @@ async function translateEnglishToGerman(id, btn) {
       duration: 3500,
     });
   } catch (error) {
-    toast("Could not translate with Mistral", {
+    toast("Could not translate reply", {
       type: "error",
       detail: String(error.message || error),
       duration: 6000,
@@ -4689,8 +4795,7 @@ function detectorFor(name) {
   // both built-in and added accounts through /api/platforms before deciding
   // whether a detector is live.
   const platformSlug = platformSlugMap.get(name) || name.toLowerCase();
-  const launcherProcess = controlsAvailable ? controlPlatformState[platformSlug] : null;
-  const process = launcherProcess || botProcessState[platformSlug] || null;
+  const process = effectiveProcessState(platformSlug);
   const processRunning = process && (process.state === "running" || process.running === true);
   const processStopped = process && (
     process.state === "stopped" || process.state === "dead" || process.running === false
@@ -4778,9 +4883,9 @@ function colorFor(name) {
 }
 
 // ── Bot controls (restart/fix/checkinall/... — proxied to launch_all.py) ───
-// The dashboard's display names ("S69", "Justlo", ...) are just the lowercase
-// launch_all.py platform slug ("s69", "justlo", ...) capitalized, so no
-// separate name-mapping table is needed here.
+// Display labels are not always lowercase slugs: "Justlo FR" and "Linduu US"
+// map to "justlo_fr" and "linduu_us".  init() fills platformSlugMap from the
+// canonical /api/platforms response before rendering controls.
 let controlsAvailable = false;
 let checkinAllRunning = false;
 let globalPauseRunning = false;
@@ -4791,6 +4896,19 @@ let botProcessState = {}; // dashboard-managed bot Popen/CDP state from /api/bot
 // renderSections() fully rebuilds #sections on every poll — without this the
 // panel would vanish again 1.5s after a command finished.
 let controlOutputs = new Map(); // slug -> output text
+
+function effectiveProcessState(platformSlug) {
+  const bot = botProcessState[platformSlug] || null;
+  const launcher = controlsAvailable ? (controlPlatformState[platformSlug] || null) : null;
+
+  // /api/bots/status validates the worker's reported PID.  It therefore wins
+  // when an older launcher still remembers the same platform as dead.  This
+  // is common after a crash-loop worker is started outside that launcher and
+  // used to make live external bots disappear from the home dashboard.
+  if (bot && bot.running === true) return bot;
+  if (launcher && launcher.state === "running") return launcher;
+  return bot || launcher;
+}
 
 function updateGlobalPauseControl() {
   const btn = document.getElementById("globalPauseBtn");
@@ -4910,7 +5028,7 @@ const CTRL_BUTTONS = [
   { cmd: "fix",       label: "Fix" },
   { cmd: "stop",      label: "Stop", cls: "danger" },
 ];
-const POOLS_PLATFORMS = new Set(["justlo", "linduu", "gnoxx", "justlo_fr"]);
+const POOLS_PLATFORMS = new Set(["justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"]);
 
 async function refreshControlStatus() {
   try {
@@ -4991,14 +5109,17 @@ function closeControlOutput(slug) {
 }
 
 function ctrlBarHtml(name) {
-  const slug = name.toLowerCase();
-  const st = controlPlatformState[slug] || botProcessState[slug];
+  const slug = platformSlugMap.get(name)
+    || name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const st = effectiveProcessState(slug);
   let pillHtml = "";
   if (st) {
-    const label = st.state === "running"
+    const isRunning = st.state === "running" || st.running === true;
+    const stateClass = isRunning ? "running" : (st.state || "stopped");
+    const label = isRunning
       ? `${st.paused ? "PAUSED" : "RUNNING"} ${fmtUptime(st.uptime)}${st.crashes ? ` · ${st.crashes} crash${st.crashes === 1 ? "" : "es"}` : ""}`
       : st.state === "dead" ? `DEAD (exit ${st.exit_code})` : "STOPPED";
-    pillHtml = `<span class="ctrl-status-pill ${escapeHtml(st.state)}">${escapeHtml(label)}</span>`;
+    pillHtml = `<span class="ctrl-status-pill ${escapeHtml(stateClass)}">${escapeHtml(label)}</span>`;
   }
   let platformButtons = [...CTRL_BUTTONS];
   if (POOLS_PLATFORMS.has(slug)) {
@@ -5077,6 +5198,7 @@ function renderCheckinResult(result) {
     ["Xkuss", result.components?.xkuss],
     ["Justlo", componentValue("justlo")],
     ["Linduu", componentValue("linduu")],
+    ["Linduu US", componentValue("linduu_us")],
     ["Gnoxx", componentValue("gnoxx")],
     ["Justlo FR", componentValue("justlo_fr")],
     ["Bonus", result.components?.fixed],
@@ -6759,6 +6881,30 @@ def judge_prompt_page():
 @app.get("/instruction-prompts")
 def instruction_prompts_page():
     return render_template("instruction_prompts.html")
+
+
+@app.post("/api/chat-html-to-json/translate")
+def translate_chat_html_last_message():
+    body = request.get_json(force=True, silent=True) or {}
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"ok": False, "error": "A last message is required."}), 400
+    text = text.strip()
+    if len(text) > 8000:
+        return jsonify({"ok": False, "error": "The last message is too long to translate."}), 400
+
+    translation = _translate_de_en(text, "original-language")
+    if not translation:
+        return jsonify({
+            "ok": False,
+            "error": "English translation is unavailable. Check the Groq API key and provider status.",
+        }), 503
+    return jsonify({"ok": True, "translation": translation})
+
+
+@app.get("/chat-html-to-json")
+def chat_html_to_json_page():
+    return render_template("chat_html_to_json.html")
 
 
 def main():

@@ -28,6 +28,13 @@ PLATFORMS = (
     Platform("xkuss", "Xkuss", "#ef4444", self_managed=True),
     Platform("justlo", "Justlo", "#3b82f6", self_managed=True),
     Platform("linduu", "Linduu", "#10b981", self_managed=True),
+    Platform(
+        "linduu_us",
+        "Linduu US",
+        "#34d399",
+        self_managed=True,
+        enabled_by_default=False,
+    ),
     Platform("gnoxx", "Gnoxx", "#0ea5e9", self_managed=True),
     Platform("justlo_fr", "Justlo FR", "#06b6d4", self_managed=True),
 )

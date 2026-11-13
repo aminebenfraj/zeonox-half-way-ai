@@ -4,8 +4,8 @@ Hardened chat automation core for all platforms.
 Instantiate ChatBot with a BotConfig and call .run().
 
 Exit codes (used by launcher to decide restart):
-  0 = setup failure (tabs not found, Chrome unreachable) — do NOT restart
-  1 = runtime crash (browser dropped, repeated errors)   — DO restart
+  0 = setup failure or browser closed by the operator — do NOT restart
+  1 = recoverable runtime crash / repeated errors     — DO restart
 """
 
 import asyncio
@@ -68,6 +68,22 @@ _FATAL_SUBSTRINGS = (
 def _is_fatal(e: Exception) -> bool:
     msg = str(e).lower()
     return any(s in msg for s in _FATAL_SUBSTRINGS)
+
+async def _stop_after_browser_disconnect(platform: str, log, error: Exception):
+    """Treat closing the bot's Chrome window as an intentional Stop action.
+
+    The launcher restarts exit-code 1 workers. A CDP disconnect used to take
+    that path, so Chrome immediately reopened after the operator closed it.
+    Exit cleanly instead while leaving ordinary runtime failures restartable.
+    """
+    log(f"[STOP] Browser was closed — stopping {platform} without reopening it: {error}")
+    await report_status(
+        platform,
+        "stopped",
+        "Browser window closed by operator",
+        checkpoint="stopped",
+    )
+    raise SystemExit(0)
 
 def _is_context_destroyed(e: Exception) -> bool:
     return "execution context was destroyed" in str(e).lower()
@@ -259,7 +275,7 @@ _FALLBACK_HTML_SERIALIZER_JS = """(rootSel) => {
   }
 
   const HTML_ATTRS = [
-    'src','srcset','alt','href',
+    'src','srcset','alt','href','class',
     'placeholder','rows','cols','type','name',
     'width','height','loading','decoding','data-nimg',
     'data-sender','data-gender','data-persona','data-client',
@@ -1438,8 +1454,9 @@ class ChatBot:
 
                 except Exception as e:
                     if _is_fatal(e):
-                        self.log(f"[FATAL] Browser disconnected: {e}")
-                        sys.exit(1)
+                        await _stop_after_browser_disconnect(
+                            self.cfg.platform, self.log, e,
+                        )
 
                     consecutive_errors += 1
                     if first_error_time is None:

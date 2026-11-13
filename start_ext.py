@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Launch the ExtJS-console bots (justlo + linduu) together.
+Launch the ExtJS-console bots (justlo + linduu + linduu_us) together.
 
-These two share the old ExtJS moderation console but each logs in on its own
+These platforms share the old ExtJS moderation console but each logs in on its own
 site, so — unlike the React platforms in launch_all.py — every bot brings up its
 own Chrome and signs itself in (see core/justlo_bot.py). This launcher just
 spawns the run_bot.py subprocesses and keeps them alive with crash-restart.
@@ -19,9 +19,10 @@ Restart policy:
   exit code 1 = runtime crash    → restart with exponential backoff
 
 Usage:
-    python start_ext.py                 # launch justlo + linduu
+    python start_ext.py                 # launch justlo + linduu + linduu_us
     python start_ext.py justlo          # launch only justlo
     python start_ext.py linduu          # launch only linduu
+    python start_ext.py linduu_us       # launch only Linduu US
 """
 
 import sys
@@ -41,7 +42,7 @@ from core.process_visibility import apply_current_console_visibility, process_wi
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-ALL_PLATFORMS = ["justlo", "linduu"]
+ALL_PLATFORMS = ["justlo", "linduu", "linduu_us"]
 BASE_DIR = Path(__file__).parent
 
 
@@ -66,6 +67,7 @@ CRASH_WINDOW       = 300   # reset crash counter if a bot ran this long without 
 _COLORS = {
     "justlo": "\033[34m",   # blue
     "linduu": "\033[32m",   # green
+    "linduu_us": "\033[92m", # bright green
 }
 _RESET = "\033[0m"
 _BOLD  = "\033[1m"

@@ -99,6 +99,17 @@ async def login_chameleon(page, email: str, password: str, platform: str = "", c
     # platform is not good enough: the available workspace tabs and extraction
     # rules depend on the exact chat (for example Linduu US vs Linduu FR).
     combobox = page.locator("button[role='combobox']")
+    try:
+        # The AgentWorkspace route can finish navigation before React mounts
+        # the chat picker. Treating count()==0 at that instant as success leaves
+        # the bot on "Chat auswählen" with no extractor or Generate button.
+        await combobox.first.wait_for(state="visible", timeout=15_000)
+    except Exception:
+        print(
+            f"{tag}Chameleon: chat selector did not become visible; "
+            "workspace is not ready.",
+            flush=True,
+        )
     if await combobox.count() > 0:
         combo_text = (await combobox.inner_text()).strip()
         chat_matches = combo_text.casefold() == chat_name.strip().casefold()

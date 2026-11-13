@@ -44,7 +44,7 @@ def _flatten_profile(raw) -> dict:
         if value:
             out[label] = value
 
-    details = raw.get("additional_details") or raw.get("details") or {}
+    details = raw.get("additional_details") or raw.get("details") or raw.get("fields") or {}
     if isinstance(details, dict):
         for key, value in details.items():
             value = _text(value)
@@ -55,6 +55,9 @@ def _flatten_profile(raw) -> dict:
         value = _text(raw.get(key))
         if value:
             out[label] = value
+    other_information = _text(raw.get("sonstige_informationen"))
+    if other_information:
+        out["Sonstige Informationen"] = other_information
     return out
 
 
@@ -154,7 +157,13 @@ def normalize_chameleon_data(raw: dict) -> dict:
     """Normalize Xkuss and Justlo/Linduu/Gnoxx JSON into dashboard fields."""
     if not isinstance(raw, dict):
         raw = {}
-    client_raw = _field(raw, "client", "client_information", "client_info") or {}
+    client_raw = _field(
+        raw,
+        "client",
+        "client_details",
+        "client_information",
+        "client_info",
+    ) or {}
     fake_raw = _field(raw, "fake_account", "fake", "fake_information", "fake_info") or {}
     client_username = _profile_username(client_raw)
     fake_username = _profile_username(fake_raw)
@@ -179,7 +188,14 @@ def normalize_chameleon_data(raw: dict) -> dict:
             if last_customer:
                 break
     if not last_customer:
-        last_customer = _text(_field(raw, "last_client_message", "last_customer_message"))
+        last_customer = _text(_field(
+            raw,
+            "last_client_message",
+            "last_customer_message",
+            # The renamed Justlo FR workspace exposes the customer-side value
+            # under this legacy extractor key.
+            "last_real_message",
+        ))
 
     # Normalized transcript for the meeting-alert analyzer -- which side sent
     # each message matters more than anything else there (see

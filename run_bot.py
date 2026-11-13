@@ -24,7 +24,7 @@ for _stream in (sys.stdout, sys.stderr):
 def main():
     if len(sys.argv) < 2:
         print("Usage: python run_bot.py <platform>")
-        print("Available platforms: gold, gold2, gold3, diamond, platin, s69, ml, xkuss, justlo, linduu, gnoxx, justlo_fr")
+        print("Available platforms: gold, gold2, gold3, diamond, platin, s69, ml, xkuss, justlo, linduu, linduu_us, gnoxx, justlo_fr")
         sys.exit(1)
 
     platform = sys.argv[1].lower()

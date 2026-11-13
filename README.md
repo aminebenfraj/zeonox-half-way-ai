@@ -24,8 +24,8 @@ http://127.0.0.1:8799/
 ```
 
 Open `/bots` to start or stop any supported platform individually. Gold,
-Gold2, Gold3, Diamond, Platin, S69, ML, Xkuss, Justlo, Linduu, Gnoxx, and
-Justlo FR all use the same lifecycle controls. If only the dashboard is running,
+Gold2, Gold3, Diamond, Platin, S69, ML, Xkuss, Justlo, Linduu, Linduu US,
+Gnoxx, and Justlo FR all use the same lifecycle controls. If only the dashboard is running,
 starting any platform also starts the central launcher automatically.
 
 Each bot card also has a **Login credentials** dropdown. Saving updates that
@@ -49,7 +49,7 @@ by every platform. Manual mode can show or skip Judge analysis while still
 requiring human approval. Automatic mode can use the current 10/10 + manual
 fallback, run the Judge while requiring manual approval for every score, reject
 lower Judge scores so the bot regenerates, or send directly without Judge.
-Justlo, Linduu, Gnoxx, and Justlo FR can either transfer/skip Chameleon
+Justlo, Linduu, Linduu US, Gnoxx, and Justlo FR can either transfer/skip Chameleon
 First Contact conversations or answer them through the normal workflow.
 Runtime visibility can keep the current CMD/Chrome windows or launch future
 bot processes with hidden consoles and headless Chrome. Existing Chrome

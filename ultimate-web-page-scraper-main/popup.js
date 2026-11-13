@@ -477,7 +477,7 @@ function serializeAccessibilityTree(rootSelector) {
     }
 
     const HTML_ATTRS = [
-      'src','srcset','alt','href',
+      'src','srcset','alt','href','class',
       'placeholder','rows','cols','type','name',
       'width','height','loading','decoding','data-nimg',
       // semantic chat annotations injected by annotateChatMessages()

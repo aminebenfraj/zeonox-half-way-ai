@@ -1,10 +1,27 @@
 """Browser maintenance operations shared by web and terminal controls."""
 
-from importlib import import_module
+import os
+import sys
+from importlib import import_module, reload
+from pathlib import Path
 
+from dotenv import dotenv_values
 from playwright.async_api import TimeoutError as PlaywrightTimeout, async_playwright
 
 from core.login import check_chameleon, force_extractor_tab, login_chameleon
+
+
+_BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _fresh_platform_config(slug: str):
+    """Load current dashboard-edited credentials/chat settings for an operation."""
+    for key, value in dotenv_values(_BASE_DIR / ".env").items():
+        if value is not None:
+            os.environ[key] = value
+    module_name = f"configs.{slug}"
+    module = reload(sys.modules[module_name]) if module_name in sys.modules else import_module(module_name)
+    return module.config
 
 
 async def _dismiss_message_box(page, *, timeout: int, required: bool) -> bool:
@@ -38,12 +55,12 @@ async def run_browser_operation(command: str, platforms: list[str]) -> str:
     output: list[str] = []
     async with async_playwright() as playwright:
         for slug in platforms:
-            cfg = import_module(f"configs.{slug}").config
+            cfg = _fresh_platform_config(slug)
             try:
                 browser = await playwright.chromium.connect_over_cdp(cfg.cdp_url)
                 context = browser.contexts[0]
                 if command == "pools":
-                    if slug not in {"justlo", "linduu", "gnoxx", "justlo_fr"}:
+                    if slug not in {"justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"}:
                         raise ValueError(
                             "Pools is available only for Justlo-family moderation consoles"
                         )

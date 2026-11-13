@@ -23,6 +23,9 @@ def openai_chat_completion(
         "model": model,
         "messages": messages,
         "temperature": 0,
+        # Mistral requires top_p=1 when temperature=0 (greedy sampling).
+        # Omitting it currently returns HTTP 400 even when the API key is valid.
+        "top_p": 1,
         "max_tokens": max_tokens,
         "stream": False,
     }
@@ -35,4 +38,19 @@ def openai_chat_completion(
         timeout=timeout,
     )
     response.raise_for_status()
-    return (response.json()["choices"][0]["message"]["content"] or "").strip()
+    content = response.json()["choices"][0]["message"]["content"]
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        # Newer Mistral responses can use OpenAI-style structured content
+        # blocks: [{"type": "text", "text": "..."}].
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts).strip()
+    return str(content or "").strip()

@@ -28,6 +28,9 @@ config = JustloConfig(
     chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
     chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
     chameleon_chat="Justlo/Linduu DE",
+    # The selected Linduu chat exposes Solo/Team/Qualität/Justlo.  The
+    # extraction workspace is labelled "Justlo", not the legacy "Extractor".
+    chameleon_workspace_tab="Justlo",
     additional_instructions="",
 
     # ── linduu login selectors (dedicated /auth/index/login form) ──────────────

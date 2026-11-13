@@ -21,8 +21,9 @@ config = JustloConfig(
 
     chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
     chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
-    # The real service follows the same Justlo/Linduu Chameleon workflow.
-    chameleon_chat="Justlo/Linduu DE",
+    chameleon_chat="GNox",
+    # The dedicated GNox chat names its extraction workspace "GNox".
+    chameleon_workspace_tab="GNox",
     additional_instructions="",
 
     sel_login_link="",

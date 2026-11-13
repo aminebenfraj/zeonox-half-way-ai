@@ -85,6 +85,7 @@ CHECKINALL_PLATFORMS = [p for p in REACT_PLATFORMS if p != "gold3"] + SELF_MANAG
 
 _CLI_ALIASES = {
     "plat": "platin", "g2": "gold2", "g3": "gold3", "lindu": "linduu",
+    "linduuus": "linduu_us", "lus": "linduu_us",
     "just": "justlo", "gnox": "gnoxx", "justfr": "justlo_fr", "fr": "justlo_fr",
 }
 
@@ -116,6 +117,7 @@ _COLORS = {
     "xkuss":   "\033[31m",
     "justlo":  "\033[34m",
     "linduu":  "\033[92m",
+    "linduu_us": "\033[38;5;48m",
     "gnoxx":   "\033[96m",
     "justlo_fr": "\033[94m",
 }
@@ -135,13 +137,13 @@ _HELP = (
     "  chameleon [platform|all]  — check if Chameleon tab is on the right page\n"
     "  extractor [platform|all]  — force-activate the Chat Extractor tab\n"
     "  fix [platform|all]        — full Chameleon re-setup: navigate + login + select chat + extractor tab\n"
-    "  pools [justlo|linduu|gnoxx|justlo_fr] — open the moderation Pools queue and resume the bot\n"
+    "  pools [justlo|linduu|linduu_us|gnoxx|justlo_fr] — open the moderation Pools queue and resume the bot\n"
     "  checkins [platform|all]   — open 'Meine Statistiken' and report money made (Ins + ASA Outs)\n"
     "  checkinall                — save/update a Desktop note (checkinall.txt) with money made across all accounts\n"
     "  help                      — show this list\n"
     "  quit / exit               — stop everything and exit\n"
-    f"  Active platforms: {', '.join(PLATFORMS)}  (aliases: plat=platin, g2=gold2, lindu=linduu, gnox=gnoxx, fr=justlo_fr)\n"
-    f"  Launch specific: python launch_all.py gold justlo linduu gnoxx justlo_fr\n"
+    f"  Active platforms: {', '.join(PLATFORMS)}  (aliases: plat=platin, g2=gold2, lindu=linduu, lus=linduu_us, gnox=gnoxx, fr=justlo_fr)\n"
+    f"  Launch specific: python launch_all.py gold justlo linduu linduu_us gnoxx justlo_fr\n"
     f"  Every command above is also available as a button on the approval dashboard."
 )
 
@@ -342,7 +344,7 @@ def run_bots():
             targets = [n for n in KNOWN_PLATFORMS if n not in stopped] if target == "all" else [target]
             return [n for n in targets if n in KNOWN_PLATFORMS], KNOWN_PLATFORMS
         if cmd == "pools":
-            options = ["justlo", "linduu", "gnoxx", "justlo_fr"]
+            options = ["justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"]
             targets = options if target == "all" else [target]
             return [n for n in targets if n in options], options
         if cmd in ("checkins", "checkin", "ins"):

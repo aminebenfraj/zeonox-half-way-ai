@@ -22,8 +22,8 @@ config = JustloConfig(
 
     chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
     chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
-    chameleon_chat=os.environ.get("JUSTLO_FR_CHAMELEON_CHAT", "Linduu FR"),
-    chameleon_workspace_tab="FR",
+    chameleon_chat=os.environ.get("JUSTLO_FR_CHAMELEON_CHAT", "Justlo FR"),
+    chameleon_workspace_tab="Justlo FR",
     additional_instructions="",
     reply_language_labels=(
         "Antwort (Französisch)",
@@ -46,6 +46,11 @@ config = JustloConfig(
     ),
     sel_mod_link='text="Alter Mod"',
 )
+
+# Assigned after construction so a long-running launcher that still has an
+# older JustloConfig class can reload this module without rejecting a new
+# constructor keyword. Fresh workers read the attribute normally.
+config.chameleon_html_adapter = "fr_extjs"
 
 
 bot_class = JustloBot
