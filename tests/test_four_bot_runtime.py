@@ -36,6 +36,23 @@ class FourBotRuntimeTests(unittest.TestCase):
         self.assertIn("const process = effectiveProcessState(platformSlug);", page)
         self.assertIn("const st = effectiveProcessState(slug);", page)
 
+    def test_home_and_bots_cards_include_the_complete_health_summary(self):
+        for page in (approval_server._PAGE, approval_server._BOTS_PAGE):
+            with self.subTest(page="bots" if page is approval_server._BOTS_PAGE else "home"):
+                for label in (
+                    "Overall",
+                    "Last heartbeat",
+                    "Stage",
+                    "Restarts",
+                    "Pending",
+                    "Last error",
+                    "Chrome",
+                    "Console",
+                    "Chameleon",
+                    "API",
+                ):
+                    self.assertIn(label, page)
+
 
 if __name__ == "__main__":
     unittest.main()

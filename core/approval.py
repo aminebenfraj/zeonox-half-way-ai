@@ -447,6 +447,7 @@ async def report_status(
     retry_count: int = 0,
     warning: str = "",
     checkpoint: str = "",
+    components: dict | None = None,
 ):
     """Best-effort workflow telemetry for the live dashboard.
 
@@ -467,6 +468,7 @@ async def report_status(
                     "warning": warning,
                     "checkpoint": checkpoint,
                     "cancellable_send": True,
+                    "components": components,
                 },
             )
     except Exception:

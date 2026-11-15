@@ -27,10 +27,11 @@ Endpoints:
   GET  /api/status                -> live per-platform state (dashboard polls this)
   GET  /                          -> the dashboard page (dark, auto-refreshing)
 
-State lives in memory only (a handful of concurrent platforms, short-lived
-requests) — restarting this process drops any requests that were mid-review,
-any live status, and resets the review mode back to "manual"; the affected
-bot's next generate/status ping simply creates a fresh one.
+Approval requests, history, and review-mode choices are persisted in SQLite.
+The in-memory dictionaries remain the fast live view, but every lifecycle
+transition is committed before its API call returns so a dashboard restart
+restores the same request IDs. Workflow telemetry is intentionally ephemeral
+and repopulates from bot heartbeats after startup.
 """
 
 import asyncio
@@ -40,6 +41,7 @@ import itertools
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -59,6 +61,7 @@ from flask import Flask, jsonify, render_template, request, Response
 from dotenv import dotenv_values, set_key
 
 from core.ai_providers import openai_chat_completion
+from core.approval_store import ApprovalStore
 from core.launcher import is_cdp_ready
 from core.bot_lifecycle import LauncherClient
 from core.bot_accounts import (
@@ -149,6 +152,10 @@ _FALLBACK_PALETTE = ["#8b5cf6", "#06b6d4", "#f97316", "#14b8a6", "#a855f7"]
 LAUNCHER_CONTROL_URL = os.environ.get("LAUNCHER_CONTROL_URL", "http://127.0.0.1:8800")
 _BASE_DIR = Path(__file__).resolve().parent
 _ENV_PATH = _BASE_DIR / ".env"
+_APPROVAL_DB_PATH = Path(
+    os.environ.get("APPROVAL_DB_PATH")
+    or (_BASE_DIR / "secrets" / "approval_state.sqlite3")
+)
 _env_write_lock = threading.Lock()
 _launcher_client = LauncherClient(LAUNCHER_CONTROL_URL, _BASE_DIR)
 
@@ -177,6 +184,75 @@ def _require_auth():
 _lock = threading.Lock()
 _requests: dict[str, dict] = {}
 _order = itertools.count()  # monotonic insertion counter, used to sort newest-first
+_request_store: ApprovalStore | None = None
+_request_store_init_lock = threading.Lock()
+
+
+def _persist_request_locked(item: dict) -> None:
+    """Commit one request while the caller still owns ``_lock``."""
+    if _request_store is not None:
+        _request_store.upsert_request(item)
+
+
+def _delete_persisted_request_locked(request_id: str) -> None:
+    if _request_store is not None:
+        _request_store.delete_request(request_id)
+
+
+def _persist_dashboard_state_locked() -> None:
+    if _request_store is None:
+        return
+    _request_store.save_state("mode", _mode)
+    _request_store.save_state("mode_overrides", _mode_overrides)
+
+
+def _initialize_request_store() -> ApprovalStore:
+    """Open SQLite once and rebuild the live request dictionary from disk."""
+    global _request_store, _order, _mode, _mode_overrides, _active_health_alerts
+    with _request_store_init_lock:
+        if _request_store is not None:
+            return _request_store
+
+        store = ApprovalStore(_APPROVAL_DB_PATH)
+        restored = store.load_requests()
+        restored_mode = store.load_state("mode", _mode)
+        restored_overrides = store.load_state("mode_overrides", _mode_overrides)
+        restored_alerts = store.load_state("active_health_alerts", {})
+        if restored_mode not in ("manual", "auto"):
+            restored_mode = "manual"
+        if not isinstance(restored_overrides, dict):
+            restored_overrides = {}
+        if not isinstance(restored_alerts, dict):
+            restored_alerts = {}
+        restored_overrides = {
+            str(key): value
+            for key, value in restored_overrides.items()
+            if value in ("manual", "auto")
+        }
+
+        with _lock:
+            _requests.clear()
+            _requests.update({item["id"]: item for item in restored})
+            next_sequence = max(
+                (int(item.get("_seq") or 0) for item in restored),
+                default=-1,
+            ) + 1
+            _order = itertools.count(next_sequence)
+            _mode = restored_mode
+            _mode_overrides.clear()
+            _mode_overrides.update(restored_overrides)
+            _request_store = store
+            with _health_alert_lock:
+                _active_health_alerts.clear()
+                _active_health_alerts.update({str(key): str(value) for key, value in restored_alerts.items()})
+            _prune_history_locked()
+
+        print(
+            f"[ApprovalServer] Restored {len(_requests)} approval request(s) "
+            f"from {_APPROVAL_DB_PATH}",
+            flush=True,
+        )
+        return store
 
 # Live-push plumbing for /ws/live (see near the bottom of the file). A plain
 # version counter + condition variable, bumped by _bump_state() right after
@@ -199,7 +275,15 @@ def _bump_state():
 # launch_all.py's control socket, so stale workflow telemetry does not make a
 # still-running bot appear offline.
 _status: dict[str, dict] = {}
-STATUS_STALE_AFTER = 45  # workflow telemetry freshness; process liveness is tracked separately
+STATUS_STALE_AFTER = max(
+    45,
+    int(os.environ.get("BOT_HEARTBEAT_STALE_SECONDS", "75")),
+)  # workflow telemetry freshness; process liveness is tracked separately
+HEALTH_STARTUP_GRACE_SECONDS = max(
+    STATUS_STALE_AFTER,
+    int(os.environ.get("HEALTH_STARTUP_GRACE_SECONDS", "90")),
+)
+_SERVER_STARTED_MONOTONIC = time.monotonic()
 
 # Review mode, toggled from the dashboard (see /api/mode below). "manual" is
 # the original behaviour — every request waits in the queue for a human.
@@ -417,10 +501,11 @@ def _close_platform_chrome(port: int) -> bool:
 
 
 def _is_cdp_ready_for_status(port: int) -> bool:
-    """Fast localhost probe used only for dashboard display state."""
+    """Fast localhost listener probe used only for dashboard display state."""
     try:
-        return httpx.get(f"http://127.0.0.1:{port}/json", timeout=0.15).is_success
-    except Exception:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.08):
+            return True
+    except OSError:
         return False
 
 
@@ -791,6 +876,318 @@ def _all_bot_statuses() -> dict[str, dict]:
     return result
 
 
+APPROVAL_ALERT_AFTER_SECONDS = max(
+    60,
+    int(os.environ.get("APPROVAL_ALERT_AFTER_SECONDS", "600")),
+)
+CRASH_LOOP_THRESHOLD = max(
+    2,
+    int(os.environ.get("CRASH_LOOP_THRESHOLD", "3")),
+)
+
+
+def _timestamp_age_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        current = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        return max(0.0, (current - parsed).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+def _component_payload(raw, fallback_state: str, fallback_detail: str) -> dict:
+    if isinstance(raw, dict):
+        state = str(raw.get("state") or fallback_state)
+        detail = str(raw.get("detail") or fallback_detail)
+    elif isinstance(raw, str) and raw:
+        state = raw
+        detail = fallback_detail
+    else:
+        state = fallback_state
+        detail = fallback_detail
+    return {"state": state, "detail": detail}
+
+
+def _shared_api_component() -> dict:
+    providers = _api_health_snapshot()
+    configured = [item for item in providers if item.get("configured")]
+    if any(item.get("state") == "error" for item in configured):
+        detail = next(
+            item.get("detail") or f"{item['label']} failed"
+            for item in configured
+            if item.get("state") == "error"
+        )
+        return {"state": "error", "detail": detail}
+    if any(item.get("state") == "cooldown" for item in configured):
+        return {"state": "warning", "detail": "An AI provider is rate-limited"}
+    if configured and all(item.get("state") == "ready" for item in configured):
+        return {"state": "ok", "detail": "Configured AI providers are ready"}
+    if configured:
+        return {"state": "checking", "detail": "Provider health not fully checked"}
+    return {"state": "warning", "detail": "No AI provider keys are configured"}
+
+
+def _bot_health_snapshot() -> dict[str, dict]:
+    """Return the single reconciled health model used by every dashboard."""
+    bot_states = _all_bot_statuses()
+    control = _control_status_cached()
+    launcher_states = (control.get("platforms") or {}) if control.get("available") else {}
+    with _lock:
+        telemetry = {key.casefold(): dict(value) for key, value in _status.items()}
+        requests_snapshot = [dict(item) for item in _requests.values()]
+
+    api_component = _shared_api_component()
+    definitions = [
+        {
+            "slug": platform.slug,
+            "label": platform.label,
+            "cdp_port": _BUILTIN_CDP_PORTS.get(platform.slug),
+        }
+        for platform in PLATFORMS
+    ]
+    definitions.extend(
+        {
+            "slug": account["id"],
+            "label": account["label"],
+            "cdp_port": int(account["cdp_port"]),
+        }
+        for account in list_accounts()
+    )
+
+    result = {}
+    for definition in definitions:
+        slug = definition["slug"]
+        label = definition["label"]
+        process = bot_states.get(slug) or {}
+        launcher = launcher_states.get(slug) or {}
+        live = telemetry.get(label.casefold()) or telemetry.get(slug.casefold()) or {}
+        running = bool(process.get("running"))
+        heartbeat_age = _timestamp_age_seconds(live.get("updated_at"))
+        in_startup_grace = (
+            time.monotonic() - _SERVER_STARTED_MONOTONIC
+            < HEALTH_STARTUP_GRACE_SECONDS
+        )
+        stale = running and (
+            (heartbeat_age is None and not in_startup_grace)
+            or (heartbeat_age is not None and heartbeat_age > STATUS_STALE_AFTER)
+        )
+        stage = str(
+            live.get("state")
+            or ("starting" if running and in_startup_grace else ("running" if running else "offline"))
+        )
+        stage_detail = str(live.get("detail") or "")
+        restart_count = int(launcher.get("crashes") or 0)
+        crash_loop = restart_count >= CRASH_LOOP_THRESHOLD
+
+        platform_requests = [
+            item
+            for item in requests_snapshot
+            if str(item.get("platform") or "").casefold() == label.casefold()
+        ]
+        pending = [item for item in platform_requests if item.get("status") == "pending"]
+        pending_ages = [
+            age
+            for age in (_timestamp_age_seconds(item.get("created_at")) for item in pending)
+            if age is not None
+        ]
+        oldest_pending_seconds = max(pending_ages, default=0.0)
+        approval_overdue = oldest_pending_seconds >= APPROVAL_ALERT_AFTER_SECONDS
+
+        latest_error_request = next(
+            (
+                item
+                for item in sorted(
+                    platform_requests,
+                    key=lambda candidate: int(candidate.get("_seq") or 0),
+                    reverse=True,
+                )
+                if item.get("error")
+            ),
+            None,
+        )
+        last_error = str(live.get("warning") or "")
+        if not last_error and stage == "error":
+            last_error = stage_detail
+        if not last_error and latest_error_request:
+            last_error = str(latest_error_request.get("error") or "")
+
+        chrome_ready = bool(
+            definition.get("cdp_port")
+            and _is_cdp_ready_for_status(int(definition["cdp_port"]))
+        )
+        raw_components = live.get("components") if isinstance(live.get("components"), dict) else {}
+        chrome_component = _component_payload(
+            raw_components.get("chrome"),
+            "ok" if chrome_ready else ("error" if running else "offline"),
+            "Dedicated Chrome CDP is reachable" if chrome_ready else "Dedicated Chrome is not reachable",
+        )
+
+        lower_problem = f"{stage_detail} {last_error}".casefold()
+        login_problem = "logged out" in lower_problem or "login failed" in lower_problem
+        chameleon_problem = "chameleon" in lower_problem and any(
+            token in lower_problem for token in ("unavailable", "not found", "failed", "not selected")
+        )
+        inferred_ready = running and not stale and stage not in ("starting", "error", "offline")
+        console_component = _component_payload(
+            raw_components.get("moderation_console"),
+            "error" if login_problem else ("ok" if inferred_ready else ("checking" if running else "offline")),
+            "Moderation console is ready" if inferred_ready else "Waiting for moderation-console readiness",
+        )
+        chameleon_component = _component_payload(
+            raw_components.get("chameleon"),
+            "error" if chameleon_problem else ("ok" if inferred_ready else ("checking" if running else "offline")),
+            "Chameleon workspace is ready" if inferred_ready else "Waiting for Chameleon readiness",
+        )
+        if login_problem:
+            console_component = {"state": "error", "detail": stage_detail or last_error}
+        if chameleon_problem:
+            chameleon_component = {"state": "error", "detail": stage_detail or last_error}
+        reported_api = _component_payload(
+            raw_components.get("api"),
+            "ok",
+            "Approval API is reachable",
+        )
+        per_bot_api = (
+            reported_api
+            if reported_api["state"] in {"error", "blocked"}
+            else dict(api_component)
+        )
+
+        alerts = []
+        if crash_loop:
+            alerts.append({"kind": "crash_loop", "message": f"Restarted {restart_count} times"})
+        if stale:
+            alerts.append({"kind": "stale", "message": "Workflow heartbeat is stale"})
+        if login_problem or console_component["state"] == "error":
+            alerts.append({"kind": "login", "message": "Moderation login or console failed"})
+        if chameleon_problem or chameleon_component["state"] == "error":
+            alerts.append({"kind": "chameleon", "message": "Chameleon workspace is unavailable"})
+        if approval_overdue:
+            minutes = max(1, int(oldest_pending_seconds // 60))
+            alerts.append({"kind": "approval_wait", "message": f"Approval waiting {minutes} minutes"})
+
+        component_states = {
+            chrome_component["state"],
+            console_component["state"],
+            chameleon_component["state"],
+            per_bot_api["state"],
+        }
+        if not running:
+            overall = "offline"
+        elif crash_loop or "error" in component_states or stage == "error":
+            overall = "critical"
+        elif stale or approval_overdue or "warning" in component_states:
+            overall = "warning"
+        elif stage in {"starting", "extracting", "generating", "retrying", "recovering", "approval", "sending"}:
+            overall = "busy"
+        else:
+            overall = "healthy"
+
+        result[slug] = {
+            "slug": slug,
+            "label": label,
+            "overall": overall,
+            "running": running,
+            "managed_by": process.get("managed_by"),
+            "stage": stage,
+            "stage_detail": stage_detail,
+            "last_heartbeat": live.get("updated_at"),
+            "heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
+            "stale": stale,
+            "last_error": last_error,
+            "restart_count": restart_count,
+            "pending_approvals": len(pending),
+            "oldest_pending_seconds": round(oldest_pending_seconds, 1),
+            "components": {
+                "chrome": chrome_component,
+                "moderation_console": console_component,
+                "chameleon": chameleon_component,
+                "api": per_bot_api,
+            },
+            "alerts": alerts,
+        }
+    return result
+
+
+@app.get("/api/bots/health")
+def bots_health():
+    return jsonify(_bot_health_snapshot())
+
+
+_health_alert_lock = threading.Lock()
+_active_health_alerts: dict[str, str] = {}
+_health_alert_thread_started = False
+
+
+def _evaluate_health_alerts() -> list[dict]:
+    """Emit one push when a problem begins, never on routine heartbeats."""
+    health = _bot_health_snapshot()
+    current = {}
+    alert_rows = []
+    for slug, item in health.items():
+        for alert in item.get("alerts") or []:
+            key = f"{slug}:{alert['kind']}"
+            current[key] = alert["message"]
+            alert_rows.append({
+                "key": key,
+                "slug": slug,
+                "platform": item["label"],
+                **alert,
+            })
+
+    with _health_alert_lock:
+        new_keys = [key for key in current if key not in _active_health_alerts]
+        _active_health_alerts.clear()
+        _active_health_alerts.update(current)
+        if _request_store is not None:
+            _request_store.save_state("active_health_alerts", _active_health_alerts)
+
+    by_key = {row["key"]: row for row in alert_rows}
+    for key in new_keys:
+        row = by_key[key]
+        try:
+            push_notifications.queue_payload({
+                "title": f"Zenox alert · {row['platform']}",
+                "body": row["message"],
+                "icon": "/static/icons/zenox-192-v2.png",
+                "badge": "/static/icons/zenox-192-v2.png",
+                "tag": f"zenox-health-{row['slug']}-{row['kind']}",
+                "url": "/bots",
+                "pendingCount": int(health[row["slug"]].get("pending_approvals") or 0),
+            })
+        except Exception:
+            pass
+    return alert_rows
+
+
+def _health_alert_loop() -> None:
+    while True:
+        try:
+            _evaluate_health_alerts()
+        except Exception as error:
+            print(f"[HealthAlerts] Evaluation failed: {error}", flush=True)
+        time.sleep(30)
+
+
+def _start_health_alert_thread() -> None:
+    global _health_alert_thread_started
+    if _health_alert_thread_started:
+        return
+    _health_alert_thread_started = True
+    threading.Thread(
+        target=_health_alert_loop,
+        name="health-alerts",
+        daemon=True,
+    ).start()
+
+
+@app.get("/api/alerts")
+def health_alerts():
+    return jsonify(_evaluate_health_alerts())
+
+
 @app.post("/api/bots/<platform>/start")
 def bots_start(platform):
     platform = platform.strip().lower()
@@ -961,6 +1358,7 @@ def _cancel_pending_for_platform(platform: str, detail: str) -> None:
             ):
                 item["status"] = "cancelled"
                 item["decided_at"] = now
+                _persist_request_locked(item)
         _status[label] = {
             "state": "stopped",
             "detail": detail,
@@ -1652,6 +2050,7 @@ def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: b
                 should_notify = True
                 created_request = dict(item)
                 pending_count = sum(1 for queued in _requests.values() if queued["status"] == "pending")
+        _persist_request_locked(item)
     if auto_candidate:
         if (
             judge_result["ok"]
@@ -1685,6 +2084,7 @@ def _prune_history_locked():
     overflow = len(_requests) - MAX_HISTORY
     for r in decided[:overflow]:
         _requests.pop(r["id"], None)
+        _delete_persisted_request_locked(r["id"])
 
 
 def _active_request_for_platform_locked(platform: str) -> dict | None:
@@ -1708,31 +2108,39 @@ def _active_request_for_platform_locked(platform: str) -> dict | None:
     )
 
 
-def _retire_unacknowledged_skip_locked(platform: str) -> bool:
-    """Close a skip decision that no longer has a worker to acknowledge it.
+def _retire_unacknowledged_action_locked(platform: str) -> bool:
+    """Close a claimed action that no longer has a worker to acknowledge it.
 
     A bot cannot submit another candidate while it is still handling the
     transfer/skip decision for its current conversation.  Consequently, a new
-    request POST for the same platform proves that any older
-    ``skip_requested`` lifecycle was orphaned by a crash or restart.  Leaving
-    that hidden decision active makes the deduplication response attach the new
-    conversation to the old request: the UI briefly reports Approval but has no
-    pending card, and the bot then tries to skip the wrong conversation.
+    request POST for the same platform proves that any older ``skip_requested``
+    or ``sending`` lifecycle was orphaned by a crash or restart.  Leaving one of
+    those hidden actions active makes the deduplication response attach the new
+    conversation to the old request: the UI reports Approval but has no pending
+    card, and the bot then waits forever or acts on the wrong conversation.
 
-    Retire only this already-decided state.  Pending, approved, and sending
-    requests retain the normal duplicate protection.
+    Retire only actions the previous worker had already claimed. Pending and
+    approved requests retain the normal duplicate protection and can be safely
+    resumed by a restarted worker.
     """
     platform_key = (platform or "").strip().casefold()
     retired = False
     for item in _requests.values():
-        if (
-            item.get("status") == "skip_requested"
-            and str(item.get("platform") or "").strip().casefold() == platform_key
-        ):
+        status = item.get("status")
+        if str(item.get("platform") or "").strip().casefold() != platform_key:
+            continue
+        if status == "skip_requested":
             item["status"] = "cancelled"
             item["error"] = "Skip was not acknowledged before the next conversation"
             item["decided_at"] = _now()
-            retired = True
+        elif status == "sending":
+            item["status"] = "failed"
+            item["error"] = "Send was not acknowledged before the next approval request"
+            item["sent_at"] = _now()
+        else:
+            continue
+        _persist_request_locked(item)
+        retired = True
     return retired
 
 
@@ -1769,11 +2177,11 @@ def create_request():
     # immediately before insertion below is still required to close the race
     # while translation and analysis run outside the lock.
     with _lock:
-        retired_skip = _retire_unacknowledged_skip_locked(platform)
+        retired_action = _retire_unacknowledged_action_locked(platform)
         existing = _active_request_for_platform_locked(platform)
         if existing is not None:
             return _duplicate_request_response(existing)
-    if retired_skip:
+    if retired_action:
         _bump_state()
 
     # Best-effort source->EN translation for review. The platform's configured
@@ -1853,7 +2261,7 @@ def create_request():
     with _lock:
         # Atomic uniqueness guard: at most one active approval lifecycle may
         # belong to a worker, which itself can own only one conversation.
-        retired_skip = _retire_unacknowledged_skip_locked(platform)
+        _retire_unacknowledged_action_locked(platform)
         existing = _active_request_for_platform_locked(platform)
         if existing is not None:
             return _duplicate_request_response(existing)
@@ -1901,6 +2309,7 @@ def create_request():
             "conversation_client_expectation": conversation_client_expectation,
             "_seq": next(_order),
         }
+        _persist_request_locked(_requests[req_id])
         _prune_history_locked()
         created_request = dict(_requests[req_id])
         pending_count = sum(1 for item in _requests.values() if item["status"] == "pending")
@@ -2107,6 +2516,7 @@ def set_mode():
         return jsonify({"error": "mode must be 'manual' or 'auto'"}), 400
     with _lock:
         _mode = mode
+        _persist_dashboard_state_locked()
     _bump_state()
     return jsonify({"ok": True, "mode": mode})
 
@@ -2141,6 +2551,7 @@ def set_mode_override():
         else:
             _mode_overrides[mode_key] = mode
         effective = _mode_overrides.get(mode_key, _mode)
+        _persist_dashboard_state_locked()
     _bump_state()
     # Approval mode is read live per-request (see create_request()) — no
     # restart needed for this one to take effect, unlike Source above.
@@ -2235,6 +2646,7 @@ def translate_request_to_german(req_id):
         item["reply_en"] = english_reply
         item["reply"] = translated_reply
         item["translated_from_english"] = True
+        _persist_request_locked(item)
     _bump_state()
     return jsonify({
         "ok": True,
@@ -2265,6 +2677,7 @@ def approve_request(req_id):
         r["decided_at"] = _now()
         r["send_started_at"] = None
         r["error"] = None
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2293,6 +2706,7 @@ def cancel_approved_send(req_id):
         r["send_cancelled_at"] = _now()
         r["send_cancel_revision"] = int(r.get("send_cancel_revision") or 0) + 1
         r["error"] = None
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2315,6 +2729,7 @@ def claim_request_send(req_id):
             return jsonify({"error": f"cannot start send from {r['status']}"}), 409
         r["status"] = "sending"
         r["send_started_at"] = _now()
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True, "final_reply": r.get("final_reply")})
 
@@ -2337,6 +2752,7 @@ def reject_request(req_id):
         r["regeneration_instruction"] = instruction
         r["status"] = "rejected"
         r["decided_at"] = _now()
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2356,6 +2772,7 @@ def cancel_request(req_id):
             return jsonify({"error": f"already {r['status']}"}), 409
         r["status"] = "cancelled"
         r["decided_at"] = _now()
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2383,6 +2800,7 @@ def skip_request(req_id):
             }), 400
         r["status"] = "skip_requested"
         r["decided_at"] = _now()
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2404,6 +2822,7 @@ def mark_request_skipped(req_id):
             return jsonify({"error": f"cannot mark skipped from {r['status']}"}), 409
         r["status"] = result
         r["sent_at"] = _now()
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2420,6 +2839,7 @@ def mark_sent(req_id):
             return jsonify({"error": f"cannot mark sent from {r['status']}"}), 409
         r["status"] = "sent"
         r["sent_at"] = _now()
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2438,6 +2858,7 @@ def mark_failed(req_id):
         r["status"] = "failed"
         r["error"] = body.get("error") or ""
         r["sent_at"] = _now()
+        _persist_request_locked(r)
     _bump_state()
     return jsonify({"ok": True})
 
@@ -2469,6 +2890,11 @@ def update_status():
             "warning": body.get("warning") or "",
             "checkpoint": body.get("checkpoint") or "",
             "cancellable_send": bool(body.get("cancellable_send")),
+            "components": (
+                body.get("components")
+                if isinstance(body.get("components"), dict)
+                else ((previous or {}).get("components") or {})
+            ),
             "updated_at": _now(),
         }
         _status[platform] = current
@@ -2609,6 +3035,7 @@ def _full_snapshot() -> dict:
         "mode": mode,
         "control": _control_status_cached(),
         "bots": _all_bot_statuses(),
+        "health": _bot_health_snapshot(),
     }
 
 
@@ -2926,6 +3353,35 @@ _PAGE = """<!doctype html>
     margin: 8px 0 14px; padding: 10px 12px; border: 1px solid var(--border);
     border-radius: 10px; background: color-mix(in srgb, var(--card) 88%, transparent);
   }
+  .bot-health-overview {
+    margin: 0 0 14px; padding: 11px 12px; border: 1px solid var(--border);
+    border-radius: 10px; background: rgba(9,9,11,.55);
+  }
+  .health-overview-head { display:flex; align-items:center; gap:8px; margin-bottom:9px; }
+  .health-overall {
+    padding:3px 8px; border:1px solid var(--border); border-radius:999px;
+    font-size:10.5px; font-weight:750; text-transform:uppercase; letter-spacing:.04em;
+  }
+  .health-overall.healthy { color:var(--success); border-color:rgba(34,197,94,.35); background:rgba(34,197,94,.09); }
+  .health-overall.busy { color:var(--info); border-color:rgba(56,189,248,.35); background:rgba(56,189,248,.09); }
+  .health-overall.warning { color:var(--warning); border-color:rgba(234,179,8,.35); background:rgba(234,179,8,.09); }
+  .health-overall.critical { color:var(--destructive); border-color:rgba(239,68,68,.35); background:rgba(239,68,68,.09); }
+  .health-overall.offline { color:var(--muted-foreground); }
+  .health-heartbeat { color:var(--muted-foreground); font-size:11px; margin-left:auto; }
+  .health-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:7px; }
+  .health-metric { padding:7px 8px; border:1px solid var(--border); border-radius:8px; background:var(--card); min-width:0; }
+  .health-metric span { display:block; color:var(--muted-foreground); font-size:9.5px; text-transform:uppercase; letter-spacing:.04em; }
+  .health-metric strong { display:block; margin-top:2px; font-size:11.5px; overflow-wrap:anywhere; }
+  .health-components { display:grid; grid-template-columns:repeat(auto-fit,minmax(82px,1fr)); gap:6px; margin-top:8px; }
+  .health-component { display:flex; align-items:center; gap:5px; color:var(--muted-foreground); font-size:10.5px; min-width:0; }
+  .health-component i { width:7px; height:7px; border-radius:50%; background:var(--border); flex:none; }
+  .health-component.ok i { background:var(--success); }
+  .health-component.warning i,.health-component.checking i { background:var(--warning); }
+  .health-component.error i,.health-component.blocked i { background:var(--destructive); }
+  .health-alert-list { display:grid; gap:5px; margin-top:9px; }
+  .health-alert-item { padding:6px 8px; border-radius:7px; background:rgba(239,68,68,.09); color:#fca5a5; font-size:10.5px; }
+  .health-error { margin-top:8px; color:#fca5a5; font-size:10.5px; overflow-wrap:anywhere; }
+  .health-error.none { color:var(--muted-foreground); }
   .workflow-steps { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .workflow-step {
     font-size: 10.5px; font-weight: 650; color: var(--muted-foreground);
@@ -4892,6 +5348,7 @@ let globalPauseRunning = false;
 let stopAllRunning = false;
 let controlPlatformState = {}; // slug -> {state, uptime, crashes, exit_code}
 let botProcessState = {}; // dashboard-managed bot Popen/CDP state from /api/bots/status
+let botHealthState = {}; // reconciled lifecycle/component health from /api/bots/health
 // Last command output per platform, kept here (not just in the DOM) because
 // renderSections() fully rebuilds #sections on every poll — without this the
 // panel would vanish again 1.5s after a command finished.
@@ -4908,6 +5365,50 @@ function effectiveProcessState(platformSlug) {
   if (bot && bot.running === true) return bot;
   if (launcher && launcher.state === "running") return launcher;
   return bot || launcher;
+}
+
+function healthAgeLabel(seconds) {
+  if (seconds == null) return "Last heartbeat: waiting";
+  if (seconds < 5) return "Last heartbeat: now";
+  if (seconds < 60) return `Last heartbeat: ${Math.floor(seconds)}s ago`;
+  return `Last heartbeat: ${Math.floor(seconds / 60)}m ago`;
+}
+
+function botHealthOverviewHtml(name) {
+  const platformSlug = platformSlugMap.get(name)
+    || name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const health = botHealthState[platformSlug];
+  if (!health) return "";
+  const componentLabels = {
+    chrome: "Chrome",
+    moderation_console: "Console",
+    chameleon: "Chameleon",
+    api: "API",
+  };
+  const components = Object.entries(componentLabels).map(([key, label]) => {
+    const component = (health.components || {})[key] || { state: "offline", detail: "" };
+    return `<span class="health-component ${escapeHtml(component.state)}" title="${escapeHtml(component.detail || "")}"><i></i>${label}</span>`;
+  }).join("");
+  const alerts = (health.alerts || []).map(alert =>
+    `<div class="health-alert-item">${escapeHtml(alert.message)}</div>`
+  ).join("");
+  return `
+    <div class="bot-health-overview">
+      <div class="health-overview-head">
+        <span class="health-overall ${escapeHtml(health.overall)}">Overall · ${escapeHtml(health.overall)}</span>
+        <span class="health-heartbeat">${escapeHtml(healthAgeLabel(health.heartbeat_age_seconds))}</span>
+      </div>
+      <div class="health-metrics">
+        <div class="health-metric"><span>Stage</span><strong>${escapeHtml(health.stage || "Unknown")}</strong></div>
+        <div class="health-metric"><span>Restarts</span><strong>${Number(health.restart_count || 0)}</strong></div>
+        <div class="health-metric"><span>Pending</span><strong>${Number(health.pending_approvals || 0)}</strong></div>
+        <div class="health-metric"><span>Owner</span><strong>${escapeHtml(health.managed_by || "none")}</strong></div>
+      </div>
+      <div class="health-components">${components}</div>
+      <div class="health-error ${health.last_error ? "" : "none"}">Last error: ${health.last_error ? escapeHtml(health.last_error) : "None"}</div>
+      ${alerts ? `<div class="health-alert-list">${alerts}</div>` : ""}
+    </div>
+  `;
 }
 
 function updateGlobalPauseControl() {
@@ -5571,6 +6072,7 @@ function renderSections(pending, autoByPlatform) {
           <hr />
         </div>
         ${workflowStatusHtml(det)}
+        ${botHealthOverviewHtml(name)}
         ${ctrlBarHtml(name)}
         ${body}
       </section>
@@ -5693,6 +6195,7 @@ function applySnapshot(data) {
     controlPlatformState = data.control.platforms || {};
   }
   if (data.bots) botProcessState = data.bots;
+  if (data.health) botHealthState = data.health;
   updateGlobalPauseControl();
   const checkinBtn = document.getElementById("checkinAllBtn");
   if (checkinBtn) checkinBtn.disabled = checkinAllRunning || stopAllRunning;
@@ -5760,6 +6263,7 @@ async function refresh() {
       readJson("/api/status"),
       readJson("/api/mode"),
       readJson("/api/bots/status"),
+      readJson("/api/bots/health"),
     ]);
     if (results[0].status !== "fulfilled" || results[1].status !== "fulfilled") return;
     applySnapshot({
@@ -5767,6 +6271,7 @@ async function refresh() {
       mode: results[3].status === "fulfilled" ? (results[3].value.mode || currentMode) : currentMode,
       control: { available: controlsAvailable, platforms: controlPlatformState },
       bots: results[4].status === "fulfilled" ? results[4].value : botProcessState,
+      health: results[5].status === "fulfilled" ? results[5].value : botHealthState,
       history: results[1].value,
       pending: results[0].value,
     });
@@ -6005,6 +6510,26 @@ _BOTS_PAGE = r"""<!doctype html>
   .status-pill.running { color: var(--success); border-color: rgba(34,197,94,.35); background: rgba(34,197,94,.1); }
   .status-pill.external { color: var(--warning); border-color: rgba(234,179,8,.35); background: rgba(234,179,8,.1); }
   .live-line { font-size: 11.5px; color: var(--muted-foreground); margin: 2px 0 12px; min-height: 15px; }
+  .bot-health-panel { margin:0 0 12px; padding:10px; border:1px solid var(--border); border-radius:9px; background:#09090b; }
+  .bot-health-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .bot-health-overall { padding:3px 8px; border:1px solid var(--border); border-radius:999px; font-size:10px; font-weight:750; text-transform:uppercase; }
+  .bot-health-overall.healthy { color:var(--success); border-color:rgba(34,197,94,.35); }
+  .bot-health-overall.busy { color:#38bdf8; border-color:rgba(56,189,248,.35); }
+  .bot-health-overall.warning { color:var(--warning); border-color:rgba(234,179,8,.35); }
+  .bot-health-overall.critical { color:var(--destructive); border-color:rgba(239,68,68,.35); }
+  .bot-health-heartbeat { margin-left:auto; color:var(--muted-foreground); font-size:10.5px; }
+  .bot-health-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(72px,1fr)); gap:6px; }
+  .bot-health-metric { padding:6px; border:1px solid var(--border); border-radius:7px; background:#111116; min-width:0; }
+  .bot-health-metric span { display:block; color:var(--muted-foreground); font-size:9px; text-transform:uppercase; }
+  .bot-health-metric strong { display:block; margin-top:2px; font-size:11px; overflow-wrap:anywhere; }
+  .bot-health-components { display:grid; grid-template-columns:repeat(auto-fit,minmax(65px,1fr)); gap:5px; margin-top:8px; }
+  .bot-health-component { display:flex; align-items:center; gap:5px; color:var(--muted-foreground); font-size:10px; min-width:0; }
+  .bot-health-component i { width:7px; height:7px; border-radius:50%; background:var(--border); flex:none; }
+  .bot-health-component.ok i { background:var(--success); }
+  .bot-health-component.warning i,.bot-health-component.checking i { background:var(--warning); }
+  .bot-health-component.error i,.bot-health-component.blocked i { background:var(--destructive); }
+  .bot-health-error,.bot-health-alert { margin-top:7px; padding:6px 7px; border-radius:6px; color:#fca5a5; background:rgba(239,68,68,.08); font-size:10.5px; overflow-wrap:anywhere; }
+  .bot-health-error.none { color:var(--muted-foreground); background:transparent; padding-left:0; }
 
   .start-stop-row { display: flex; gap: 8px; margin-bottom: 14px; }
   button {
@@ -6353,8 +6878,44 @@ for (const p of PLATFORMS) {
     starting: false, startingAt: 0, stopping: false, stepsOpen: false, loaded: false,
     credentialsOpen: false, credentialsLoaded: false, credentialUsername: "",
     credentialPassword: "", passwordConfigured: false, credentialsSaving: false,
-    credentialMessage: "", credentialMessageType: "",
+    credentialMessage: "", credentialMessageType: "", health: null,
   };
+}
+
+function botHealthAgeLabel(seconds) {
+  if (seconds == null) return "Last heartbeat: waiting";
+  if (seconds < 5) return "Last heartbeat: now";
+  if (seconds < 60) return `Last heartbeat: ${Math.floor(seconds)}s ago`;
+  return `Last heartbeat: ${Math.floor(seconds / 60)}m ago`;
+}
+
+function botHealthPanelHtml(health) {
+  if (!health) return "";
+  const labels = { chrome:"Chrome", moderation_console:"Console", chameleon:"Chameleon", api:"API" };
+  const components = Object.entries(labels).map(([key, label]) => {
+    const component = (health.components || {})[key] || { state:"offline", detail:"" };
+    return `<span class="bot-health-component ${escapeHtml(component.state)}" title="${escapeHtml(component.detail || "")}"><i></i>${label}</span>`;
+  }).join("");
+  const alerts = (health.alerts || []).map(alert =>
+    `<div class="bot-health-alert">${escapeHtml(alert.message)}</div>`
+  ).join("");
+  return `
+    <div class="bot-health-panel">
+      <div class="bot-health-head">
+        <span class="bot-health-overall ${escapeHtml(health.overall)}">Overall · ${escapeHtml(health.overall)}</span>
+        <span class="bot-health-heartbeat">${escapeHtml(botHealthAgeLabel(health.heartbeat_age_seconds))}</span>
+      </div>
+      <div class="bot-health-metrics">
+        <div class="bot-health-metric"><span>Stage</span><strong>${escapeHtml(health.stage || "Unknown")}</strong></div>
+        <div class="bot-health-metric"><span>Restarts</span><strong>${Number(health.restart_count || 0)}</strong></div>
+        <div class="bot-health-metric"><span>Pending</span><strong>${Number(health.pending_approvals || 0)}</strong></div>
+        <div class="bot-health-metric"><span>Owner</span><strong>${escapeHtml(health.managed_by || "none")}</strong></div>
+      </div>
+      <div class="bot-health-components">${components}</div>
+      <div class="bot-health-error ${health.last_error ? "" : "none"}">Last error: ${health.last_error ? escapeHtml(health.last_error) : "None"}</div>
+      ${alerts}
+    </div>
+  `;
 }
 
 function stepsFor(slug, approval) {
@@ -6417,6 +6978,7 @@ function renderCard(slug, label) {
       </div>
       ${platformInfo.additional ? `<div class="bot-type">Type: ${escapeHtml((BOT_TYPES.find(p => p.slug === platformInfo.platformType) || {}).label || platformInfo.platformType)}</div>` : ""}
       <div class="live-line">${escapeHtml(s.liveDetail || "")}</div>
+      ${botHealthPanelHtml(s.health)}
 
       <div class="start-stop-row">
         <button class="btn-start" ${(running || busy || !s.loaded) ? "disabled" : ""} onclick="startBot('${slug}')">${s.starting ? '<span class="spinner"></span>Starting' : "Start"}</button>
@@ -6754,6 +7316,12 @@ async function refreshStatus() {
     }
   } catch (e) { /* transient */ }
 
+  try {
+    const res = await fetch("/api/bots/health");
+    const data = await res.json();
+    for (const p of PLATFORMS) state[p.slug].health = data[p.slug] || null;
+  } catch (e) { /* transient */ }
+
   renderBackgroundUpdate();
 }
 
@@ -6764,6 +7332,7 @@ let botsReconnectDelay = 1000;
 function applyBotSnapshot(snapshot) {
   const bots = snapshot.bots || {};
   const statuses = snapshot.status || {};
+  const health = snapshot.health || {};
   for (const p of PLATFORMS) {
     const bot = bots[p.slug] || {};
     state[p.slug].running = !!bot.running;
@@ -6772,6 +7341,7 @@ function applyBotSnapshot(snapshot) {
     if (bot.running || Date.now() - state[p.slug].startingAt > 180_000) state[p.slug].starting = false;
     const entry = statuses[p.label] || statuses[p.label.toLowerCase()];
     if (entry) state[p.slug].liveDetail = `${entry.state}${entry.detail ? " — " + entry.detail : ""}`;
+    if (health[p.slug]) state[p.slug].health = health[p.slug];
   }
   renderBackgroundUpdate();
 }
@@ -6907,7 +7477,15 @@ def chat_html_to_json_page():
     return render_template("chat_html_to_json.html")
 
 
+def create_app():
+    """Initialize durable state and return the configured Flask app."""
+    _initialize_request_store()
+    _start_health_alert_thread()
+    return app
+
+
 def main():
+    create_app()
     apply_current_console_visibility()
     print(f"[ApprovalServer] Dashboard running at http://{HOST}:{PORT}")
     if not (AUTH_USER and AUTH_PASS):

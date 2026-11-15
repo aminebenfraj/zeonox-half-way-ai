@@ -171,6 +171,16 @@ Dashboard state is delivered over WebSocket while the connection is healthy.
 HTTP polling runs only as a fallback, and slow launcher-status checks run in
 the background so they do not block queue rendering.
 
+Approval requests, their full lifecycle history, global review mode, and
+per-bot review overrides are stored in SQLite at
+`secrets/approval_state.sqlite3` by default. Restarting the dashboard restores
+the same pending request IDs, allowing waiting bots to reconnect instead of
+losing their cards. The Home and Bots pages share `/api/bots/health`, which
+shows workflow stage, heartbeat freshness, errors, restart count, pending
+approvals, and Chrome/console/Chameleon/API component status. Phone health
+alerts are emitted once when a problem begins and are suppressed until that
+condition clears.
+
 ## Useful checks
 
 Check the local dashboard:

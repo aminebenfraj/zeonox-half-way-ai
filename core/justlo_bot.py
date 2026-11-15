@@ -1443,7 +1443,17 @@ class JustloBot:
         async with async_playwright() as p:
             # ── Connect to Chrome ──────────────────────────────────────────
             self.log(f"Connecting to Chrome at {self.cfg.cdp_url}...")
-            await report_status(self.cfg.platform, "starting")
+            await report_status(
+                self.cfg.platform,
+                "starting",
+                "Connecting to the dedicated Chrome session",
+                components={
+                    "chrome": "checking",
+                    "moderation_console": "checking",
+                    "chameleon": "checking",
+                    "api": "ok",
+                },
+            )
             browser = None
             for attempt in range(3):
                 try:
@@ -1458,6 +1468,18 @@ class JustloBot:
                         port = self.cfg.cdp_url.rsplit(":", 1)[-1]
                         self.log(f"[ERROR] Cannot connect to Chrome at {self.cfg.cdp_url}")
                         self.log(f"        Launch Chrome with: --remote-debugging-port={port}")
+                        await report_status(
+                            self.cfg.platform,
+                            "error",
+                            f"Cannot connect to Chrome on port {port}",
+                            warning=str(e),
+                            components={
+                                "chrome": "error",
+                                "moderation_console": "blocked",
+                                "chameleon": "blocked",
+                                "api": "ok",
+                            },
+                        )
                         sys.exit(0)
 
             context = browser.contexts[0]
@@ -1469,19 +1491,71 @@ class JustloBot:
             # login/navigation from receiving clicks on startup.
             await self._dismiss_failure_popup(tab1)
             self.log("Logging in to justlo and opening the console (Play)...")
-            await login_justlo(tab1, self.cfg, self.cfg.platform)
+            try:
+                await login_justlo(tab1, self.cfg, self.cfg.platform)
+            except Exception as error:
+                await report_status(
+                    self.cfg.platform,
+                    "error",
+                    f"Moderation console login failed: {error}",
+                    warning=str(error),
+                    components={
+                        "chrome": "ok",
+                        "moderation_console": "error",
+                        "chameleon": "checking",
+                        "api": "ok",
+                    },
+                )
+                raise
 
             tab2 = await self._find_or_open_tab(context, self.cfg.tab2_pattern)
             self.log("Setting up chameleon tab...")
-            await login_chameleon(
-                tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
-                self.cfg.platform, self.cfg.chameleon_chat,
-            )
+            try:
+                await login_chameleon(
+                    tab2, self.cfg.chameleon_email, self.cfg.chameleon_password,
+                    self.cfg.platform, self.cfg.chameleon_chat,
+                )
+            except Exception as error:
+                await report_status(
+                    self.cfg.platform,
+                    "error",
+                    f"Chameleon login or chat selection failed: {error}",
+                    warning=str(error),
+                    components={
+                        "chrome": "ok",
+                        "moderation_console": "ok",
+                        "chameleon": "error",
+                        "api": "ok",
+                    },
+                )
+                raise
             if not await self._ensure_chat_selected(tab2):
+                await report_status(
+                    self.cfg.platform,
+                    "error",
+                    f"Chameleon chat '{self.cfg.chameleon_chat}' was not selected",
+                    components={
+                        "chrome": "ok",
+                        "moderation_console": "ok",
+                        "chameleon": "error",
+                        "api": "ok",
+                    },
+                )
                 raise RuntimeError(
                     f"Chameleon chat '{self.cfg.chameleon_chat}' was not selected"
                 )
             if not await self._ensure_extractor_tab_active(tab2):
+                await report_status(
+                    self.cfg.platform,
+                    "error",
+                    f"Chameleon workspace tab '{self.cfg.chameleon_workspace_tab}' is unavailable",
+                    components={
+                        "chrome": "ok",
+                        "moderation_console": "ok",
+                        "chameleon": "error",
+                        "api": "ok",
+                    },
+                )
                 raise RuntimeError(
                     f"Chameleon workspace tab '{self.cfg.chameleon_workspace_tab}' is unavailable"
                 )
@@ -1496,6 +1570,18 @@ class JustloBot:
                     checkpoint="waiting",
                 )
 
+            await report_status(
+                self.cfg.platform,
+                "waiting",
+                "All services ready; waiting for a conversation",
+                checkpoint="waiting",
+                components={
+                    "chrome": "ok",
+                    "moderation_console": "ok",
+                    "chameleon": "ok",
+                    "api": "ok",
+                },
+            )
             self.log("Both tabs ready. Bot running.\n")
 
             consecutive_errors = 0

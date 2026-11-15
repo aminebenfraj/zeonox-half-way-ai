@@ -167,6 +167,50 @@ class ApprovalRequestDedupTests(unittest.TestCase):
         "auto_mode_policy": "direct",
         "manual_judge_policy": "disabled",
     })
+    def test_unacknowledged_send_does_not_hide_next_approval_card(
+        self, _settings, _translate, _analyze, queue_approval
+    ):
+        first = self._post(platform="Linduu", reply="Old approved reply")
+        old_request_id = first.get_json()["id"]
+        self.assertEqual(
+            self.client.post(f"/api/requests/{old_request_id}/approve").status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/requests/{old_request_id}/sending").status_code,
+            200,
+        )
+
+        next_request = self._post(
+            platform="Linduu",
+            reply="New conversation candidate",
+        )
+
+        self.assertEqual(next_request.status_code, 201)
+        self.assertNotEqual(next_request.get_json()["id"], old_request_id)
+        with approval_server._lock:
+            old_request = approval_server._requests[old_request_id]
+            new_request = approval_server._requests[next_request.get_json()["id"]]
+        self.assertEqual(old_request["status"], "failed")
+        self.assertIn("not acknowledged", old_request["error"])
+        self.assertEqual(new_request["status"], "pending")
+        self.assertEqual(new_request["reply"], "New conversation candidate")
+        self.assertEqual(queue_approval.call_count, 2)
+
+    @patch.object(approval_server.push_notifications, "queue_approval")
+    @patch.object(approval_server, "_analyze_meeting_alert", return_value={
+        "ok": True,
+        "requested": False,
+        "reason": "",
+        "tone": "",
+        "direction": "",
+        "client_expectation": "",
+    })
+    @patch.object(approval_server, "_translate_de_en", return_value=None)
+    @patch.object(approval_server, "get_runtime_settings", return_value={
+        "auto_mode_policy": "direct",
+        "manual_judge_policy": "disabled",
+    })
     def test_each_platform_has_its_own_pending_conversation(
         self, _settings, _translate, _analyze, _queue_approval
     ):
