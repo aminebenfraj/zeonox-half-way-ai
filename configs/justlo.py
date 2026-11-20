@@ -20,6 +20,9 @@ config = JustloConfig(
     chameleon_email=os.environ.get("CHAMELEON_EMAIL", ""),
     chameleon_password=os.environ.get("CHAMELEON_PASSWORD", ""),
     chameleon_chat="Justlo/Linduu DE",  # justlo + linduu share this chameleon chat
+    # This shared chat exposes the extractor workspace as "Justlo".  Keeping
+    # the legacy default ("Extractor") makes the worker fail its readiness check.
+    chameleon_workspace_tab="Justlo",
     additional_instructions="",
 )
 

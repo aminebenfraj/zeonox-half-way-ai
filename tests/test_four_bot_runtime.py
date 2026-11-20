@@ -2,6 +2,7 @@ import unittest
 
 import approval_server
 from configs.gnoxx import config as gnoxx_config
+from configs.justlo import config as justlo_config
 from configs.justlo_fr import config as justlo_fr_config
 from configs.linduu import config as linduu_config
 from configs.linduu_us import config as linduu_us_config
@@ -23,6 +24,7 @@ class FourBotRuntimeTests(unittest.TestCase):
                 self.assertIn(slug, SELF_MANAGED_PLATFORM_SLUGS)
 
     def test_each_bot_targets_its_real_chameleon_workspace_tab(self):
+        self.assertEqual(justlo_config.chameleon_workspace_tab, "Justlo")
         self.assertEqual(linduu_config.chameleon_workspace_tab, "Justlo")
         self.assertEqual(linduu_us_config.chameleon_workspace_tab, "Justlo")
         self.assertEqual(gnoxx_config.chameleon_workspace_tab, "GNox")
