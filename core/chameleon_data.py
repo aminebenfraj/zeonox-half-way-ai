@@ -106,6 +106,23 @@ def _bool_value(value) -> bool | None:
     return None
 
 
+def _reply_type(raw: dict) -> str:
+    """Normalize Chameleon's authoritative extracted conversation type."""
+    value = _text(_field(
+        raw,
+        "message_type",
+        "messageType",
+        "conversation_type",
+        "conversationType",
+        "Nachrichtentyp",
+    ))
+    if re.search(r"\bDIA\b", value, re.IGNORECASE):
+        return "DIA"
+    if re.search(r"\bASA\b", value, re.IGNORECASE):
+        return "ASA Follow-up"
+    return ""
+
+
 def _is_customer(
     message: dict,
     client_username: str = "",
@@ -214,6 +231,7 @@ def normalize_chameleon_data(raw: dict) -> dict:
     ]
 
     return {
+        "reply_type": _reply_type(raw),
         "last_message": last_message,
         "last_customer_message": last_customer,
         "client_profile": _flatten_profile(client_raw),
@@ -225,6 +243,7 @@ def normalize_chameleon_data(raw: dict) -> dict:
 async def read_extracted_data(tab2, timeout_ms: int = 5_000) -> dict:
     """Read Chameleon's extracted JSON and always return to its Chat tab."""
     empty = {
+        "reply_type": "",
         "last_message": "",
         "last_customer_message": "",
         "client_profile": {},

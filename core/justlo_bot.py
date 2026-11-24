@@ -113,16 +113,26 @@ _SEL_GEN_BTN       = "button:has-text('Antwort generieren')"
 _SEL_INSTRUCTIONS  = "textarea[placeholder*='Etwas flirtender'], textarea[placeholder*='Thema XYZ']"
 _SEL_COMBOBOX      = "button[role='combobox']"
 _GET_CHAMELEON_REPLY_TYPE_JS = r"""() => {
+  const normalizedText = (el) => (el.textContent || '')
+    .replace(/\s+/g, ' ')
+    .trim();
   const ownText = (el) => Array.from(el.childNodes)
     .filter((node) => node.nodeType === Node.TEXT_NODE)
     .map((node) => node.textContent || '')
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
-  const label = Array.from(document.querySelectorAll('div, span, p'))
+  const detectedRow = Array.from(document.querySelectorAll('div, span, p'))
     .find((el) => /^Erkannt\s*:?$/i.test(ownText(el)));
-  if (!label) return '';
-  const detected = (label.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!detectedRow) return '';
+
+  // Only inspect the Chameleon result badge.  The same row also contains the
+  // optional checkbox label "Stupser — als ASA schreiben"; reading the whole
+  // row therefore turns every DIA into a false ASA Follow-up.
+  const detected = Array.from(detectedRow.querySelectorAll('span, div, p'))
+    .filter((el) => !el.closest('label, button'))
+    .map(normalizedText)
+    .find((text) => /^(?:DIA|ASA)\b/i.test(text)) || '';
   if (/\bASA\b/i.test(detected)) return 'ASA Follow-up';
   if (/\bDIA\b/i.test(detected)) return 'DIA';
   return '';
@@ -1680,7 +1690,15 @@ class JustloBot:
                                  "to answer it as a normal conversation.")
 
                     try:
-                        reply_type = await self._chameleon_reply_type(tab2)
+                        # Chameleon's JSON tab is the authoritative source. It
+                        # exposes message_type (for example "DIA") separately
+                        # from the optional "als ASA schreiben" checkbox, so it
+                        # cannot be confused by unrelated text in the UI row.
+                        reply_type = extracted.get("reply_type", "")
+                        if reply_type:
+                            self.log(f"Chameleon JSON message type: {reply_type}")
+                        else:
+                            reply_type = await self._chameleon_reply_type(tab2)
                         if not reply_type:
                             self.log("[WARN] Chameleon message type missing — "
                                      "falling back to the platform queue label.")
