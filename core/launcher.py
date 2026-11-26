@@ -59,6 +59,9 @@ def start_chrome(profile_dir: str, port: int) -> subprocess.Popen:
         "--force-device-scale-factor=1",
         "--no-first-run",
         "--no-default-browser-check",
+        # Open a plain startup page instead of Chrome's interactive new-tab UI.
+        # These dedicated sessions only need platform and Chameleon tabs.
+        "about:blank",
     ]
     if background_runtime_enabled():
         # Modern headless Chrome uses the full browser engine and CDP while

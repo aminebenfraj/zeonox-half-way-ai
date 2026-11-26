@@ -44,12 +44,12 @@ ASA_OUT_VALUE = ASA_OUT_RATE * FX
 XKUSS_VALUE = XKUSS_RATE * FX
 SHARED_VALUE = SHARED_RATE * FX
 
-FORMULA_VERSION = 4
+FORMULA_VERSION = 5
 NOTE_PATH = Path.home() / "Desktop" / "checkinall.txt"
 STATE_PATH = Path(__file__).resolve().parent.parent / ".checkinall_state.json"
 
 REACT_NAMES = {"gold", "gold2", "diamond", "platin", "s69", "ml"}
-SHARED_NAMES = ("justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr")
+SHARED_NAMES = ("justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr", "justlo_us")
 
 
 def _react_money(ins: int, asa_outs: int) -> float:
@@ -172,6 +172,7 @@ def _build_note(rows: list[dict]) -> str:
         variable_line("linduu_usins", shared_values["linduu_us"], SHARED_RATE),
         variable_line("gnoxxins", shared_values["gnoxx"], SHARED_RATE),
         variable_line("justlo_frins", shared_values["justlo_fr"], SHARED_RATE),
+        variable_line("justlo_usins", shared_values["justlo_us"], SHARED_RATE),
         f"  {'fixed':<12s}: {FIXED_BONUS:,.2f} DT",
     ]
 
@@ -209,7 +210,7 @@ def _build_note(rows: list[dict]) -> str:
         f"CHECK-IN ALL CALCULATOR — {now:%Y-%m-%d %H:%M:%S}\n"
         f"{sep}\n"
         "Formula: goldins + (xkussins × 0.20 × 3.4) + "
-        "((justloins + linduuins + linduu_usins + gnoxxins + justlo_frins) × 0.17 × 3.4) + 200\n\n"
+        "((justloins + linduuins + linduu_usins + gnoxxins + justlo_frins + justlo_usins) × 0.17 × 3.4) + 200\n\n"
         "Live counters:\n"
         + ("\n".join(account_lines) if account_lines else "  No platform data available")
         + "\n\nCalculator variables:\n"
@@ -258,7 +259,12 @@ def _build_note(rows: list[dict]) -> str:
                 shared_values["justlo_fr"] * SHARED_VALUE
                 if shared_values["justlo_fr"] is not None else None
             ),
+            "justlo_us": (
+                shared_values["justlo_us"] * SHARED_VALUE
+                if shared_values["justlo_us"] is not None else None
+            ),
             "shared": (
+                # All configured Justlo-family platforms, including Justlo US.
                 sum(value * SHARED_VALUE for value in shared_values.values() if value is not None)
                 if any(value is not None for value in shared_values.values()) else None
             ),

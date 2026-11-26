@@ -217,9 +217,21 @@ async def _do_login(page, cfg, tag: str):
 
     await _dismiss_popups(page)
 
+    # Persisted sessions may redirect /login straight to community or Mod.
+    # A previously visible login form can disappear during that navigation.
+    if await _in_console(page, cfg) or await _on_community(page, cfg):
+        print(f"{tag}session already authenticated. URL: {page.url}", flush=True)
+        return
+
     # Wait for the username input to be actionable, then fill + submit.
     user = page.locator(cfg.sel_login_user)
-    await user.first.wait_for(state="visible", timeout=15_000)
+    try:
+        await user.first.wait_for(state="visible", timeout=15_000)
+    except Exception:
+        if await _in_console(page, cfg) or await _on_community(page, cfg):
+            print(f"{tag}authenticated redirect completed. URL: {page.url}", flush=True)
+            return
+        raise
     await user.first.fill(cfg.username)
     await page.locator(cfg.sel_login_pass).first.fill(cfg.password)
     await page.locator(cfg.sel_login_btn).first.click()

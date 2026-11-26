@@ -60,7 +60,7 @@ async def run_browser_operation(command: str, platforms: list[str]) -> str:
                 browser = await playwright.chromium.connect_over_cdp(cfg.cdp_url)
                 context = browser.contexts[0]
                 if command == "pools":
-                    if slug not in {"justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"}:
+                    if slug not in {"justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr", "justlo_us"}:
                         raise ValueError(
                             "Pools is available only for Justlo-family moderation consoles"
                         )

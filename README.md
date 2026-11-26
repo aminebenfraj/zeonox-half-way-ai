@@ -25,7 +25,7 @@ http://127.0.0.1:8799/
 
 Open `/bots` to start or stop any supported platform individually. Gold,
 Gold2, Gold3, Diamond, Platin, S69, ML, Xkuss, Justlo, Linduu, Linduu US,
-Gnoxx, and Justlo FR all use the same lifecycle controls. If only the dashboard is running,
+Gnoxx, Justlo FR, and Justlo US all use the same lifecycle controls. If only the dashboard is running,
 starting any platform also starts the central launcher automatically.
 
 Each bot card also has a **Login credentials** dropdown. Saving updates that
@@ -49,7 +49,7 @@ by every platform. Manual mode can show or skip Judge analysis while still
 requiring human approval. Automatic mode can use the current 10/10 + manual
 fallback, run the Judge while requiring manual approval for every score, reject
 lower Judge scores so the bot regenerates, or send directly without Judge.
-Justlo, Linduu, Linduu US, Gnoxx, and Justlo FR can either transfer/skip Chameleon
+Justlo, Linduu, Linduu US, Gnoxx, Justlo FR, and Justlo US can either transfer/skip Chameleon
 First Contact conversations or answer them through the normal workflow.
 Runtime visibility can keep the current CMD/Chrome windows or launch future
 bot processes with hidden consoles and headless Chrome. Existing Chrome
@@ -182,6 +182,13 @@ alerts are emitted once when a problem begins and are suppressed until that
 condition clears.
 
 ## Useful checks
+
+Justlo US uses its own Chrome profile (`profiles/justlo_us`) and debugging port
+9235. Set `JUSTLO_US_USERNAME` and `JUSTLO_US_PASSWORD` in `.env`, then launch
+with `python run_bot.py justlo_us` or `python launch_all.py justlo_us`.
+Its Chameleon chat defaults to `Justlo US` and its extractor tab to `Justlo`; configure
+`JUSTLO_US_CHAMELEON_CHAT` and `JUSTLO_US_CHAMELEON_TAB` to match the workspace.
+Replies and approval cards use English. This platform is opt-in for bulk launches.
 
 Check the local dashboard:
 

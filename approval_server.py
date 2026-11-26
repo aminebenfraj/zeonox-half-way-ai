@@ -324,11 +324,12 @@ _SELF_MANAGED_CDP_PORTS = {
     "linduu_us": 9234,
     "gnoxx": 9231,
     "justlo_fr": 9233,
+    "justlo_us": 9235,
 }
 _BUILTIN_CDP_PORTS = {
     "gold": 9222, "diamond": 9223, "platin": 9224, "s69": 9225,
     "gold2": 9226, "xkuss": 9227, "ml": 9228, "justlo": 9229,
-    "linduu": 9230, "gnoxx": 9231, "gold3": 9232, "justlo_fr": 9233,
+    "linduu": 9230, "gnoxx": 9231, "gold3": 9232, "justlo_fr": 9233, "justlo_us": 9235,
     "linduu_us": 9234,
 }
 _PLATFORM_CREDENTIAL_ENV = {
@@ -1506,7 +1507,7 @@ def _reply_language_for_platform(platform: str) -> tuple[str, str]:
     platform_type = _platform_type_for_runtime_name(platform)
     if platform_type == "justlo_fr":
         return "French", "FR"
-    if platform_type == "linduu_us":
+    if platform_type in {"linduu_us", "justlo_us"}:
         return "English", "EN"
     return "German", "DE"
 
@@ -2402,6 +2403,28 @@ def get_settings():
     return jsonify(get_runtime_settings())
 
 
+@app.route("/api/settings/justlo-us", methods=["GET", "POST"])
+def justlo_us_settings():
+    fields = {"chat": ("JUSTLO_US_CHAMELEON_CHAT", "Justlo US"),
+              "tab": ("JUSTLO_US_CHAMELEON_TAB", "Justlo")}
+    if request.method == "POST":
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "Settings must be a JSON object"}), 400
+        values = {}
+        for key, (env_name, default) in fields.items():
+            value = body.get(key)
+            if not isinstance(value, str) or not value.strip() or len(value) > 150 or any(c in value for c in "\r\n\0"):
+                return jsonify({"error": f"A valid Chameleon {key} name is required"}), 400
+            values[env_name] = value.strip()
+        with _env_write_lock:
+            for env_name, value in values.items():
+                set_key(str(_ENV_PATH), env_name, value, quote_mode="always")
+                os.environ[env_name] = value
+    saved = dotenv_values(_ENV_PATH)
+    return jsonify({key: saved.get(env_name) or default for key, (env_name, default) in fields.items()})
+
+
 @app.post("/api/settings")
 def save_settings():
     body = request.get_json(force=True, silent=True) or {}
@@ -2558,8 +2581,7 @@ def set_mode_override():
     return jsonify({"ok": True, "platform": platform, "effective": effective})
 
 
-@app.get("/api/platforms")
-def list_platforms():
+def _platform_catalog():
     platforms = [
         {
             "slug": platform.slug,
@@ -2579,7 +2601,28 @@ def list_platforms():
             "platform_type": account["platform_type"],
             "additional": True,
         })
-    return jsonify(platforms)
+    # Additional accounts need an identity of their own, even when they share
+    # a platform type. Keep colors stable across snapshots and restarts.
+    import colorsys
+    import hashlib
+    used = {item["color"] for item in platforms if not item.get("additional")}
+    for item in platforms:
+        if not item.get("additional"):
+            continue
+        hue = int(hashlib.sha256(item["slug"].encode()).hexdigest()[:8], 16) % 360
+        for offset in range(360):
+            rgb = colorsys.hls_to_rgb(((hue + offset * 137.508) % 360) / 360, .65, .7)
+            color = "#" + "".join(f"{round(channel * 255):02x}" for channel in rgb)
+            if color not in used:
+                break
+        item["color"] = color
+        used.add(color)
+    return platforms
+
+
+@app.get("/api/platforms")
+def list_platforms():
+    return jsonify(_platform_catalog())
 
 
 @app.get("/api/requests")
@@ -3029,6 +3072,7 @@ def _full_snapshot() -> dict:
         status = dict(_status)
     return {
         "type": "snapshot",
+        "platforms": _platform_catalog(),
         "pending": _requests_snapshot(pending=True),
         "history": _requests_snapshot(pending=False, limit=300),
         "status": status,
@@ -3056,13 +3100,8 @@ if sock:
                 if send_snapshot:
                     ws.send(json.dumps(_full_snapshot()))
                 else:
-                    with _lock:
-                        status = dict(_status)
-                    ws.send(json.dumps({
-                        "type": "heartbeat",
-                        "version": last_version,
-                        "status": status,
-                    }))
+                    # Reconcile liveness even when a worker exits silently.
+                    ws.send(json.dumps(_full_snapshot()))
         except ConnectionClosed:
             pass
         except Exception:
@@ -3111,7 +3150,7 @@ def control_command():
         return jsonify({"ok": False, "error": "cmd is required"}), 400
     if target != "all" and target not in PLATFORM_BY_SLUG and get_account(target) is None:
         return jsonify({"ok": False, "error": f"unknown platform '{target}'"}), 404
-    if cmd == "pools" and target not in {"justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"}:
+    if cmd == "pools" and target not in {"justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr", "justlo_us"}:
         return jsonify({
             "ok": False,
             "error": "Pools is available only for Justlo-family moderation consoles",
@@ -3154,7 +3193,7 @@ def control_command():
         try:
             from core.checkinall import gather_and_write, load_latest_result
             platforms = ["gold", "gold2", "diamond", "platin", "s69", "ml",
-                         "xkuss", "justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"]
+                         "xkuss", "justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr", "justlo_us"]
             text, path = asyncio.run(gather_and_write(platforms))
             return jsonify({
                 "ok": True,
@@ -3170,7 +3209,7 @@ def control_command():
     # Pools is always handled by the current dashboard code so it works even
     # when the long-running launcher predates this command. Other browser
     # operations stay local only when launcher control is unavailable.
-    if cmd == "pools" or (cmd in ("fix", "chameleon", "extractor") and target in {"justlo_fr", "linduu_us"}) or (
+    if cmd == "pools" or (cmd in ("fix", "chameleon", "extractor") and target in {"justlo_fr", "linduu_us", "justlo_us"}) or (
         not control_available and cmd in ("fix", "chameleon", "extractor")
     ):
         statuses = _all_bot_statuses()
@@ -4998,7 +5037,7 @@ const ACTION_MESSAGES = {
   skip:    { verb: "Transferring", done: "Transfer requested — the bot will skip only if nobody is online", type: "warning" },
 };
 
-const SKIPPABLE_CARD_PLATFORMS = new Set(["xkuss", "justlo", "linduu", "linduu us", "gnoxx", "justlo fr"]);
+const SKIPPABLE_CARD_PLATFORMS = new Set(["xkuss", "justlo", "linduu", "linduu us", "gnoxx", "justlo fr", "justlo us"]);
 
 async function act(id, action, body, btn) {
   // Disable the whole card's action row (not just the clicked button) so a
@@ -5293,7 +5332,7 @@ function detectorFor(name) {
       retryCount: 0, warning: "", checkpoint: "", cancellableSend: false,
     };
   }
-  if (!telemetryFresh) {
+  if (!telemetryFresh || ["stopped", "offline", "dead"].includes(s?.state)) {
     return { live: false, label: "Offline", color: "var(--border)", detail: "", state: "offline", retryCount: 0, warning: "", checkpoint: "", cancellableSend: false };
   }
   const meta = STATE_META[s.state] || { label: s.state, color: "var(--info)" };
@@ -5529,7 +5568,7 @@ const CTRL_BUTTONS = [
   { cmd: "fix",       label: "Fix" },
   { cmd: "stop",      label: "Stop", cls: "danger" },
 ];
-const POOLS_PLATFORMS = new Set(["justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"]);
+const POOLS_PLATFORMS = new Set(["justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr", "justlo_us"]);
 
 async function refreshControlStatus() {
   try {
@@ -5702,6 +5741,7 @@ function renderCheckinResult(result) {
     ["Linduu US", componentValue("linduu_us")],
     ["Gnoxx", componentValue("gnoxx")],
     ["Justlo FR", componentValue("justlo_fr")],
+    ["Justlo US", componentValue("justlo_us")],
     ["Bonus", result.components?.fixed],
   ];
   document.getElementById("earningsBreakdown").innerHTML = parts.map(([label, value]) => {
@@ -6026,15 +6066,7 @@ function renderSections(pending, autoByPlatform) {
   const order = [...knownPlatforms];
   for (const name of byPlatform.keys()) if (!order.includes(name)) order.push(name);
   if (showAuto) for (const name of autoByPlatform.keys()) if (!order.includes(name)) order.push(name);
-  // A pending approval is authoritative even if process telemetry is stale,
-  // the worker just stopped, or this is a newly-added account whose detector
-  // has not reported yet. Never hide a card merely because its bot looks
-  // offline; the reviewer may still need to approve, cancel, or inspect it.
-  const runningOrder = order.filter(name =>
-    detectorFor(name).live
-    || (byPlatform.get(name) || []).length > 0
-    || (showAuto && (autoByPlatform.get(name) || []).length > 0)
-  );
+  const runningOrder = order.filter(name => detectorFor(name).live);
 
   document.getElementById("sections").innerHTML = runningOrder.length ? runningOrder.map(name => {
     const items = byPlatform.get(name) || [];
@@ -6186,6 +6218,15 @@ function renderHistory(items) {
 // fallback (refresh()) — one code path renders a snapshot no matter where it
 // came from, so the two can never quietly drift out of sync with each other.
 function applySnapshot(data) {
+  if (data.platforms) {
+    knownPlatforms = data.platforms.map(p => p.name);
+    platformSlugMap.clear();
+    platformColorMap.clear();
+    for (const p of data.platforms) {
+      platformSlugMap.set(p.name, p.slug);
+      platformColorMap.set(p.name, p.color);
+    }
+  }
   if (data.status) liveStatus = data.status;
   if (typeof data.mode === "string") currentMode = data.mode;
   renderModeToggle();
@@ -6204,7 +6245,7 @@ function applySnapshot(data) {
   const unavailNote = document.getElementById("ctrlUnavailableNote");
   if (unavailNote) unavailNote.style.display = controlsAvailable ? "none" : "block";
 
-  const history = data.history || []; // newest first
+  const history = (data.history || []).filter(r => detectorFor(r.platform).live); // newest first
   const autoByPlatform = new Map();
   const AUTO_PER_PLATFORM = 12; // history is already newest-first, so this keeps the most recent N per platform
   for (const r of history) {
@@ -6218,7 +6259,7 @@ function applySnapshot(data) {
   // The request store, not detector telemetry, owns approval visibility.
   // Filtering here used to make valid cards disappear during restarts,
   // telemetry gaps, and for additional accounts whose label differs from id.
-  const pendingList = data.pending || [];
+  const pendingList = (data.pending || []).filter(r => detectorFor(r.platform).live);
   const currentPendingIds = new Set(pendingList.map(r => r.id));
   if (knownPendingIds !== null) {
     for (const id of currentPendingIds) {
@@ -6264,6 +6305,7 @@ async function refresh() {
       readJson("/api/mode"),
       readJson("/api/bots/status"),
       readJson("/api/bots/health"),
+      readJson("/api/platforms"),
     ]);
     if (results[0].status !== "fulfilled" || results[1].status !== "fulfilled") return;
     applySnapshot({
@@ -6272,6 +6314,7 @@ async function refresh() {
       control: { available: controlsAvailable, platforms: controlPlatformState },
       bots: results[4].status === "fulfilled" ? results[4].value : botProcessState,
       health: results[5].status === "fulfilled" ? results[5].value : botHealthState,
+      platforms: results[6].status === "fulfilled" ? results[6].value : undefined,
       history: results[1].value,
       pending: results[0].value,
     });
@@ -6971,7 +7014,7 @@ function renderCard(slug, label) {
   const steps = stepsFor(slug, s.approvalEffective);
 
   return `
-    <div class="bot-card" data-slug="${slug}">
+    <div class="bot-card" data-slug="${slug}" style="border-top:3px solid ${platformInfo.color || '#94a3b8'}">
       <div class="bot-card-head">
         <h2>${escapeHtml(label)}</h2>
         <span class="status-pill ${statusClass}">${statusText}</span>
@@ -7022,6 +7065,7 @@ function renderCard(slug, label) {
         </div>
       </details>
 
+      ${slug === "justlo_us" ? '<p><a href="/settings#justlo-us">Justlo US workspace settings</a></p>' : ""}
       <details class="steps-block" ${s.stepsOpen ? "open" : ""} ontoggle="state['${slug}'].stepsOpen = this.open">
         <summary>What happens, step by step</summary>
         <ol class="steps-list">${steps.map(st => `<li>${escapeHtml(st)}</li>`).join("")}</ol>
@@ -7410,10 +7454,12 @@ def service_worker():
 
 @app.get("/bots")
 def bots_page():
+    colors = {item["slug"]: item["color"] for item in _platform_catalog()}
     platform_data = [
         {
             "slug": platform.slug,
             "label": platform.label,
+            "color": colors[platform.slug],
             "selfManaged": platform.self_managed,
         }
         for platform in PLATFORMS
@@ -7423,6 +7469,7 @@ def bots_page():
         platform_data.append({
             "slug": account["id"],
             "label": account["label"],
+            "color": colors[account["id"]],
             "selfManaged": base.self_managed,
             "platformType": account["platform_type"],
             "additional": True,

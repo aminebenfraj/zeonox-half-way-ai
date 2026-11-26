@@ -666,11 +666,39 @@ class JustloBot:
         try:
             tab_name = self.cfg.chameleon_workspace_tab or "Extractor"
             btn = tab2.get_by_role("tab", name=tab_name, exact=True)
+            # US workspaces have used both labels for the same extractor.
+            # The chat identity is still checked separately; only the extractor
+            # tab label may vary. Never substitute Solo/Team/Quality.
+            us_workspace = self.cfg.platform in {"Justlo US", "Linduu US"}
+            try:
+                await btn.wait_for(state="visible", timeout=5_000 if us_workspace else 15_000)
+            except PlaywrightTimeout:
+                if us_workspace:
+                    for alias in ("Justlo US", "Justlo"):
+                        candidate = tab2.get_by_role("tab", name=alias, exact=True)
+                        if await candidate.count() and await candidate.is_visible():
+                            self.log(f"Chameleon extractor tab renamed: '{tab_name}' -> '{alias}'")
+                            btn = candidate
+                            break
+                    else:
+                        available = await tab2.get_by_role("tab").all_text_contents()
+                        self.log(f"[WARN] No US extractor tab available; available tabs: {available}")
+                        return False
+                else:
+                    available = await tab2.get_by_role("tab").all_text_contents()
+                    self.log(f"[WARN] Chameleon tab '{tab_name}' unavailable; available tabs: {available}")
+                    return False
             if await btn.count() > 0:
                 if await btn.get_attribute("data-state") != "active":
                     await btn.click()
                     await asyncio.sleep(0.5)
-                return await btn.get_attribute("data-state") == "active"
+                active = await btn.get_attribute("data-state") == "active"
+                if active and us_workspace:
+                    # Validate the semantic surface before treating an alias as
+                    # a usable extractor; a renamed unrelated tab must fail.
+                    await tab2.locator(_SEL_HTML_TEXTAREA).wait_for(state="visible", timeout=15_000)
+                    await tab2.locator(_SEL_EXTRACT_BTN).wait_for(state="visible", timeout=15_000)
+                return active
             else:
                 self.log(f"[WARN] Chameleon workspace tab '{tab_name}' was not found.")
                 return False
@@ -688,7 +716,8 @@ class JustloBot:
             checkpoint="scraping_html",
         )
         await self._wait_for_page_ready(tab2, "domcontentloaded")
-        await self._ensure_extractor_tab_active(tab2)
+        if not await self._ensure_extractor_tab_active(tab2):
+            raise RuntimeError("Chameleon extractor is unavailable; HTML was not submitted")
 
         textarea = tab2.locator(_SEL_HTML_TEXTAREA)
         self.log("Waiting for HTML textarea to be visible...")

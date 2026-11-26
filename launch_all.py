@@ -87,6 +87,7 @@ _CLI_ALIASES = {
     "plat": "platin", "g2": "gold2", "g3": "gold3", "lindu": "linduu",
     "linduuus": "linduu_us", "lus": "linduu_us",
     "just": "justlo", "gnox": "gnoxx", "justfr": "justlo_fr", "fr": "justlo_fr",
+    "justus": "justlo_us", "jus": "justlo_us",
 }
 
 def _resolve_platforms(args: list[str]) -> list[str]:
@@ -120,6 +121,7 @@ _COLORS = {
     "linduu_us": "\033[38;5;48m",
     "gnoxx":   "\033[96m",
     "justlo_fr": "\033[94m",
+    "justlo_us": "\033[96m",
 }
 
 _ALIASES = _CLI_ALIASES
@@ -344,7 +346,7 @@ def run_bots():
             targets = [n for n in KNOWN_PLATFORMS if n not in stopped] if target == "all" else [target]
             return [n for n in targets if n in KNOWN_PLATFORMS], KNOWN_PLATFORMS
         if cmd == "pools":
-            options = ["justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr"]
+            options = ["justlo", "linduu", "linduu_us", "gnoxx", "justlo_fr", "justlo_us"]
             targets = options if target == "all" else [target]
             return [n for n in targets if n in options], options
         if cmd in ("checkins", "checkin", "ins"):

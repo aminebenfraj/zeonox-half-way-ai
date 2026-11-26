@@ -19,7 +19,7 @@ class Platform:
 
 PLATFORMS = (
     Platform("gold", "Gold", "#f59e0b"),
-    Platform("gold2", "Gold2", "#eab308", enabled_by_default=False),
+    Platform("gold2", "Gold2", "#f97316", enabled_by_default=False),
     Platform("gold3", "Gold3", "#d946ef", enabled_by_default=False),
     Platform("diamond", "Diamond", "#22d3ee"),
     Platform("platin", "Platin", "#94a3b8"),
@@ -31,12 +31,13 @@ PLATFORMS = (
     Platform(
         "linduu_us",
         "Linduu US",
-        "#34d399",
+        "#84cc16",
         self_managed=True,
         enabled_by_default=False,
     ),
-    Platform("gnoxx", "Gnoxx", "#0ea5e9", self_managed=True),
-    Platform("justlo_fr", "Justlo FR", "#06b6d4", self_managed=True),
+    Platform("gnoxx", "Gnoxx", "#a78bfa", self_managed=True),
+    Platform("justlo_fr", "Justlo FR", "#fda4af", self_managed=True),
+    Platform("justlo_us", "Justlo US", "#facc15", self_managed=True, enabled_by_default=False),
 )
 
 PLATFORM_BY_SLUG = {platform.slug: platform for platform in PLATFORMS}
