@@ -2031,6 +2031,14 @@ def _complete_judge_analysis(req_id: str, judge_payload: dict, auto_candidate: b
             "judge_error": None if judge_result["ok"] else judge_result.get("error"),
             "judge_pending": False,
         })
+        # The operator may switch to Manual while the provider is in flight.
+        # Re-read the effective mode before applying an automatic decision.
+        if auto_candidate and _mode_overrides.get(item["platform"].strip().lower(), _mode) != "auto":
+            auto_candidate = False
+            if item["status"] == "pending":
+                should_notify = True
+                created_request = dict(item)
+                pending_count = sum(1 for queued in _requests.values() if queued["status"] == "pending")
         if auto_candidate and item["status"] == "pending":
             if (
                 judge_result["ok"]
@@ -2281,6 +2289,12 @@ def create_request():
         if existing is not None:
             return _duplicate_request_response(existing)
         now = _now()
+        # Meeting checks also run outside the lock. A switch to Manual during
+        # those checks must prevent Direct mode from approving on insertion.
+        if _mode_overrides.get(platform.strip().lower(), _mode) != "auto":
+            direct_auto = False
+            auto_candidate = False
+            run_judge = runtime_settings["manual_judge_policy"] == "enabled"
         _requests[req_id] = {
             "id": req_id,
             "platform": platform,
@@ -2546,6 +2560,16 @@ def delete_instruction_prompt_api(prompt_id):
     return jsonify({"ok": True, "prompt": deleted})
 
 
+def _hold_auto_approvals_locked():
+    """Apply a Manual switch to automatic replies still in their send timer."""
+    for item in _requests.values():
+        mode = _mode_overrides.get(item["platform"].strip().lower(), _mode)
+        if mode == "manual" and item.get("auto") and item["status"] == "approved":
+            item.update(status="pending", auto=False, decided_at=None, send_started_at=None)
+            item["send_cancel_revision"] = int(item.get("send_cancel_revision") or 0) + 1
+            _persist_request_locked(item)
+
+
 @app.post("/api/mode")
 def set_mode():
     global _mode
@@ -2555,6 +2579,7 @@ def set_mode():
         return jsonify({"error": "mode must be 'manual' or 'auto'"}), 400
     with _lock:
         _mode = mode
+        _hold_auto_approvals_locked()
         _persist_dashboard_state_locked()
     _bump_state()
     return jsonify({"ok": True, "mode": mode})
@@ -2590,6 +2615,7 @@ def set_mode_override():
         else:
             _mode_overrides[mode_key] = mode
         effective = _mode_overrides.get(mode_key, _mode)
+        _hold_auto_approvals_locked()
         _persist_dashboard_state_locked()
     _bump_state()
     # Approval mode is read live per-request (see create_request()) — no
