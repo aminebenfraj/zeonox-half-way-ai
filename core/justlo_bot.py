@@ -624,11 +624,11 @@ class JustloBot:
                 return False
             # Not just "some chat" — it must be OUR chat. Otherwise a stale/wrong
             # selection (e.g. a reload-race fallback pick) looks "fine" forever.
-            return self.cfg.chameleon_chat.lower() in combo_text.lower()
+            return self.cfg.chameleon_chat.casefold() == combo_text.casefold()
         except PlaywrightError as e:
             if _is_fatal(e):
                 raise
-            return True
+            return False
 
     async def _ensure_chat_selected(self, tab2) -> bool:
         if await self._is_chat_selected(tab2):
@@ -639,7 +639,7 @@ class JustloBot:
             combobox = tab2.locator(_SEL_COMBOBOX)
             await combobox.first.click()
             await asyncio.sleep(0.5)
-            option = tab2.locator(f"[role='option']:has-text('{chat}')")
+            option = tab2.get_by_role("option", name=chat, exact=True)
             try:
                 await option.wait_for(state="visible", timeout=10_000)
                 await option.first.click()
@@ -709,6 +709,8 @@ class JustloBot:
             return False
 
     async def _paste_and_extract(self, tab2, html: str):
+        if not await self._ensure_chat_selected(tab2):
+            raise RuntimeError(f"Wrong Chameleon chat; expected '{self.cfg.chameleon_chat}'")
         self.log(f"Switching to extractor tab and pasting {len(html):,} chars of HTML...")
         await report_status(
             self.cfg.platform, "extracting",
@@ -759,6 +761,8 @@ class JustloBot:
         return await self._safe_evaluate(tab2, _GET_CONFIGURED_REPLY_JS, list(labels))
 
     async def _generate_reply(self, tab2, regeneration_instruction: str = "") -> str:
+        if not await self._is_chat_selected(tab2):
+            raise RuntimeError("Chameleon workspace changed after extraction; refusing mismatched reply generation")
         old_reply = await self._get_chameleon_reply(tab2)
         gen_btn   = tab2.locator(_SEL_GEN_BTN)
         self.log(f"Waiting up to {EXTRACT_TIMEOUT}s for 'Generate Reply' button...")
@@ -920,6 +924,8 @@ class JustloBot:
             approved, final_text, req_id = await request_approval(
                 self.cfg.platform, reply,
                 reply_type=reply_type,
+                conversation_key=expected_sig,
+                context=f"Chameleon workspace: {self.cfg.chameleon_chat}",
                 last_message=last_message,
                 customer_message=customer_message,
                 client_profile=client_profile, fake_profile=fake_profile,
@@ -1667,18 +1673,6 @@ class JustloBot:
                     # Fingerprint this conversation so we don't handle it twice.
                     sig = await self._conversation_sig(tab1)
 
-                    # ── ASA 2 / ASA 3 follow-up → nudge, don't reply ───────
-                    # These queue tasks are answered by pressing 'Anstupsen'; no
-                    # HTML capture, no chameleon — mark handled and wait for the
-                    # next conversation.
-                    if await self._is_asa_nudge(tab1):
-                        await tab1.bring_to_front()
-                        await self._click_anstupsen(tab1)
-                        self._last_sig = sig
-                        self.log("[ASA] Nudged — waiting for the next conversation.")
-                        cycle -= 1
-                        continue
-
                     # ── Always run the chameleon work — chameleon's own First
                     # Contact badge is the sole authority on handover. The local
                     # 'Unterhaltung' grid is NOT trusted to decide this on its own:
@@ -1702,8 +1696,33 @@ class JustloBot:
 
                     await tab2.bring_to_front()
                     await self._paste_and_extract(tab2, html)
-                    is_fc = await self._is_first_contact(tab2)
                     extracted = await read_extracted_data(tab2)
+                    identities = await tab1.evaluate(
+                        """(s) => ({
+                            client: (document.querySelector(s.client)?.textContent || '').trim(),
+                            fake: (document.querySelector(s.fake)?.textContent || '').trim()
+                        })""",
+                        {"client": self.cfg.sel_client_username, "fake": self.cfg.sel_fake_username},
+                    )
+                    for side, profile_key in (("client", "client_profile"), ("fake", "fake_profile")):
+                        expected_name = (identities.get(side) or "").casefold()
+                        actual_name = str(extracted[profile_key].get("Username") or "").casefold()
+                        if expected_name and expected_name != actual_name:
+                            raise RuntimeError(f"Chameleon {side} profile does not match the loaded moderation conversation")
+                    reply_type = extracted.get("reply_type", "")
+                    if reply_type not in {"DIA", "ASA Follow-up", "FC"}:
+                        raise RuntimeError("Chameleon JSON has no recognized conversation type; refusing to guess")
+                    is_fc = reply_type == "FC"
+                    # Preserve ASA 2/3 nudges only after Chameleon confirms ASA;
+                    # a local queue label alone no longer decides the type.
+                    if reply_type == "ASA Follow-up" and await self._is_asa_nudge(tab1):
+                        await tab1.bring_to_front()
+                        await self._click_anstupsen(tab1)
+                        self._last_sig = sig
+                        cycle -= 1
+                        continue
+                    if not is_fc and not extracted["last_message"]:
+                        raise RuntimeError("Chameleon conversation has no last message; refusing to generate without context")
 
                     fc_policy = get_runtime_settings()["fc_contact_policy"]
                     if is_fc and fc_policy == "skip":
@@ -1726,12 +1745,6 @@ class JustloBot:
                         reply_type = extracted.get("reply_type", "")
                         if reply_type:
                             self.log(f"Chameleon JSON message type: {reply_type}")
-                        else:
-                            reply_type = await self._chameleon_reply_type(tab2)
-                        if not reply_type:
-                            self.log("[WARN] Chameleon message type missing — "
-                                     "falling back to the platform queue label.")
-                            reply_type = await self._queue_task_type(tab1)
                         reply, approval_id = await self._get_approved_and_send(
                             tab1, tab2, reply_type, extracted, sig,
                         )

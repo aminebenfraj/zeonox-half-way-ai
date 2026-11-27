@@ -2145,6 +2145,17 @@ def _retire_unacknowledged_action_locked(platform: str) -> bool:
     return retired
 
 
+def _request_for_conversation_locked(platform: str, conversation_key: str):
+    existing = _active_request_for_platform_locked(platform)
+    if existing is not None and conversation_key and existing.get("conversation_key") != conversation_key:
+        existing["status"] = "cancelled"
+        existing["error"] = "Source conversation changed; replaced by a fresh approval"
+        existing["decided_at"] = _now()
+        _persist_request_locked(existing)
+        return None
+    return existing
+
+
 def _duplicate_request_response(existing: dict):
     return jsonify({
         "error": "this conversation already has an active approval request",
@@ -2171,6 +2182,9 @@ def create_request():
     client_profile = body.get("client_profile") or {}
     fake_profile = body.get("fake_profile") or {}
     messages = body.get("messages") or []
+    conversation_key = body.get("conversation_key") or ""
+    if not isinstance(conversation_key, str) or not isinstance(messages, list):
+        return jsonify({"error": "Invalid conversation context"}), 400
     if not reply.strip():
         return jsonify({"error": "reply is required"}), 400
 
@@ -2179,7 +2193,7 @@ def create_request():
     # while translation and analysis run outside the lock.
     with _lock:
         retired_action = _retire_unacknowledged_action_locked(platform)
-        existing = _active_request_for_platform_locked(platform)
+        existing = _request_for_conversation_locked(platform, conversation_key)
         if existing is not None:
             return _duplicate_request_response(existing)
     if retired_action:
@@ -2263,7 +2277,7 @@ def create_request():
         # Atomic uniqueness guard: at most one active approval lifecycle may
         # belong to a worker, which itself can own only one conversation.
         _retire_unacknowledged_action_locked(platform)
-        existing = _active_request_for_platform_locked(platform)
+        existing = _request_for_conversation_locked(platform, conversation_key)
         if existing is not None:
             return _duplicate_request_response(existing)
         now = _now()
@@ -2277,6 +2291,8 @@ def create_request():
             "client_profile": client_profile,
             "fake_profile": fake_profile,
             "context": body.get("context") or "",
+            "conversation_key": conversation_key,
+            "messages": messages,
             "reply_type": reply_type,
             "reply": reply,
             "reply_en": reply_en,
@@ -5810,11 +5826,15 @@ function profileRowsHtml(profile) {
 function extractedDataHtml(r) {
   const hasClient = r.client_profile && Object.keys(r.client_profile).length;
   const hasFake = r.fake_profile && Object.keys(r.fake_profile).length;
-  if (!hasClient && !hasFake) return "";
+  const messages = r.messages || [];
+  if (!hasClient && !hasFake && !messages.length) return "";
   const disclosureKey = `extracted:${r.id}`;
   return `
     <details class="extracted-data" data-ui-key="${disclosureKey}" ${openDisclosurePanels.has(disclosureKey) ? "open" : ""}>
       <summary>Extracted data</summary>
+      ${r.context ? `<p>${escapeHtml(r.context)}</p>` : ""}
+      <div class="field-label">Conversation (${messages.length} extracted messages)</div>
+      ${messages.map(message => `<div class="profile-row"><span class="k">${escapeHtml(message.sender || "unknown")}</span><span>${escapeHtml(message.text || "")}</span></div>`).join("")}
       <div class="profile-cols">
         <div class="profile-col">
           <div class="field-label">Client data</div>

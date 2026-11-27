@@ -28,6 +28,7 @@ thing with that — it never falls back to auto-sending.
 import asyncio
 import base64
 import json
+import hashlib
 import os
 from datetime import datetime
 from typing import Awaitable, Callable
@@ -145,6 +146,7 @@ async def request_approval(
     customer_message: str = "",
     context: str = "",
     reply_type: str = "",
+    conversation_key: str = "",
     client_profile: dict | None = None,
     fake_profile: dict | None = None,
     messages: list[dict] | None = None,
@@ -181,6 +183,11 @@ async def request_approval(
                 "customer_message": customer_message,
                 "context": context,
                 "reply_type": reply_type,
+                "conversation_key": conversation_key or hashlib.sha256(json.dumps([
+                    platform, last_message, customer_message,
+                    (client_profile or {}).get("Username", ""),
+                    (fake_profile or {}).get("Username", ""),
+                ], ensure_ascii=False).encode()).hexdigest(),
                 "client_profile": client_profile or {},
                 "fake_profile": fake_profile or {},
                 "messages": messages or [],

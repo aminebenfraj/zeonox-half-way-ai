@@ -8,6 +8,7 @@ the Chat tab before reply generation continues.
 
 import json
 import re
+import asyncio
 
 from playwright.async_api import Error as PlaywrightError
 
@@ -63,7 +64,7 @@ def _flatten_profile(raw) -> dict:
 
 def _message_text(message) -> str:
     if isinstance(message, dict):
-        return _text(message.get("text") or message.get("message"))
+        return _text(message.get("text") or message.get("message") or message.get("content"))
     return _text(message)
 
 
@@ -119,6 +120,12 @@ def _reply_type(raw: dict) -> str:
     if re.search(r"\bDIA\b", value, re.IGNORECASE):
         return "DIA"
     if re.search(r"\bASA\b", value, re.IGNORECASE):
+        return "ASA Follow-up"
+    if re.search(r"\bFC\b|first[ _-]?contact", value, re.IGNORECASE):
+        return "FC"
+    if value.casefold() in {"dialogue", "dialog", "dia"}:
+        return "DIA"
+    if value.casefold() in {"follow_up", "follow-up", "followup"}:
         return "ASA Follow-up"
     return ""
 
@@ -205,7 +212,7 @@ def normalize_chameleon_data(raw: dict) -> dict:
             if last_customer:
                 break
     if not last_customer:
-        last_customer = _text(_field(
+        last_customer = _message_text(_field(
             raw,
             "last_client_message",
             "last_customer_message",
@@ -225,6 +232,7 @@ def normalize_chameleon_data(raw: dict) -> dict:
                 else "fake_account"
             ),
             "text": _message_text(message),
+            "timestamp": _text(_field(message, "timestamp", "time", "date", "zeit")),
         }
         for message in messages
         if isinstance(message, dict) and _message_text(message)
@@ -242,23 +250,25 @@ def normalize_chameleon_data(raw: dict) -> dict:
 
 async def read_extracted_data(tab2, timeout_ms: int = 5_000) -> dict:
     """Read Chameleon's extracted JSON and always return to its Chat tab."""
-    empty = {
-        "reply_type": "",
-        "last_message": "",
-        "last_customer_message": "",
-        "client_profile": {},
-        "fake_profile": {},
-        "messages": [],
-    }
+    error = None
     try:
-        json_button = tab2.get_by_role("button", name="JSON", exact=True)
-        await json_button.click()
-        payload = tab2.locator("pre").last
-        await payload.wait_for(state="visible", timeout=timeout_ms)
-        raw = json.loads(await payload.inner_text())
-        return normalize_chameleon_data(raw)
-    except (PlaywrightError, json.JSONDecodeError, TypeError, ValueError):
-        return empty
+        for attempt in range(3):
+            try:
+                await tab2.get_by_role("button", name="JSON", exact=True).click(timeout=timeout_ms)
+                payload = tab2.locator("pre:visible").last
+                await payload.wait_for(state="visible", timeout=timeout_ms)
+                raw = json.loads(await payload.inner_text())
+                if not isinstance(raw, dict):
+                    raise ValueError("Chameleon JSON is not a conversation object")
+                normalized = normalize_chameleon_data(raw)
+                if not any(normalized[key] for key in ("messages", "last_message", "client_profile", "fake_profile")):
+                    raise ValueError("Chameleon returned an empty conversation")
+                return normalized
+            except (PlaywrightError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                error = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+        raise RuntimeError(f"Could not read current Chameleon conversation JSON: {error}") from error
     finally:
         try:
             await tab2.get_by_role("button", name="Chat", exact=True).click()

@@ -648,20 +648,20 @@ class ChatBot:
         try:
             combobox = tab2.locator("button[role='combobox']")
             if await combobox.count() == 0:
-                # No combobox means we're not on the select screen — nothing to fix.
-                return True
+                # Missing controls cannot confirm the selected workspace.
+                return False
             combo_text = (await combobox.first.inner_text()).strip()
-            return not chat_not_selected(combo_text)
+            return not chat_not_selected(combo_text) and combo_text.casefold() == self.cfg.chameleon_chat.casefold()
         except PlaywrightError as e:
             if _is_fatal(e):
                 raise
-            return True
+            return False
 
     async def _ensure_chat_selected(self, tab2) -> bool:
         """Recover from the 'Select chat...' stuck screen by picking the configured chat.
 
         Opens the dropdown and selects self.cfg.chameleon_chat (e.g. 'Gold XL WM'),
-        falling back to the first available option. Returns True once a chat is set.
+        refusing any other workspace. Returns True once the exact chat is set.
         """
         if await self._is_chat_selected(tab2):
             return True
@@ -673,15 +673,14 @@ class ChatBot:
             await combobox.first.click()
             await asyncio.sleep(0.5)
             # Radix UI renders options in a portal with role="option".
-            option = tab2.locator(f"[role='option']:has-text('{chat}')")
+            option = tab2.get_by_role("option", name=chat, exact=True)
             try:
                 await option.wait_for(state="visible", timeout=10_000)
                 await option.first.click()
             except Exception:
-                fallback = tab2.locator("[role='option']")
-                if await fallback.count() > 0:
-                    self.log(f"[RECOVERY] '{chat}' not found — selecting first available chat.")
-                    await fallback.first.click()
+                self.log(f"[RECOVERY] Exact Chameleon chat '{chat}' unavailable; refusing another workspace.")
+                await tab2.keyboard.press("Escape")
+                return False
             await asyncio.sleep(1.5)
         except PlaywrightError as e:
             if _is_fatal(e):
@@ -802,6 +801,8 @@ class ChatBot:
             self.log(f"[WARN] Could not activate extractor tab: {e}")
 
     async def _paste_and_extract(self, tab2, html: str):
+        if not await self._ensure_chat_selected(tab2):
+            raise RuntimeError(f"Wrong Chameleon workspace; expected '{self.cfg.chameleon_chat}'")
         self.log(f"Switching to extractor tab and pasting {len(html):,} chars of HTML...")
         await report_status(
             self.cfg.platform,
@@ -960,6 +961,8 @@ class ChatBot:
         raise RuntimeError("Send was not confirmed: the reply box did not clear.")
 
     async def _generate_reply(self, tab2, regeneration_instruction: str = "") -> str:
+        if not await self._is_chat_selected(tab2):
+            raise RuntimeError("Chameleon workspace changed after extraction; refusing mismatched reply generation")
         old_reply = await self._safe_evaluate(tab2, _GET_DE_REPLY_JS)
         gen_btn   = tab2.locator(self.cfg.sel_gen_btn)
         self.log(f"Waiting up to {EXTRACT_TIMEOUT}s for 'Generate Reply' button...")
