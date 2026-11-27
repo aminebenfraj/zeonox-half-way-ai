@@ -22,7 +22,7 @@ config = JustloConfig(
     chameleon_workspace_tab=os.environ.get("JUSTLO_US_CHAMELEON_TAB", "Justlo"),
     additional_instructions="Write the reply in natural American English.",
     reply_language_labels=("Reply (English)", "Answer (English)", "Antwort (Englisch)"),
-    asa_2_3_nudge_enabled=False,
+    asa_2_3_nudge_enabled=True,
     sel_login_link="",
     sel_login_user='input[placeholder="Username"]',
     sel_login_pass='input[placeholder="Password"]',
