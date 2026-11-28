@@ -195,6 +195,36 @@ def normalize_chameleon_data(raw: dict) -> dict:
     messages = _field(raw, "messages", "conversation", "chat") or []
     messages = messages if isinstance(messages, list) else []
 
+    # Some Chameleon extractors leave profile.username blank even though every
+    # transcript row retains the exact From/To usernames. Recover only an
+    # unambiguous identity from those routes and explicit sender-side metadata.
+    route_names = {"client": set(), "fake": set()}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        source = _text(_field(message, "from", "von", "sender_username"))
+        target = _text(_field(message, "to", "an", "recipient_username"))
+        sender = _identity(_field(message, "sender", "role"))
+        side = None
+        if sender in {"client", "customer", "kunde", "user", "member"}:
+            side = "client"
+        elif sender in {"fake", "fake_account", "fake account", "moderator", "operator", "agent"}:
+            side = "fake"
+        elif _bool_value(_field(message, "has_moderator", "is_moderator")) is not None:
+            side = "fake" if _bool_value(_field(message, "has_moderator", "is_moderator")) else "client"
+        if side:
+            if source:
+                route_names[side].add(source)
+            if target:
+                route_names["fake" if side == "client" else "client"].add(target)
+    client_profile = _flatten_profile(client_raw)
+    fake_profile = _flatten_profile(fake_raw)
+    for side, profile in (("client", client_profile), ("fake", fake_profile)):
+        if not profile.get("Username") and len(route_names[side]) == 1:
+            profile["Username"] = next(iter(route_names[side]))
+    client_username = _identity(client_profile.get("Username"))
+    fake_username = _identity(fake_profile.get("Username"))
+
     last_message = _message_text(raw.get("last_message"))
     if not last_message and messages:
         last_message = _message_text(messages[-1])
@@ -242,8 +272,8 @@ def normalize_chameleon_data(raw: dict) -> dict:
         "reply_type": _reply_type(raw),
         "last_message": last_message,
         "last_customer_message": last_customer,
-        "client_profile": _flatten_profile(client_raw),
-        "fake_profile": _flatten_profile(fake_raw),
+        "client_profile": client_profile,
+        "fake_profile": fake_profile,
         "messages": normalized_messages,
     }
 

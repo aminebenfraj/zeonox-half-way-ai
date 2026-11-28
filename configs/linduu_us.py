@@ -32,6 +32,8 @@ config = JustloConfig(
     # "Antwort (Deutsch)", which leaves the bot polling forever even though
     # the English reply is already visible.
     reply_language_labels=("Reply (English)",),
+    # ASA 2/3: Anstupsen only after Chameleon confirms ASA; ASA 1 gets a reply.
+    asa_2_3_nudge_enabled=True,
 
     sel_login_link="",
     sel_login_user="#username",

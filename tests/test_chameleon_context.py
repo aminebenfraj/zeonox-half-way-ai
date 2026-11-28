@@ -7,6 +7,21 @@ from core.justlo_bot import JustloBot, JustloConfig
 
 
 class ChameleonContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_blank_profile_username_is_recovered_from_explicit_routes(self):
+        result = normalize_chameleon_data({'client_information': {'username': ''}, 'fake_account': {'username': 'Crazy_LunaX'}, 'conversation': [
+            {'sender': 'client', 'from': 'dani Buntschu', 'to': 'Crazy_LunaX', 'text': 'Hello'},
+            {'sender': 'fake_account', 'from': 'Crazy_LunaX', 'to': 'dani Buntschu', 'text': 'Hi'},
+        ]})
+        self.assertEqual(result['client_profile']['Username'], 'dani Buntschu')
+        self.assertEqual(result['fake_profile']['Username'], 'Crazy_LunaX')
+
+    def test_conflicting_routes_do_not_guess_a_profile_identity(self):
+        result = normalize_chameleon_data({'conversation': [
+            {'sender': 'client', 'from': 'first', 'to': 'fake', 'text': 'Hello'},
+            {'sender': 'client', 'from': 'other', 'to': 'fake', 'text': 'Hello'},
+        ]})
+        self.assertNotIn('Username', result['client_profile'])
+
     async def test_read_failure_raises_instead_of_returning_empty_context(self):
         page = Mock()
         button = AsyncMock()
